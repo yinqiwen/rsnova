@@ -22,10 +22,8 @@ use clap::{App, Arg};
 use config::Config;
 use std::fs::File;
 
-
 use simplelog::Config as LogConfig;
 use simplelog::{CombinedLogger, LevelFilter, TermLogger, WriteLogger};
-
 
 struct T {
     a: String,
@@ -109,7 +107,6 @@ fn main() {
     let mut log_level = LevelFilter::Info;
     if matches.occurrences_of("debug") == 1 {
         log_level = LevelFilter::Debug;
-
     }
     for log in logs.iter() {
         if log.to_lowercase() == "console" {
@@ -149,7 +146,6 @@ fn main() {
         _ => info!("Don't be crazy"),
     }
 
-
     let data = r#"
         {
             "listen": ":48100"
@@ -158,5 +154,4 @@ fn main() {
 
     // Do things just like with any other Rust data structure.
     info!("Please call  {}", p.listen);
-
 }

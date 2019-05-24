@@ -1,0 +1,182 @@
+{
+    "test_env": true,
+    "uu_server": "MobileAssist.WeishiUU.UUObj@tcp -h 10.50.152.141 -p 10008 -t 60000",
+    "uu_timeout": 800,
+    "recall_server": "MobileAssist.WeishiRecall.RecallObj@tcp -h 10.50.83.40 -p 10147 -t 60000",
+    "rank_server": "MobileAssist.WeishiRank.RankObj",
+    "rank_timeout": 500,
+    "policy_server": "MobileAssist.WeishiPolicy.PolicyObj@tcp -h 100.96.25.146 -p 10053 -t 60000",
+    "policy_timeout": 800,
+    "out_recall_server": "WeSee.WeishiOutRecall.RecallObj",
+    "out_recall_timeout": 500,
+    "out_rank_server": "WeSee.WeishiOutRank.RankObj",
+    "out_rank_timeout": 500,
+    "out_policy_server": "WeSee.WeishiOutPolicy.PolicyObj",
+    "out_policy_timeout": 500,
+    "person_recall_server": "WeSee.WeishiPersonRecall.RecallObj",
+    "person_recall_timeout": 500,
+    "person_rank_server": "WeSee.WeishiPersonRank.RankObj",
+    "person_rank_timeout": 500,
+    "person_policy_server": "WeSee.WeishiPersonPolicy.PolicyObj",
+    "person_policy_timeout": 500,
+    "channel_uu_server": "MobileAssist.WeishiUU.UUObj",
+    "channel_uu_timeout": 800,
+    "channel_recall_server": "MobileAssist.WeishiRecall.RecallObj",
+    "channel_rank_server": "MobileAssist.WeishiRank.RankObj",
+    "channel_rank_timeout": 500,
+    "channel_policy_server": "MobileAssist.WeishiPolicy.PolicyObj",
+    "channel_policy_timeout": 800,
+    "compress_policy": true,
+    "compress_rank": true,
+    "compress_recall": true,
+    "compress_uu": true,
+    "channel_compress_policy": true,
+    "channel_compress_rank": true,
+    "channel_compress_recall": true,
+    "channel_compress_uu": true,
+    "trace_user_ckv": {
+        "l5_mod": 1056897,
+        "l5_cmd": 131072,
+        "bid": 102021571,
+        "task_queue_limit": 10000
+    },
+    "so_script_sync": {
+        "test_env": true,
+        "service": "wesee",
+        "module": "AS",
+        "table": "script_manage",
+        "test_env_column": "istest",
+        "service_column": "service",
+        "module_column": "module",
+        "filename_column": "file_name",
+        "content_column": "source",
+        "timestamp_column": "updatetime",
+        "enable_column": "vaild",
+        "db_conf": {
+            "dbhost": "tagVerify.mdb.mig",
+            "dbport": "16746",
+            "dbuser": "writeuser",
+            "dbpass": "9YIocdnH0QIS0SqD",
+            "dbname": "wesee",
+            "charset": "utf8"
+        },
+        "check_period": 5000
+    },
+    "trace_user_key_expire_secs": 3600,
+    "so_script": {
+        "source_dir": [
+            "/usr/local/app/taf/MobileAssist.WeishiAS/data/so_script"
+        ],
+        "compile_flags": "-D_GLIBCXX_USE_CXX11_ABI=0 -std=gnu++11 -D__STDC_FORMAT_MACROS -pipe"
+    },
+    "recmd_abtest_appid": "801",
+    "recmd_abtest_channel": "80101",
+    "planb_abtest": [
+        {
+            "test_id": 200921,
+            "rule_id": 9527,
+            "mapParam": {
+                "scirpt_func": "uu_planb"
+            }
+        },
+        {
+            "test_id": 200922,
+            "rule_id": 9527,
+            "mapParam": {
+                "script_func": "recall_planb",
+                "need_realtime_negative": "0"
+            }
+        },
+        {
+            "test_id": 200923,
+            "rule_id": 9527,
+            "mapParam": {
+                "script_func": "rank_planb"
+            }
+        },
+        {
+            "test_id": 200924,
+            "rule_id": 9527,
+            "mapParam": {
+                "script_func": "policy_planb"
+            }
+        }
+    ],
+    "unionid_conf": {
+        "mod_r": 960129,
+        "cmd_r": 65537,
+        "bid_r": 102021305,
+        "timeout_r": 200,
+        "mod_w": 1075905,
+        "cmd_w": 393216,
+        "bid_w": 102021305,
+        "timeout_w": 200
+    },
+    "blacklist_l5_mod": 972481,
+    "blacklist_l5_cmd": 65536,
+    "blacklist_l5_timeout": 200,
+    "recmd_abt": {
+        "UU": [
+            {
+                "name": "UU_old",
+                "default_script": "weishi_uu.cpp",
+                "default_func": "default_uu",
+                "layer": 0
+            }
+        ],
+        "Recall": [
+            {
+                "name": "Recall0",
+                "default_script": "weishi_recall0.cpp",
+                "default_func": "default_recall0",
+                "layer": 0
+            },
+            {
+                "name": "Recall1",
+                "default_script": "weishi_recall1.cpp",
+                "default_func": "default_recall1",
+                "layer": 1
+            },
+            {
+                "name": "Recall2",
+                "default_script": "weishi_recall2.cpp",
+                "default_func": "default_recall2",
+                "layer": 2
+            },
+            {
+                "name": "Recall3",
+                "default_script": "weishi_recall3.cpp",
+                "default_func": "default_recall3",
+                "layer": 3
+            },
+            {
+                "name": "Recall4",
+                "default_script": "weishi_recall4.cpp",
+                "default_func": "default_recall4",
+                "layer": 4
+            },
+            {
+                "name": "Recall5",
+                "default_script": "weishi_recall5.cpp",
+                "default_func": "default_recall5",
+                "layer": 5
+            }
+        ],
+        "Rank": [
+            {
+                "name": "Rank_old",
+                "default_script": "weishi_rank.cpp",
+                "default_func": "default_rank",
+                "layer": 2
+            }
+        ],
+        "Policy": [
+            {
+                "name": "Policy_old",
+                "default_script": "weishi_policy.cpp",
+                "default_func": "default_policy",
+                "layer": 3
+            }
+        ]
+    }
+}
