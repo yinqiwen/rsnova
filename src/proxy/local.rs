@@ -17,7 +17,6 @@ struct PreProcess<R> {
 
 type PeekAddress = (String, BytesMut);
 
-
 pub fn extract_tls_target(buffer: &mut BytesMut) -> Result<Async<PeekAddress>, TokioIOError> {
     let parser = ::common::client_hello::ClientHelloBuilder::new();
     match parser.parse_bytes(&buffer[..]) {
@@ -73,7 +72,6 @@ pub fn extract_http_target(buffer: &mut BytesMut) -> Result<Async<PeekAddress>, 
         }
     }
 }
-
 
 impl<R: AsyncRead> Future for PreProcess<R> {
     type Item = PeekAddress;

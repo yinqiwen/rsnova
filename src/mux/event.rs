@@ -23,6 +23,17 @@ pub struct Event {
     pub body: Vec<u8>,
 }
 
+pub fn new_data_event(sid: u32, buf: &[u8]) -> Event {
+    Event {
+        header: Header {
+            version: 0,
+            flags: FLAG_DATA,
+            stream_id: sid,
+            len: buf.len() as u32,
+        },
+        body: Vec::from(buf),
+    }
+}
 
 // This is where we'd keep track of any extra book-keeping information
 // our transport needs to operate.
@@ -110,5 +121,4 @@ impl Decoder for EventCodec {
         }
         Ok(Some(ev))
     }
-
 }

@@ -5,6 +5,7 @@ extern crate bytes;
 extern crate clap;
 extern crate futures;
 extern crate httparse;
+extern crate serde;
 
 extern crate nom;
 extern crate simplelog;
@@ -16,6 +17,7 @@ mod common;
 mod config;
 mod mux;
 mod proxy;
+//mod test;
 
 use bytes::BufMut;
 use clap::{App, Arg};
