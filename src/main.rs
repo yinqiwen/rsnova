@@ -13,6 +13,8 @@ extern crate simplelog;
 extern crate tokio;
 extern crate tokio_io;
 
+extern crate lazy_static;
+
 mod common;
 mod config;
 mod mux;
