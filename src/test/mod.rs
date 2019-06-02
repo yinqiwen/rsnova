@@ -1,25 +1,81 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+use futures::future::lazy;
+use futures::try_ready;
+use std::str;
 
-struct Stream {
-    s: *mut Session,
-}
-struct Session {
-    streams: HashMap<u32, Stream>,
+use tokio::io::Error as TokioIOError;
+use tokio::net::TcpListener;
+
+use std::io::ErrorKind;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::prelude::*;
+use tokio::timer::Interval;
+
+use tokio_sync::semaphore::{Permit, Semaphore};
+
+pub struct TestFuture {
+    counter: u32,
+    interval: Interval,
 }
 
-impl Session {
-    pub fn new_stream(&mut self) -> Stream {
-        Stream { s: self }
+impl TestFuture {
+    pub fn new() -> Self {
+        Self {
+            counter: 0,
+            interval: Interval::new_interval(Duration::from_secs(3)),
+        }
     }
-
-    pub fn write(&mut self) {}
 }
 
-impl Stream {
-    pub fn write(&mut self) {
-        let ref_mut: &mut Session = unsafe { &mut *self.s };
-        ref_mut.write();
+impl Stream for TestFuture {
+    type Item = u32;
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        info!("poll invoked.");
+        try_ready!(self
+            .interval
+            .poll()
+            // The interval can fail if the Tokio runtime is unavailable.
+            // In this example, the error is ignored.
+            .map_err(|_| ()));
+        self.counter = self.counter + 1;
+        Ok(Async::Ready(Some(self.counter)))
     }
+}
+
+fn t1() {
+    let s = Semaphore::new(2);
+
+    let acuire = |sem| {
+        let mut p = Permit::new();
+        let r = p.poll_acquire(sem);
+        match r {
+            Err(e) => error!("failed to acuire:{}", e),
+            Ok(Async::NotReady) => {
+                error!("failed to acuire");
+            }
+            _ => {
+                info!("acuire success:{}", sem.available_permits());
+            }
+        }
+    };
+
+    acuire(&s);
+    acuire(&s);
+    //s.add_permits(1);
+    acuire(&s);
+}
+
+pub fn start() {
+    let f = TestFuture::new();
+    // let r = f.into_stream();
+    let x = f
+        .for_each(|v| {
+            info!("Got counter:{}", v);
+            t1();
+            Ok(())
+        })
+        .map_err(|e| {});
+    tokio::run(x);
+    info!("after run");
 }

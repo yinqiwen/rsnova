@@ -120,12 +120,12 @@ pub fn start_local_server(addr: &str) {
         .for_each(|sock| {
             // Split up the reading and writing parts of the
             // socket.
-            let (reader, writer) = sock.split();
+            let (local_reader, local_writer) = sock.split();
 
             //let peek_remote = ;
             // A future that echos the data and returns how
             // many bytes were copied...
-            let bytes_copied = copy(reader, writer);
+            let bytes_copied = copy(local_reader, local_writer);
 
             // ... after which we'll print what happened.
             let handle_conn = bytes_copied

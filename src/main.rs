@@ -1,4 +1,7 @@
+#![feature(drain_filter)]
+
 #[macro_use]
+
 extern crate log;
 extern crate byteorder;
 extern crate bytes;
@@ -12,6 +15,10 @@ extern crate simplelog;
 
 extern crate tokio;
 extern crate tokio_io;
+extern crate tokio_io_timeout;
+extern crate tokio_sync;
+extern crate tokio_udp;
+extern crate url;
 
 extern crate lazy_static;
 
@@ -19,7 +26,7 @@ mod common;
 mod config;
 mod mux;
 mod proxy;
-//mod test;
+mod test;
 
 use bytes::BufMut;
 use clap::{App, Arg};
@@ -107,7 +114,7 @@ fn main() {
         .get_matches();
 
     let logs: Vec<_> = matches.values_of("log").unwrap().collect();
-    let mut loggers: Vec<Box<simplelog::SharedLogger>> = Vec::new();
+    let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = Vec::new();
     let mut log_level = LevelFilter::Info;
     if matches.occurrences_of("debug") == 1 {
         log_level = LevelFilter::Debug;
@@ -127,7 +134,7 @@ fn main() {
 
     CombinedLogger::init(loggers).unwrap();
 
-    // test();
+    test::start();
 
     // error!("Bright red error");
     // info!("This only appears in the log file");

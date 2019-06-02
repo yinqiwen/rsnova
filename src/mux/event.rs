@@ -23,6 +23,18 @@ pub struct Event {
     pub body: Vec<u8>,
 }
 
+pub fn new_fin_event(sid: u32) -> Event {
+    Event {
+        header: Header {
+            version: 0,
+            flags: FLAG_FIN,
+            stream_id: sid,
+            len: 0,
+        },
+        body: Vec::new(),
+    }
+}
+
 pub fn new_data_event(sid: u32, buf: &[u8]) -> Event {
     Event {
         header: Header {
@@ -32,6 +44,17 @@ pub fn new_data_event(sid: u32, buf: &[u8]) -> Event {
             len: buf.len() as u32,
         },
         body: Vec::from(buf),
+    }
+}
+pub fn new_window_update_event(sid: u32, len: u32) -> Event {
+    Event {
+        header: Header {
+            version: 0,
+            flags: FLAG_DATA,
+            stream_id: sid,
+            len: len,
+        },
+        body: Vec::new(),
     }
 }
 
