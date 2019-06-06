@@ -24,6 +24,9 @@ impl TestFuture {
             interval: Interval::new_interval(Duration::from_secs(3)),
         }
     }
+    pub fn teset(self) -> String {
+        return String::from("a");
+    }
 }
 
 impl Stream for TestFuture {
@@ -41,6 +44,12 @@ impl Stream for TestFuture {
         self.counter = self.counter + 1;
         Ok(Async::Ready(Some(self.counter)))
     }
+}
+
+fn t2() {
+    let f = TestFuture::new();
+    let s1 = f.teset();
+    //let s2 = f.teset();
 }
 
 fn t1() {

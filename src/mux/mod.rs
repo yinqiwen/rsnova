@@ -1,7 +1,6 @@
-pub mod session;
+//pub mod manager;
+pub mod mux;
 
+mod channel;
 mod event;
-pub mod manager;
-
 mod message;
-mod stream;

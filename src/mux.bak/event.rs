@@ -24,16 +24,14 @@ pub struct Header {
 pub struct Event {
     pub header: Header,
     pub body: Vec<u8>,
-
-    pub local: bool,
 }
 
-pub fn new_message_event<T: serde::Serialize>(sid: u32, msg: &T, local: bool) -> Event {
+pub fn new_message_event<T: serde::Serialize>(sid: u32, msg: &T) -> Event {
     let data = bincode::serialize(msg).unwrap();
-    new_data_event(sid, &data[..], local)
+    new_data_event(sid, &data[..])
 }
 
-pub fn new_fin_event(sid: u32, local: bool) -> Event {
+pub fn new_fin_event(sid: u32) -> Event {
     Event {
         header: Header {
             version: 0,
@@ -42,11 +40,10 @@ pub fn new_fin_event(sid: u32, local: bool) -> Event {
             len: 0,
         },
         body: Vec::new(),
-        local: local,
     }
 }
 
-pub fn new_data_event(sid: u32, buf: &[u8], local: bool) -> Event {
+pub fn new_data_event(sid: u32, buf: &[u8]) -> Event {
     Event {
         header: Header {
             version: 0,
@@ -55,10 +52,9 @@ pub fn new_data_event(sid: u32, buf: &[u8], local: bool) -> Event {
             len: buf.len() as u32,
         },
         body: Vec::from(buf),
-        local: local,
     }
 }
-pub fn new_window_update_event(sid: u32, len: u32, local: bool) -> Event {
+pub fn new_window_update_event(sid: u32, len: u32) -> Event {
     Event {
         header: Header {
             version: 0,
@@ -67,7 +63,6 @@ pub fn new_window_update_event(sid: u32, len: u32, local: bool) -> Event {
             len: len,
         },
         body: Vec::new(),
-        local: local,
     }
 }
 
@@ -101,7 +96,7 @@ pub fn encode_event(ev: Event, buf: &mut BytesMut) {
     }
 }
 
-pub fn read_event<T: AsyncRead>(r: T) -> impl Future<Item = (T, Event), Error = std::io::Error> {
+pub fn read_event<T: AsyncRead>(r: T) -> impl Future<Item = Event, Error = std::io::Error> {
     let buf = vec![0; 10];
     read_exact(r, buf).and_then(|(_stream, data)| {
         let ver = data[0];
@@ -118,18 +113,16 @@ pub fn read_event<T: AsyncRead>(r: T) -> impl Future<Item = (T, Event), Error = 
             let ev = Event {
                 header: header,
                 body: Vec::new(),
-                local: false,
             };
-            future::Either::A(future::ok((_stream, ev)))
+            future::Either::A(future::ok(ev))
         } else {
             let data_buf = Vec::with_capacity(header.len as usize);
             let r = read_exact(_stream, data_buf).and_then(|(_r, _body)| {
                 let ev = Event {
                     header: header,
                     body: _body,
-                    local: false,
                 };
-                Ok((_r, ev))
+                Ok(ev)
             });
             future::Either::B(r)
         }
@@ -189,7 +182,6 @@ impl Decoder for EventCodec {
                 len: len,
             },
             body: Vec::with_capacity(len as usize),
-            local: false,
         };
         src.copy_to_slice(&mut ev.body[..]);
         unsafe {

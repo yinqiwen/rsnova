@@ -3,6 +3,7 @@
 #[macro_use]
 
 extern crate log;
+extern crate bincode;
 extern crate byteorder;
 extern crate bytes;
 extern crate clap;
@@ -35,28 +36,6 @@ use std::fs::File;
 
 use simplelog::Config as LogConfig;
 use simplelog::{CombinedLogger, LevelFilter, TermLogger, WriteLogger};
-
-struct T {
-    a: String,
-    b: bytes::BytesMut,
-}
-type PeekAddress1 = (String, bytes::BytesMut);
-fn test() {
-    let mut t = T {
-        a: String::from("a"),
-        b: bytes::BytesMut::with_capacity(10),
-    };
-    t.a = String::from("a");
-    t.b.put_u8(1);
-
-    let t1 = T {
-        a: String::from("a"),
-        b: t.b,
-    };
-    println!("{}  {}", t.a, t1.b[0]);
-
-    let t2 = (String::from("a"), bytes::BytesMut::with_capacity(10));
-}
 
 fn main() {
     let matches = App::new("rsnova")
