@@ -109,7 +109,7 @@ pub fn start_local_server(addr: &str) {
         laddr = "0.0.0.0".to_owned();
         laddr.push_str(addr);
     }
-    info!("listen on {}", laddr);
+    info!("Local server listen on {}", laddr);
     let net_addr = laddr.parse().unwrap();
     let listener = TcpListener::bind(&net_addr).expect("unable to bind TCP listener");
 
@@ -137,5 +137,5 @@ pub fn start_local_server(addr: &str) {
         });
 
     // Start the Tokio runtime
-    tokio::run(server);
+    tokio::spawn(server);
 }

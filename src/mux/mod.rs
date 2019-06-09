@@ -1,6 +1,8 @@
 //pub mod manager;
-pub mod mux;
-
-mod channel;
+pub mod channel;
+mod common;
+mod crypto;
 mod event;
 mod message;
+mod mux;
+mod tcp;

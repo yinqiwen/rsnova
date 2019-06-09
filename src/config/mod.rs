@@ -1,8 +1,62 @@
-extern crate serde;
+use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 
-use self::serde::{Serialize, Deserialize};
+lazy_static! {
+    static ref GLOBAL_CONFIG: Mutex<Config> = Mutex::new(Config::new());
+}
 
-#[derive(Serialize, Deserialize,Debug)]
-pub struct Config{
-    pub listen: String,
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct ChannelConfig {
+    pub name: String,
+    pub urls: Vec<String>,
+    pub ping_interval_sec: u32,
+    pub conns_per_host: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct CipherConfig {
+    pub key: String,
+    pub method: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct LocalConfig {
+    pub channels: Vec<ChannelConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct RemoteConfig {}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Config {
+    pub cipher: CipherConfig,
+    pub read_timeout_sec: u64,
+    pub local: LocalConfig,
+    pub remote: RemoteConfig,
+}
+
+impl Config {
+    pub fn new() -> Self {
+        Self {
+            cipher: CipherConfig {
+                key: String::from("44eb1a8421c5f9c96e405a77f70646c8"),
+                method: String::from("chacha20poly1305"),
+            },
+            read_timeout_sec: 10,
+            local: Default::default(),
+            remote: Default::default(),
+        }
+    }
+}
+
+pub fn get_config() -> &'static Mutex<Config> {
+    &GLOBAL_CONFIG
+}
+
+pub fn add_channel_config(url: &str) {
+    let mut ch: ChannelConfig = Default::default();
+    ch.urls.push(String::from(url));
+    ch.conns_per_host = 2;
+    ch.name = String::from("default");
+    get_config().lock().unwrap().local.channels.push(ch);
 }

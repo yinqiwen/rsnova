@@ -1,8 +1,9 @@
+use crate::mux::crypto::*;
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::codec::{Decoder, Encoder};
 
-use std::io::{self, Cursor};
+use std::io::{Error, ErrorKind};
 use tokio::prelude::*;
 
 use tokio_io::io::{read_exact, write_all};
@@ -12,13 +13,38 @@ pub const FLAG_FIN: u8 = 1;
 pub const FLAG_DATA: u8 = 2;
 pub const FLAG_WIN_UPDATE: u8 = 3;
 pub const FLAG_PING: u8 = 4;
-pub const FLAG_PING_ACK: u8 = 5;
+pub const FLAG_AUTH: u8 = 5;
+
+pub const EVENT_HEADER_LEN: usize = 8;
 
 pub struct Header {
-    pub version: u8,
-    pub flags: u8,
+    pub flag_len: u32,
     pub stream_id: u32,
-    pub len: u32,
+    //pub reserved: [u8; 2],
+}
+
+fn get_flag_len(len: u32, flag: u8) -> u32 {
+    (len << 24) | (flag as u32)
+}
+
+impl Header {
+    fn set_flag_len(&mut self, len: u32, flag: u8) {
+        self.flag_len = (len << 24) | (flag as u32);
+    }
+    pub fn flags(&self) -> u8 {
+        return (self.flag_len & 0xFF) as u8;
+    }
+    pub fn len(&self) -> u32 {
+        (self.flag_len >> 24)
+    }
+    pub fn set_len(&mut self, v: u32) {
+        let f = self.flags();
+        self.set_flag_len(v, f);
+    }
+    pub fn set_flag(&mut self, v: u8) {
+        let l = self.len();
+        self.set_flag_len(l, v);
+    }
 }
 
 pub struct Event {
@@ -28,18 +54,25 @@ pub struct Event {
     pub local: bool,
 }
 
-pub fn new_message_event<T: serde::Serialize>(sid: u32, msg: &T, local: bool) -> Event {
+pub fn new_auth_event<T: serde::Serialize>(sid: u32, msg: &T, local: bool) -> Event {
     let data = bincode::serialize(msg).unwrap();
-    new_data_event(sid, &data[..], local)
+    let mut ev = new_data_event(sid, &data[..], local);
+    ev.header.set_flag(FLAG_AUTH);
+    ev
+}
+
+pub fn new_syn_event<T: serde::Serialize>(sid: u32, msg: &T, local: bool) -> Event {
+    let data = bincode::serialize(msg).unwrap();
+    let mut ev = new_data_event(sid, &data[..], local);
+    ev.header.set_flag(FLAG_SYN);
+    ev
 }
 
 pub fn new_fin_event(sid: u32, local: bool) -> Event {
     Event {
         header: Header {
-            version: 0,
-            flags: FLAG_FIN,
+            flag_len: get_flag_len(0, FLAG_FIN),
             stream_id: sid,
-            len: 0,
         },
         body: Vec::new(),
         local: local,
@@ -49,10 +82,8 @@ pub fn new_fin_event(sid: u32, local: bool) -> Event {
 pub fn new_data_event(sid: u32, buf: &[u8], local: bool) -> Event {
     Event {
         header: Header {
-            version: 0,
-            flags: FLAG_DATA,
+            flag_len: get_flag_len(buf.len() as u32, FLAG_DATA),
             stream_id: sid,
-            len: buf.len() as u32,
         },
         body: Vec::from(buf),
         local: local,
@@ -61,10 +92,8 @@ pub fn new_data_event(sid: u32, buf: &[u8], local: bool) -> Event {
 pub fn new_window_update_event(sid: u32, len: u32, local: bool) -> Event {
     Event {
         header: Header {
-            version: 0,
-            flags: FLAG_DATA,
+            flag_len: get_flag_len(len, FLAG_DATA),
             stream_id: sid,
-            len: len,
         },
         body: Vec::new(),
         local: local,
@@ -73,67 +102,14 @@ pub fn new_window_update_event(sid: u32, len: u32, local: bool) -> Event {
 
 // This is where we'd keep track of any extra book-keeping information
 // our transport needs to operate.
-pub struct EventCodec;
-
-// Turns string errors into std::io::Error
-fn bad_utf8<E>(_: E) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "Unable to decode input as UTF8",
-    )
+pub struct EventCodec {
+    ctx: CryptoContext,
 }
 
 impl EventCodec {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(ctx: CryptoContext) -> Self {
+        Self { ctx: ctx }
     }
-}
-
-pub fn encode_event(ev: Event, buf: &mut BytesMut) {
-    buf.reserve(ev.body.len() + 10);
-    buf.put_u8(ev.header.version);
-    buf.put_u8(ev.header.flags);
-    buf.put_u32_le(ev.header.stream_id);
-    let len = ev.body.len() as u32;
-    buf.put_u32_le(len);
-    if ev.body.len() > 0 {
-        buf.put_slice(&ev.body[..]);
-    }
-}
-
-pub fn read_event<T: AsyncRead>(r: T) -> impl Future<Item = (T, Event), Error = std::io::Error> {
-    let buf = vec![0; 10];
-    read_exact(r, buf).and_then(|(_stream, data)| {
-        let ver = data[0];
-        let flags = data[1];
-        let sid = byteorder::LittleEndian::read_u32(&data[2..6]);
-        let elen = byteorder::LittleEndian::read_u32(&data[6..10]);
-        let header = Header {
-            version: ver,
-            flags: flags,
-            stream_id: sid,
-            len: elen,
-        };
-        if FLAG_DATA != header.flags {
-            let ev = Event {
-                header: header,
-                body: Vec::new(),
-                local: false,
-            };
-            future::Either::A(future::ok((_stream, ev)))
-        } else {
-            let data_buf = Vec::with_capacity(header.len as usize);
-            let r = read_exact(_stream, data_buf).and_then(|(_r, _body)| {
-                let ev = Event {
-                    header: header,
-                    body: _body,
-                    local: false,
-                };
-                Ok((_r, ev))
-            });
-            future::Either::B(r)
-        }
-    })
 }
 
 // First, we implement encoding, because it's so straightforward.
@@ -150,7 +126,7 @@ impl Encoder for EventCodec {
         // we have to reserve memory before we try to write to it.
         //buf.reserve(line.len() + 1);
         // And now, we write out our stuff!
-        encode_event(ev, buf);
+        self.ctx.encrypt(&ev, buf);
         Ok(())
     }
 }
@@ -166,35 +142,15 @@ impl Decoder for EventCodec {
     type Error = std::io::Error;
 
     // Find the next line in buf!
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Event>, io::Error> {
-        if buf.len() < 10 {
-            return Ok(None);
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Event>, std::io::Error> {
+        match self.ctx.decrypt(buf) {
+            Ok(ev) => Ok(Some(ev)),
+            Err((n, reason)) => {
+                if reason.len() > 0 {
+                    return Err(Error::from(ErrorKind::InvalidData));
+                }
+                return Ok(None);
+            }
         }
-        let mut src = Cursor::new(&mut *buf);
-        //let mut nbuf = buf.into_buf();
-
-        let ver = src.get_u8();
-        let flags = src.get_u8();
-        let sid = src.get_u32_le();
-        let len = src.get_u32_le();
-        if src.remaining() < len as usize {
-            return Ok(None);
-        }
-
-        let mut ev = Event {
-            header: Header {
-                version: ver,
-                flags: flags,
-                stream_id: sid,
-                len: len,
-            },
-            body: Vec::with_capacity(len as usize),
-            local: false,
-        };
-        src.copy_to_slice(&mut ev.body[..]);
-        unsafe {
-            ev.body.set_len(len as usize);
-        }
-        Ok(Some(ev))
     }
 }

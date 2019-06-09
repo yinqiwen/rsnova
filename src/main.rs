@@ -1,7 +1,6 @@
 #![feature(drain_filter)]
 
 #[macro_use]
-
 extern crate log;
 extern crate bincode;
 extern crate byteorder;
@@ -12,15 +11,20 @@ extern crate httparse;
 extern crate serde;
 
 extern crate nom;
+extern crate orion;
+extern crate rand;
 extern crate simplelog;
+extern crate skip32;
 
 extern crate tokio;
 extern crate tokio_io;
 extern crate tokio_io_timeout;
 extern crate tokio_sync;
 extern crate tokio_udp;
+
 extern crate url;
 
+#[macro_use]
 extern crate lazy_static;
 
 mod common;
@@ -29,10 +33,13 @@ mod mux;
 mod proxy;
 mod test;
 
-use bytes::BufMut;
 use clap::{App, Arg};
 use config::Config;
+use futures::future::{self, FutureResult};
+use futures::prelude::*;
 use std::fs::File;
+
+use tokio::runtime::Runtime;
 
 use simplelog::Config as LogConfig;
 use simplelog::{CombinedLogger, LevelFilter, TermLogger, WriteLogger};
@@ -56,6 +63,15 @@ fn main() {
                 .long("listen")
                 .value_name("ADDRESS")
                 .help("Listen address")
+                .multiple(true)
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("server")
+                .short("s")
+                .long("server")
+                .value_name("ADDRESS")
+                .help("Server address")
                 .multiple(true)
                 .takes_value(true),
         )
@@ -113,35 +129,74 @@ fn main() {
 
     CombinedLogger::init(loggers).unwrap();
 
-    test::start();
+    //test::start();
 
-    // error!("Bright red error");
-    // info!("This only appears in the log file");
-    // debug!("This level is currently not enabled for any logger");
-
-    // if let Some(c) = matches.value_of("local") {
-    //     println!("Value for local: {}", matches.value_of("local"));
-    // }
-
+    // Create the runtime
+    let mut rt = Runtime::new().unwrap();
     // You can see how many times a particular flag or argument occurred
     // Note, only flags can have multiple occurrences
     let listens: Vec<_> = matches.values_of("listen").unwrap().collect();
 
     match matches.occurrences_of("local") {
-        0 => info!("local mode is off"),
+        0 => {
+            info!("local mode is off");
+        }
         1 => {
             info!("local mode is on");
-            proxy::local::start_local_server(listens[0]);
+            for l in &listens {
+                let laddr = String::from(*l);
+                rt.spawn(future::lazy(move || {
+                    proxy::local::start_local_server(laddr.as_str());
+                    Ok(())
+                }));
+            }
         }
         _ => info!("Don't be crazy"),
     }
 
-    let data = r#"
-        {
-            "listen": ":48100"
-        }"#;
-    let p: Config = serde_json::from_str(data).unwrap();
+    match matches.occurrences_of("remote") {
+        0 => {
+            info!("remote mode is off");
+        }
+        1 => {
+            info!("remote mode is on");
+            for l in &listens {
+                let laddr = String::from(*l);
+                rt.spawn(future::lazy(move || {
+                    mux::channel::init_remote_mux_server(&laddr);
+                    Ok(())
+                }));
+            }
+        }
+        _ => info!("Don't be crazy"),
+    }
 
-    // Do things just like with any other Rust data structure.
-    info!("Please call  {}", p.listen);
+    match matches.values_of("server") {
+        None => {
+            warn!("no remote server configured.");
+        }
+        Some(ss) => {
+            let servers: Vec<_> = ss.collect();
+            for s in &servers {
+                config::add_channel_config(*s);
+            }
+            rt.spawn(future::lazy(|| {
+                mux::channel::init_local_mux_channels(
+                    &config::get_config().lock().unwrap().local.channels,
+                );
+                Ok(())
+            }));
+        }
+    }
+
+    // let data = r#"
+    //     {
+    //         "listen": ":48100"
+    //     }"#;
+    // let p: Config = serde_json::from_str(data).unwrap();
+
+    // // Do things just like with any other Rust data structure.
+    // info!("Please call  {}", p.listen);
+
+    rt.shutdown_on_idle().wait().unwrap();
 }

@@ -1,211 +1,206 @@
-use crate::mux::event::*;
+use crate::config::*;
 use crate::mux::mux::*;
-use std::io::{Cursor, Error, ErrorKind, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-
+use crate::mux::tcp::*;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
-use bytes::Bytes;
+use std::time::Duration;
+use tokio::prelude::*;
+use tokio::timer::Interval;
 
-use tokio::io;
-use tokio_io::{AsyncRead, AsyncWrite};
-
-use tokio::codec::*;
+use tokio::runtime::Runtime;
 
 use futures::sync::mpsc;
-use tokio::prelude::*;
-use tokio_sync::semaphore::{Permit, Semaphore};
+use futures::Stream;
 
-struct MuxStreamState {
-    stream_id: u32,
-    send_buf_window: AtomicU32,
-    recv_buf_window: AtomicU32,
-    window_sem: Semaphore,
-    closed: AtomicBool,
+use url::{ParseError, Url};
+
+lazy_static! {
+    static ref SESSIONS_HOLDER: Mutex<MuxSessionManager> = Mutex::new(MuxSessionManager::new());
 }
 
-struct MuxStreamInner {
-    state: Arc<MuxStreamState>,
-    recv_buf: Cursor<Bytes>,
-    send_channel: mpsc::Sender<Event>,
-    recv_channel: mpsc::Receiver<Bytes>,
+#[derive(Clone)]
+struct ChannelState {
+    //config: ChannelConfig,
+    channel: String,
+    url: Url,
+    conns: u32,
+    conns_per_host: u32,
 }
-impl AsyncRead for MuxStreamInner {}
-impl Read for MuxStreamInner {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.state.closed.load(Ordering::SeqCst) {
-            return Err(Error::from(ErrorKind::ConnectionReset));
+
+struct SessionData {
+    channel: String,
+    url: String,
+    task_sender: mpsc::Sender<SessionTaskClosure>,
+}
+
+struct MuxSessionManager {
+    all_sessions: Vec<SessionData>,
+    cursor: u32,
+
+    channel_states: HashMap<String, ChannelState>,
+}
+
+fn channel_url_key(n: &str, u: &str) -> String {
+    let mut s = String::from(n);
+    s.push('#');
+    s.push_str(u);
+    s
+}
+
+impl MuxSessionManager {
+    fn new() -> Self {
+        MuxSessionManager {
+            all_sessions: Vec::new(),
+            cursor: 0,
+            channel_states: HashMap::new(),
         }
-        let n = self.recv_buf.read(buf)?;
-        if n > 0 {
-            return Ok(n);
+    }
+
+    fn routine(&self) {
+        for state in self.channel_states.values() {
+            if state.conns < state.conns_per_host {
+                let gap = state.conns_per_host - state.conns;
+                for n in 0..gap {
+                    init_local_mux_connection(&state.channel, &state.url);
+                }
+            }
+        }
+    }
+
+    fn add_channel_url(&mut self, key: String, state: ChannelState) {
+        info!("add state for key:{}", key);
+        self.channel_states.entry(key).or_insert(state);
+    }
+
+    fn add_session(
+        &mut self,
+        channel: &str,
+        url: &str,
+        task_sender: &mpsc::Sender<SessionTaskClosure>,
+    ) -> bool {
+        let data = SessionData {
+            channel: String::from(channel),
+            url: String::from(url),
+            task_sender: task_sender.clone(),
+        };
+        let k = channel_url_key(data.channel.as_str(), data.url.as_str());
+        info!("add session for {}", k);
+        if let Some(s) = self.channel_states.get_mut(&k) {
+            s.conns = s.conns + 1;
+            info!("session count {}", s.conns);
+            self.all_sessions.push(data);
+            true
         } else {
-            let r = self.recv_channel.poll();
-            match r {
-                Ok(Async::NotReady) => Err(Error::from(ErrorKind::WouldBlock)),
-                Ok(Async::Ready(None)) => Err(Error::from(ErrorKind::ConnectionReset)),
-                Ok(Async::Ready(Some(b))) => {
-                    self.recv_buf = Cursor::new(b);
-                    self.recv_buf.read(buf)
+            error!("No channel config found for {}", k);
+            false
+        }
+    }
+
+    fn do_select_session(&mut self) -> Option<mpsc::Sender<SessionTaskClosure>> {
+        let c = self.cursor + 1;
+        self.cursor = c;
+        let idx = c as usize % self.all_sessions.len();
+        if let Some(data) = self.all_sessions.get(idx) {
+            if data.task_sender.is_closed() {
+                let k = channel_url_key(data.channel.as_str(), data.url.as_str());
+                if let Some(s) = self.channel_states.get_mut(&k) {
+                    s.conns = s.conns - 1;
                 }
-                Err(_) => Err(Error::from(ErrorKind::Other)),
+                self.all_sessions.remove(idx as usize);
+                return None;
             }
+            return Some(data.task_sender.clone());
         }
+        return None;
     }
-}
-impl AsyncWrite for MuxStreamInner {
-    fn shutdown(&mut self) -> Result<Async<()>, io::Error> {
-        self.state.closed.store(true, Ordering::SeqCst);
-        //self.conn.lock().unwrap().close_stream(self.stream_id, true);
-        //self.send_channel.close();
-        Ok(Async::Ready(()))
-    }
-}
-impl Write for MuxStreamInner {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.state.closed.load(Ordering::SeqCst) {
-            return Err(Error::from(ErrorKind::ConnectionReset));
-        }
 
-        let mut send_permit = Permit::new();
-        let acuire = send_permit.poll_acquire(&self.state.window_sem);
-        match acuire {
-            Err(e) => {
-                error!("failed to acuire:{}", e);
-                return Err(Error::from(ErrorKind::Other));
+    pub fn select_session(&mut self) -> Option<mpsc::Sender<SessionTaskClosure>> {
+        loop {
+            if self.all_sessions.len() == 0 {
+                return None;
             }
-            Ok(Async::NotReady) => {
-                error!("failed to acuire send window buf");
-                return Err(Error::from(ErrorKind::WouldBlock));
+            if let Some(v) = self.do_select_session() {
+                return Some(v);
             }
-            _ => {}
         }
-        let mut send_len = buf.len();
-        if send_len > self.state.send_buf_window.load(Ordering::SeqCst) as usize {
-            send_len = self.state.send_buf_window.load(Ordering::SeqCst) as usize;
+    }
+}
+
+pub fn add_session(
+    channel: &str,
+    url: &str,
+    task_sender: &mpsc::Sender<SessionTaskClosure>,
+) -> bool {
+    SESSIONS_HOLDER
+        .lock()
+        .unwrap()
+        .add_session(channel, url, task_sender)
+}
+
+fn init_local_mux_connection(channel: &str, url: &Url) {
+    match url.scheme() {
+        "tcp" => {
+            init_local_tcp_channel(channel, url);
         }
-        let ev = new_data_event(self.state.stream_id, &buf[0..send_len], true);
-        let r = self.send_channel.start_send(ev);
-        match r {
-            Ok(AsyncSink::Ready) => {
-                self.state
-                    .send_buf_window
-                    .fetch_sub(send_len as u32, Ordering::SeqCst);
-                if self.state.send_buf_window.load(Ordering::SeqCst) > 0 {
-                    send_permit.release(&self.state.window_sem);
+        _ => {
+            error!("unknown scheme:{}", url.scheme());
+        }
+    }
+}
+
+pub fn init_local_mux_channels(cs: &Vec<ChannelConfig>) {
+    for c in cs {
+        for u in &c.urls {
+            match Url::parse(u.as_str()) {
+                Ok(url) => {
+                    let state = ChannelState {
+                        channel: String::from(c.name.as_str()),
+                        url: url,
+                        conns: 0,
+                        conns_per_host: c.conns_per_host,
+                    };
+                    let init_state = state.clone();
+                    let key = channel_url_key(c.name.as_str(), state.url.as_str());
+                    SESSIONS_HOLDER.lock().unwrap().add_channel_url(key, state);
+
+                    for _ in 0..c.conns_per_host {
+                        init_local_mux_connection(&init_state.channel, &init_state.url);
+                    }
                 }
-                Ok(send_len)
-            }
-            Ok(AsyncSink::NotReady(_)) => Err(Error::from(ErrorKind::WouldBlock)),
-            Err(_) => Err(Error::from(ErrorKind::Other)),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.send_channel.poll_complete();
-        Ok(())
-    }
-}
-
-pub struct ChannelMuxStream {
-    state: Arc<MuxStreamState>,
-    send_channel: mpsc::Sender<Event>,
-    recv_data_channel: Option<mpsc::Sender<Bytes>>,
-}
-
-impl ChannelMuxStream {
-    pub fn new(id: u32, s: &mpsc::Sender<Event>) -> Self {
-        let state = MuxStreamState {
-            stream_id: id,
-            send_buf_window: AtomicU32::new(0),
-            recv_buf_window: AtomicU32::new(0),
-            window_sem: Semaphore::new(1),
-            closed: AtomicBool::new(false),
-        };
-        Self {
-            state: Arc::new(state),
-            send_channel: s.clone(),
-            recv_data_channel: None,
-        }
-    }
-}
-
-impl MuxStream for ChannelMuxStream {
-    fn split(&mut self) -> (Box<dyn AsyncRead + Send>, Box<dyn AsyncWrite + Send>) {
-        let (send, recv) = mpsc::channel(1024);
-        self.recv_data_channel = Some(send);
-
-        let inner = MuxStreamInner {
-            state: self.state.clone(),
-            recv_buf: Cursor::new(Bytes::with_capacity(0)),
-            send_channel: self.send_channel.clone(),
-            recv_channel: recv,
-        };
-        let (r, w) = inner.split();
-        (Box::new(r), Box::new(w))
-    }
-    fn close(&mut self) {}
-    fn handle_recv_data(&mut self, data: Vec<u8>) {
-        let data_len = data.len() as u32;
-        match &mut self.recv_data_channel {
-            Some(tx) => {
-                tx.try_send(Bytes::from(data));
-            }
-            None => {
-                return;
+                Err(e) => {
+                    error!("invalid url:{}", u);
+                }
             }
         }
-        let recv_window_size = self
-            .state
-            .recv_buf_window
-            .fetch_add(data_len, Ordering::SeqCst);
-        if recv_window_size >= 32 * 1024 {
-            let ev = new_window_update_event(self.state.stream_id, recv_window_size, true);
-            self.send_channel.start_send(ev);
-            self.state
-                .recv_buf_window
-                .fetch_sub(recv_window_size, Ordering::SeqCst);
-        }
     }
-    fn handle_window_update(&mut self, len: u32) {
-        self.state.send_buf_window.fetch_add(len, Ordering::SeqCst);
-        if self.state.window_sem.available_permits() == 0 {
-            self.state.window_sem.add_permits(1);
-        }
-    }
-    fn id(&self) -> u32 {
-        self.state.stream_id
-    }
+
+    let interval = Interval::new_interval(Duration::from_secs(3));
+    let routine = interval
+        .for_each(|_| {
+            SESSIONS_HOLDER.lock().unwrap().routine();
+            Ok(())
+        })
+        .map_err(|e| {
+            error!("routine task error:{}", e);
+        });
+    tokio::spawn(routine);
 }
 
-pub struct ChannelMuxSession {
-    event_trigger_send: mpsc::Sender<Event>,
-    streams: HashMap<u32, ChannelMuxStream>,
-}
-
-impl ChannelMuxSession {
-    pub fn new(send: &mpsc::Sender<Event>) -> Self {
-        Self {
-            event_trigger_send: send.clone(),
-            streams: HashMap::new(),
+pub fn init_remote_mux_server(url: &String) {
+    let remote_url = Url::parse(url.as_str());
+    match remote_url {
+        Err(e) => {
+            error!("invalid remote url:{} with error:{}", url, e);
+            return;
         }
+        Ok(u) => match u.scheme() {
+            "tcp" => {
+                init_remote_tcp_channel(&u);
+            }
+            _ => {
+                error!("unknown scheme:{}", u.scheme());
+            }
+        },
     }
-}
-
-impl MuxSession for ChannelMuxSession {
-    fn new_stream(&mut self, sid: u32) -> &mut MuxStream {
-        let s = ChannelMuxStream::new(sid, &self.event_trigger_send);
-        self.streams.entry(sid).or_insert(s)
-    }
-    fn get_stream(&mut self, sid: u32) -> Option<&mut MuxStream> {
-        match self.streams.get_mut(&sid) {
-            Some(s) => Some(s),
-            None => None,
-        }
-    }
-    fn open_stream(&mut self, proto: &str, addr: &str) -> &mut MuxStream {
-        self.new_stream(1)
-    }
-    fn close_stream(&mut self, sid: u32, initial: bool) {}
 }

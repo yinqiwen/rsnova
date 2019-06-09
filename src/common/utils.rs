@@ -1,3 +1,5 @@
+use std::net::AddrParseError;
+use std::net::SocketAddr;
 use url::Url;
 
 pub fn get_hostport_from_url(url: &Url) -> Option<String> {
@@ -25,4 +27,13 @@ pub fn get_hostport_from_url(url: &Url) -> Option<String> {
         }
     };
     return Some(hostport);
+}
+
+pub fn get_listen_addr(addr: &str) -> Result<SocketAddr, AddrParseError> {
+    let mut laddr = addr.to_owned();
+    if addr.chars().nth(0).unwrap() == ':' {
+        laddr = "0.0.0.0".to_owned();
+        laddr.push_str(addr);
+    }
+    laddr.parse()
 }
