@@ -6,6 +6,8 @@ name = "rsnova"
 version = "0.1.0"
 authors = ["yinqiwen <yinqiwen@gmail.com>"]
 
+[features]
+
 [dependencies]
 clap = "~2.33"
 log = "0.4"
@@ -29,4 +31,8 @@ url = "1.7"
 rand = "0.6"
 skip32 = "1.0"
 orion ="0.14"
+nix = "0.14.1"
+cfg-if = "0.1"
+actix-http = "0.2"
+ring = "0.14"
 

@@ -1,18 +1,23 @@
 #![feature(drain_filter)]
+#![feature(pattern)]
 
+extern crate actix_http;
 #[macro_use]
 extern crate log;
 extern crate bincode;
 extern crate byteorder;
 extern crate bytes;
 extern crate clap;
+#[macro_use]
 extern crate futures;
 extern crate httparse;
 extern crate serde;
 
+extern crate nix;
 extern crate nom;
 extern crate orion;
 extern crate rand;
+extern crate ring;
 extern crate simplelog;
 extern crate skip32;
 

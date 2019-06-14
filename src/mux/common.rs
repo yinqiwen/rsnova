@@ -29,6 +29,18 @@ struct MuxStreamInner {
     send_channel: mpsc::Sender<Event>,
     recv_channel: mpsc::Receiver<Bytes>,
 }
+
+impl MuxStreamInner {
+    fn close(&mut self) {
+        if !self.state.closed.load(Ordering::SeqCst) {
+            self.state.closed.store(true, Ordering::SeqCst);
+            self.send_channel
+                .start_send(new_fin_event(self.state.stream_id, true));
+            self.send_channel.poll_complete();
+        }
+    }
+}
+
 impl AsyncRead for MuxStreamInner {}
 impl Read for MuxStreamInner {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -54,9 +66,7 @@ impl Read for MuxStreamInner {
 }
 impl AsyncWrite for MuxStreamInner {
     fn shutdown(&mut self) -> Result<Async<()>, io::Error> {
-        self.state.closed.store(true, Ordering::SeqCst);
-        //self.conn.lock().unwrap().close_stream(self.stream_id, true);
-        //self.send_channel.close();
+        self.close();
         Ok(Async::Ready(()))
     }
 }
@@ -93,6 +103,7 @@ impl Write for MuxStreamInner {
                 if self.state.send_buf_window.load(Ordering::SeqCst) > 0 {
                     send_permit.release(&self.state.window_sem);
                 }
+                self.send_channel.poll_complete();
                 Ok(send_len)
             }
             Ok(AsyncSink::NotReady(_)) => Err(Error::from(ErrorKind::WouldBlock)),
@@ -143,12 +154,19 @@ impl MuxStream for ChannelMuxStream {
         let (r, w) = inner.split();
         (Box::new(r), Box::new(w))
     }
-    fn close(&mut self) {}
+    fn close(&mut self) {
+        if !self.state.closed.load(Ordering::SeqCst) {
+            self.state.closed.store(true, Ordering::SeqCst);
+            self.send_channel
+                .start_send(new_fin_event(self.state.stream_id, true));
+        }
+    }
     fn handle_recv_data(&mut self, data: Vec<u8>) {
         let data_len = data.len() as u32;
         match &mut self.recv_data_channel {
             Some(tx) => {
-                tx.try_send(Bytes::from(data));
+                tx.start_send(Bytes::from(data));
+                tx.poll_complete();
             }
             None => {
                 return;
@@ -161,6 +179,7 @@ impl MuxStream for ChannelMuxStream {
         if recv_window_size >= 32 * 1024 {
             let ev = new_window_update_event(self.state.stream_id, recv_window_size, true);
             self.send_channel.start_send(ev);
+            self.send_channel.poll_complete();
             self.state
                 .recv_buf_window
                 .fetch_sub(recv_window_size, Ordering::SeqCst);
@@ -204,11 +223,16 @@ impl ChannelMuxSession {
 
 impl MuxSession for ChannelMuxSession {
     fn close(&mut self) {}
-    fn new_stream(&mut self, sid: u32) -> &mut MuxStream {
+    fn ping(&mut self) {
+        //info!("Send ping.");
+        self.event_trigger_send.start_send(new_ping_event(0));
+    }
+
+    fn new_stream(&mut self, sid: u32) -> &mut dyn MuxStream {
         let s = ChannelMuxStream::new(sid, &self.event_trigger_send);
         self.streams.entry(sid).or_insert(s)
     }
-    fn get_stream(&mut self, sid: u32) -> Option<&mut MuxStream> {
+    fn get_stream(&mut self, sid: u32) -> Option<&mut dyn MuxStream> {
         match self.streams.get_mut(&sid) {
             Some(s) => Some(s),
             None => None,
@@ -217,5 +241,15 @@ impl MuxSession for ChannelMuxSession {
     fn next_stream_id(&mut self) -> u32 {
         self.next_stream_id.fetch_add(2, Ordering::SeqCst)
     }
-    fn close_stream(&mut self, sid: u32, initial: bool) {}
+    fn close_stream(&mut self, sid: u32, initial: bool) {
+        let s = self.streams.remove(&sid);
+        if initial {
+            match s {
+                Some(mut stream) => {
+                    stream.close();
+                }
+                None => {}
+            }
+        }
+    }
 }

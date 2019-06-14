@@ -1,6 +1,6 @@
 use crate::mux::crypto::*;
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::BytesMut;
 use tokio::codec::{Decoder, Encoder};
 
 use std::io::{Error, ErrorKind};
@@ -8,15 +8,16 @@ use tokio::prelude::*;
 
 use tokio_io::io::{read_exact, write_all};
 use tokio_io::{AsyncRead, AsyncWrite};
-pub const FLAG_SYN: u8 = 0;
-pub const FLAG_FIN: u8 = 1;
-pub const FLAG_DATA: u8 = 2;
-pub const FLAG_WIN_UPDATE: u8 = 3;
-pub const FLAG_PING: u8 = 4;
-pub const FLAG_AUTH: u8 = 5;
+pub const FLAG_SYN: u8 = 1;
+pub const FLAG_FIN: u8 = 2;
+pub const FLAG_DATA: u8 = 3;
+pub const FLAG_WIN_UPDATE: u8 = 4;
+pub const FLAG_PING: u8 = 5;
+pub const FLAG_AUTH: u8 = 6;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 
+#[derive(Debug, Clone)]
 pub struct Header {
     pub flag_len: u32,
     pub stream_id: u32,
@@ -46,12 +47,29 @@ impl Header {
         self.set_flag_len(l, v);
     }
 }
-
+#[derive(Debug, Clone)]
 pub struct Event {
     pub header: Header,
     pub body: Vec<u8>,
 
     pub local: bool,
+}
+
+impl Event {
+    pub fn is_empty(&self) -> bool {
+        self.header.flags() == 0 as u8
+    }
+}
+
+pub fn new_empty_event() -> Event {
+    Event {
+        header: Header {
+            flag_len: get_flag_len(0, 0),
+            stream_id: 0,
+        },
+        body: Vec::new(),
+        local: false,
+    }
 }
 
 pub fn new_auth_event<T: serde::Serialize>(sid: u32, msg: &T, local: bool) -> Event {
@@ -76,6 +94,17 @@ pub fn new_fin_event(sid: u32, local: bool) -> Event {
         },
         body: Vec::new(),
         local: local,
+    }
+}
+
+pub fn new_ping_event(sid: u32) -> Event {
+    Event {
+        header: Header {
+            flag_len: get_flag_len(0, FLAG_PING),
+            stream_id: sid,
+        },
+        body: Vec::new(),
+        local: false,
     }
 }
 

@@ -8,8 +8,6 @@ use std::time::Duration;
 use tokio::prelude::*;
 use tokio::timer::Interval;
 
-use tokio::runtime::Runtime;
-
 use futures::sync::mpsc;
 use futures::Stream;
 
@@ -48,6 +46,10 @@ fn channel_url_key(n: &str, u: &str) -> String {
     s
 }
 
+fn ping_session(session: &mut dyn MuxSession) {
+    session.ping();
+}
+
 impl MuxSessionManager {
     fn new() -> Self {
         MuxSessionManager {
@@ -57,13 +59,18 @@ impl MuxSessionManager {
         }
     }
 
-    fn routine(&self) {
+    fn routine(&mut self) {
         for state in self.channel_states.values() {
             if state.conns < state.conns_per_host {
                 let gap = state.conns_per_host - state.conns;
                 for n in 0..gap {
                     init_local_mux_connection(&state.channel, &state.url);
                 }
+            }
+        }
+        for s in self.all_sessions.iter_mut() {
+            if !s.task_sender.is_closed() {
+                s.task_sender.start_send(Box::new(ping_session));
             }
         }
     }
@@ -97,7 +104,7 @@ impl MuxSessionManager {
         }
     }
 
-    fn do_select_session(&mut self) -> Option<mpsc::Sender<SessionTaskClosure>> {
+    fn do_select_session(&mut self, ch: &str) -> Option<mpsc::Sender<SessionTaskClosure>> {
         let c = self.cursor + 1;
         self.cursor = c;
         let idx = c as usize % self.all_sessions.len();
@@ -110,21 +117,42 @@ impl MuxSessionManager {
                 self.all_sessions.remove(idx as usize);
                 return None;
             }
-            return Some(data.task_sender.clone());
+            if ch.len() == 0 || data.channel == ch {
+                return Some(data.task_sender.clone());
+            }
         }
         return None;
     }
 
-    pub fn select_session(&mut self) -> Option<mpsc::Sender<SessionTaskClosure>> {
-        loop {
+    pub fn select_session_by_channel(
+        &mut self,
+        ch: &str,
+    ) -> Option<mpsc::Sender<SessionTaskClosure>> {
+        let mut loop_count = 0;
+        while loop_count < self.all_sessions.len() {
             if self.all_sessions.len() == 0 {
                 return None;
             }
-            if let Some(v) = self.do_select_session() {
+            if let Some(v) = self.do_select_session(ch) {
                 return Some(v);
             }
+            loop_count = loop_count + 1;
         }
+        None
     }
+}
+
+pub fn select_session() -> Option<mpsc::Sender<SessionTaskClosure>> {
+    SESSIONS_HOLDER
+        .lock()
+        .unwrap()
+        .select_session_by_channel("")
+}
+pub fn select_session_by_channel(ch: &str) -> Option<mpsc::Sender<SessionTaskClosure>> {
+    SESSIONS_HOLDER
+        .lock()
+        .unwrap()
+        .select_session_by_channel(ch)
 }
 
 pub fn add_session(

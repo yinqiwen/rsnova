@@ -1,3 +1,5 @@
+use crate::common::udp::*;
+use crate::common::utils::*;
 use crate::config::*;
 use crate::mux::channel::*;
 use crate::mux::common::*;
@@ -8,6 +10,7 @@ use std::io::{Error, ErrorKind};
 
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::net::UdpSocket;
 
 use tokio_io::io::write_all;
 use tokio_io::io::{copy, shutdown};
@@ -36,16 +39,38 @@ pub trait MuxStream: Sync + Send {
     fn id(&self) -> u32;
 }
 
+fn proxy_stream<R>(
+    local_reader: Box<dyn AsyncRead + Send>,
+    local_writer: Box<dyn AsyncWrite + Send>,
+    remote: R,
+) -> impl Future<Item = (u64, u64), Error = std::io::Error>
+where
+    R: AsyncRead + AsyncWrite,
+{
+    let (remote_reader, remote_writer) = remote.split();
+    let mut remote_reader = TimeoutReader::new(remote_reader);
+    let mut local_reader = TimeoutReader::new(local_reader);
+    let timeout = Duration::from_secs(get_config().lock().unwrap().read_timeout_sec);
+    remote_reader.set_timeout(Some(timeout));
+    local_reader.set_timeout(Some(timeout));
+    let copy_to_remote = copy(local_reader, remote_writer)
+        .and_then(|(n, _, server_writer)| shutdown(server_writer).map(move |_| n));;
+    let copy_to_local = copy(remote_reader, local_writer)
+        .and_then(|(n, _, client_writer)| shutdown(client_writer).map(move |_| n));;
+    copy_to_remote.join(copy_to_local)
+}
+
 //pub type MuxStreamRef = Box<dyn MuxStream>;
 
 pub trait MuxSession: Send {
-    fn new_stream(&mut self, sid: u32) -> &mut MuxStream;
-    fn get_stream(&mut self, sid: u32) -> Option<&mut MuxStream>;
+    fn new_stream(&mut self, sid: u32) -> &mut dyn MuxStream;
+    fn get_stream(&mut self, sid: u32) -> Option<&mut dyn MuxStream>;
     fn next_stream_id(&mut self) -> u32;
     fn close_stream(&mut self, sid: u32, initial: bool);
     fn close(&mut self);
+    fn ping(&mut self);
 
-    fn open_stream(&mut self, proto: &str, addr: &str) -> &mut MuxStream {
+    fn open_stream(&mut self, proto: &str, addr: &str) -> &mut dyn MuxStream {
         let next_id = self.next_stream_id();
         let s = self.new_stream(next_id);
         let c = ConnectRequest {
@@ -83,36 +108,65 @@ pub trait MuxSession: Send {
     fn handle_syn(&mut self, ev: Event) {
         let s = self.new_stream(ev.header.stream_id);
         let (local_reader, local_writer) = s.split();
-        let connect_req: ConnectRequest = bincode::deserialize(&ev.body[..]).unwrap();
-        let addr = connect_req.addr.parse().unwrap();
-        if connect_req.proto == "udp" {}
-        let proxy = TcpStream::connect(&addr)
-            .and_then(move |socket| {
-                // let s = self.get_stream(sid).unwrap();
-                let (remote_reader, remote_writer) = socket.split();
-                let mut remote_reader = TimeoutReader::new(remote_reader);
-                let mut local_reader = TimeoutReader::new(local_reader);
-                let timeout = Duration::from_secs(get_config().lock().unwrap().read_timeout_sec);
-                remote_reader.set_timeout(Some(timeout));
-                local_reader.set_timeout(Some(timeout));
-                let copy_to_remote = copy(local_reader, remote_writer)
-                    .and_then(|(n, _, server_writer)| shutdown(server_writer).map(move |_| n));;
-                let copy_to_local = copy(remote_reader, local_writer)
-                    .and_then(|(n, _, client_writer)| shutdown(client_writer).map(move |_| n));;
-                copy_to_remote.join(copy_to_local)
-            })
-            .map(move |(from_client, from_server)| {
-                //self.close_stream(sid, true);
-                info!(
-                    "client at {} wrote {} bytes and received {} bytes",
-                    addr, from_client, from_server
+        let connect_req: ConnectRequest = match bincode::deserialize(&ev.body[..]) {
+            Ok(m) => m,
+            Err(err) => {
+                error!("Failed to parse ConnectRequest with error:{}", err);
+                return;
+            }
+        };
+        let addr = match connect_req.addr.parse() {
+            Ok(m) => m,
+            Err(err) => {
+                error!(
+                    "Failed to parse addr with error:{} from connect request:{}",
+                    err, connect_req.addr
                 );
-            })
-            .map_err(|e| {
-                error!("error: {}", e);
-                //local_writer.shutdown();
-            });
-        tokio::spawn(proxy);
+                return;
+            }
+        };
+        if connect_req.proto == "udp" {
+            let lport = get_available_udp_port();
+            let laddr = format!("0.0.0.0:{}", lport).parse().unwrap();
+            let u = match UdpSocket::bind(&laddr) {
+                Ok(m) => m,
+                Err(err) => {
+                    error!("Failed to bind udp addr:{} with error:{}", laddr, err);
+                    return;
+                }
+            };
+            if let Err(e) = u.connect(&addr) {
+                error!("Failed to connect udp addr:{} with error:{}", addr, e);
+                return;
+            }
+            let conn = UdpConnection::new(u);
+            let proxy = proxy_stream(local_reader, local_writer, conn)
+                .map_err(|e| {
+                    error!("udp proxy error: {}", e);
+                })
+                .map(move |(from_client, from_server)| {
+                    info!(
+                        "client at {} wrote {} bytes and received {} bytes",
+                        addr, from_client, from_server
+                    );
+                });
+            tokio::spawn(proxy);
+        } else {
+            let proxy = TcpStream::connect(&addr)
+                .and_then(move |socket| proxy_stream(local_reader, local_writer, socket))
+                .map(move |(from_client, from_server)| {
+                    //self.close_stream(sid, true);
+                    info!(
+                        "client at {} wrote {} bytes and received {} bytes",
+                        addr, from_client, from_server
+                    );
+                })
+                .map_err(|e| {
+                    error!("tcp proxy error: {}", e);
+                    //local_writer.shutdown();
+                });
+            tokio::spawn(proxy);
+        }
     }
     fn handle_mux_event(&mut self, ev: Event) -> Option<Event> {
         match ev.header.flags() {
@@ -126,6 +180,12 @@ pub trait MuxSession: Send {
             }
             FLAG_DATA => {
                 self.handle_data(ev);
+                None
+            }
+            FLAG_PING => {
+                //self.handle_window_update(ev);
+                info!("Recv ping.");
+                //self.ping();
                 None
             }
             FLAG_WIN_UPDATE => {
@@ -213,6 +273,8 @@ struct MuxConnectionProcessor<T: AsyncRead + AsyncWrite> {
     task_send: mpsc::Sender<SessionTaskClosure>,
     task_recv: mpsc::Receiver<SessionTaskClosure>,
     session: ChannelMuxSession,
+    last_unsent_event: Event,
+    closed: bool,
 }
 
 impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
@@ -229,54 +291,116 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
             task_send: atx,
             task_recv: arx,
             session: session,
+            last_unsent_event: new_empty_event(),
+            closed: false,
         }
     }
     fn close(&mut self) {
+        self.closed = true;
         self.session.close();
         self.local_ev_send.close();
         self.remote_ev_send.close();
         self.task_send.close();
     }
-}
 
-impl<T: AsyncRead + AsyncWrite> Stream for MuxConnectionProcessor<T> {
-    type Item = ();
-    type Error = std::io::Error;
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let r1 = self.local_ev_recv.poll();
-        match r1 {
-            Ok(Async::Ready(v)) => match v {
-                None => {
-                    return Ok(Async::Ready(Some(())));
-                }
-                Some(ev) => {
-                    if FLAG_FIN == ev.header.flags() {
-                        self.session.close_stream(ev.header.stream_id, true);
-                    }
-                    self.remote_ev_send.start_send(ev);
-                    return Ok(Async::Ready(Some(())));
-                }
-            },
-            Err(_) => {
-                error!("Local event recv error");
+    fn try_send_event(&mut self, ev: Event) -> Result<bool, std::io::Error> {
+        match self.remote_ev_send.start_send(ev) {
+            Ok(AsyncSink::Ready) => {
+                return Ok(true);
+            }
+            Ok(AsyncSink::NotReady(v)) => {
+                self.last_unsent_event = v;
+                Ok(false)
+            }
+            Err(e) => {
+                error!("Remote event send error:{}", e);
                 self.close();
                 return Err(Error::from(ErrorKind::ConnectionReset));
             }
+        }
+    }
+
+    fn poll_local_event(&mut self) -> Poll<Option<()>, std::io::Error> {
+        let mut not_ready = true;
+        if self.last_unsent_event.is_empty() {
+            match self.local_ev_recv.poll() {
+                Ok(Async::Ready(v)) => match v {
+                    None => {
+                        info!("local none event");
+                        return Ok(Async::Ready(Some(())));
+                    }
+                    Some(ev) => {
+                        not_ready = false;
+                        debug!("recv local event:{}", ev.header.flags());
+                        if FLAG_FIN == ev.header.flags() {
+                            self.session.close_stream(ev.header.stream_id, true);
+                        }
+                        match self.try_send_event(ev) {
+                            Err(e) => {
+                                error!("Remote event send error:{}", e);
+                                self.close();
+                                return Err(Error::from(ErrorKind::ConnectionReset));
+                            }
+                            _ => {}
+                        }
+                        //return Ok(Async::Ready(Some(())));
+                    }
+                },
+                Err(_) => {
+                    error!("Local event recv error");
+                    self.close();
+                    return Err(Error::from(ErrorKind::ConnectionReset));
+                }
+                Ok(Async::NotReady) => {
+                    //
+                }
+            };
+        } else {
+            let sev = self.last_unsent_event.clone();
+            match self.try_send_event(sev) {
+                Err(e) => {
+                    error!("Remote event send error:{}", e);
+                    self.close();
+                    return Err(Error::from(ErrorKind::ConnectionReset));
+                }
+                Ok(true) => {
+                    self.last_unsent_event = new_empty_event();
+                }
+                _ => {}
+            }
+        }
+        match self.local_ev_send.poll_complete() {
             Ok(Async::NotReady) => {
                 //
             }
+            Ok(Async::Ready(_)) => {
+                //not_ready = false;
+            }
+            Err(_) => {
+                error!("Local event flush error");
+                self.close();
+                return Err(Error::from(ErrorKind::ConnectionReset));
+            }
+        };
+        if not_ready {
+            Ok(Async::NotReady)
+        } else {
+            Ok(Async::Ready(Some(())))
         }
-        let r2 = self.remote_ev_recv.poll();
-        match r2 {
+    }
+    fn poll_remote_event(&mut self) -> Poll<Option<()>, std::io::Error> {
+        let mut not_ready = true;
+        match self.remote_ev_recv.poll() {
             Ok(Async::Ready(v)) => match v {
                 None => {
-                    return Ok(Async::Ready(Some(())));
+                    warn!("recv none remote");
+                    self.close();
+                    return Err(Error::from(ErrorKind::ConnectionReset));
                 }
                 Some(ev) => {
-                    if let Some(res) = self.session.handle_mux_event(ev) {
-                        self.remote_ev_send.start_send(res);
-                    }
-                    return Ok(Async::Ready(Some(())));
+                    info!("recv remote event:{}", ev.header.flags());
+                    self.session.handle_mux_event(ev);
+                    not_ready = false;
                 }
             },
             Err(e) => {
@@ -287,16 +411,39 @@ impl<T: AsyncRead + AsyncWrite> Stream for MuxConnectionProcessor<T> {
             Ok(Async::NotReady) => {
                 //
             }
+        };
+        match self.remote_ev_send.poll_complete() {
+            Ok(Async::NotReady) => {
+                //
+            }
+            Ok(Async::Ready(_)) => {
+                //not_ready = false;
+            }
+            Err(e) => {
+                error!("Local event flush error:{}", e);
+                self.close();
+                return Err(Error::from(ErrorKind::ConnectionReset));
+            }
+        };
+        if not_ready {
+            Ok(Async::NotReady)
+        } else {
+            Ok(Async::Ready(Some(())))
         }
-        let r3 = self.task_recv.poll();
-        match r3 {
+    }
+
+    fn poll_task(&mut self) -> Poll<Option<()>, std::io::Error> {
+        let mut not_ready = true;
+        match self.task_recv.poll() {
             Ok(Async::Ready(v)) => match v {
                 None => {
+                    info!("recv none task");
                     return Ok(Async::Ready(Some(())));
                 }
                 Some(func) => {
+                    debug!("recv task");
                     func(&mut self.session);
-                    return Ok(Async::Ready(Some(())));
+                    not_ready = false;
                 }
             },
             Err(_) => {
@@ -307,8 +454,77 @@ impl<T: AsyncRead + AsyncWrite> Stream for MuxConnectionProcessor<T> {
             Ok(Async::NotReady) => {
                 //
             }
+        };
+        match self.task_send.poll_complete() {
+            Ok(Async::NotReady) => {
+                //
+            }
+            Ok(Async::Ready(_)) => {
+                //not_ready = false;
+            }
+            Err(_) => {
+                error!("Task event flush error");
+                self.close();
+                return Err(Error::from(ErrorKind::ConnectionReset));
+            }
+        };
+        if not_ready {
+            Ok(Async::NotReady)
+        } else {
+            Ok(Async::Ready(Some(())))
         }
-        Ok(Async::NotReady)
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite> Stream for MuxConnectionProcessor<T> {
+    type Item = ();
+    type Error = std::io::Error;
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        if self.closed {
+            return Err(Error::from(ErrorKind::ConnectionReset));
+        }
+        let mut all_not_ready = true;
+        match self.poll_remote_event() {
+            Err(e) => {
+                return Err(e);
+            }
+            Ok(Async::Ready(_)) => {
+                info!("0 return with {}", all_not_ready);
+                all_not_ready = false;
+            }
+            Ok(Async::NotReady) => {
+                //
+            }
+        };
+        match self.poll_local_event() {
+            Err(e) => {
+                return Err(e);
+            }
+            Ok(Async::Ready(_)) => {
+                info!("1 return with {}", all_not_ready);
+                all_not_ready = false;
+            }
+            Ok(Async::NotReady) => {
+                //
+            }
+        };
+        match self.poll_task() {
+            Err(e) => {
+                return Err(e);
+            }
+            Ok(Async::Ready(_)) => {
+                info!("2 return with {}", all_not_ready);
+                all_not_ready = false;
+            }
+            Ok(Async::NotReady) => {
+                //
+            }
+        };
+        if all_not_ready {
+            Ok(Async::NotReady)
+        } else {
+            Ok(Async::Ready(Some(())))
+        }
     }
 }
 
@@ -323,8 +539,12 @@ pub fn process_server_connection<T: AsyncRead + AsyncWrite>(
             error!("Faield to server auth connection with reason:{}", err);
         })
         .and_then(move |(_ctx, _conn, _res)| {
-            let ctx = CryptoContext::new(_res.method.as_str(), key.as_str(), _res.rand);
-            let processor = MuxConnectionProcessor::new(ctx, _conn, false);
+            let nctx = CryptoContext::new(_res.method.as_str(), key.as_str(), _res.rand);
+            info!(
+                "Recv connected client with method:{} rand:{}",
+                _res.method, _res.rand
+            );
+            let processor = MuxConnectionProcessor::new(nctx, _conn, false);
             processor.for_each(|_| Ok(())).map_err(|_| {})
         })
 }
@@ -344,7 +564,7 @@ pub fn process_client_connection<T: AsyncRead + AsyncWrite>(
             error!("Faield to auth connection with reason:{}", err);
         })
         .and_then(move |(_, conn, res)| {
-            info!("Connected server with rand:{}", res.rand);
+            info!("Connected server with  method:{} rand:{}", method, res.rand);
             let ctx = CryptoContext::new(method.as_str(), key.as_str(), res.rand);
             let processor = MuxConnectionProcessor::new(ctx, conn, true);
             if add_session(channel_str.as_str(), url_str.as_str(), &processor.task_send) {
