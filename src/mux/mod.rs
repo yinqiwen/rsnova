@@ -7,4 +7,5 @@ mod crypto;
 //mod direct;
 mod event;
 mod message;
+pub mod relay;
 mod tcp;

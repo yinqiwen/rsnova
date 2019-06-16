@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 
 use tokio::io;
+use tokio_io::io::shutdown;
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use futures::sync::mpsc;
@@ -27,7 +28,7 @@ struct MuxStreamInner {
     state: Arc<MuxStreamState>,
     recv_buf: Cursor<Bytes>,
     send_channel: mpsc::Sender<Event>,
-    recv_channel: mpsc::Receiver<Bytes>,
+    recv_channel: mpsc::Receiver<Vec<u8>>,
 }
 
 impl MuxStreamInner {
@@ -37,6 +38,7 @@ impl MuxStreamInner {
             self.send_channel
                 .start_send(new_fin_event(self.state.stream_id, true));
             self.send_channel.poll_complete();
+            self.state.window_sem.close();
         }
     }
 }
@@ -56,7 +58,7 @@ impl Read for MuxStreamInner {
                 Ok(Async::NotReady) => Err(Error::from(ErrorKind::WouldBlock)),
                 Ok(Async::Ready(None)) => Err(Error::from(ErrorKind::ConnectionReset)),
                 Ok(Async::Ready(Some(b))) => {
-                    self.recv_buf = Cursor::new(b);
+                    self.recv_buf = Cursor::new(Bytes::from(b));
                     self.recv_buf.read(buf)
                 }
                 Err(_) => Err(Error::from(ErrorKind::Other)),
@@ -120,7 +122,7 @@ impl Write for MuxStreamInner {
 pub struct ChannelMuxStream {
     state: Arc<MuxStreamState>,
     send_channel: mpsc::Sender<Event>,
-    recv_data_channel: Option<mpsc::Sender<Bytes>>,
+    recv_data_channel: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl ChannelMuxStream {
@@ -159,13 +161,16 @@ impl MuxStream for ChannelMuxStream {
             self.state.closed.store(true, Ordering::SeqCst);
             self.send_channel
                 .start_send(new_fin_event(self.state.stream_id, true));
+            if let Some(s) = &mut self.recv_data_channel {
+                s.close();
+            }
         }
     }
     fn handle_recv_data(&mut self, data: Vec<u8>) {
         let data_len = data.len() as u32;
         match &mut self.recv_data_channel {
             Some(tx) => {
-                tx.start_send(Bytes::from(data));
+                tx.start_send(data);
                 tx.poll_complete();
             }
             None => {

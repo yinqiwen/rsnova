@@ -34,5 +34,5 @@ orion ="0.14"
 nix = "0.14.1"
 cfg-if = "0.1"
 actix-http = "0.2"
-ring = "0.14"
+twoway = "0.2"
 

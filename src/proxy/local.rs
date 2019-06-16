@@ -1,19 +1,15 @@
+use super::http::handle_http_connection;
+use super::socks5::handle_socks5_connection;
+use super::tls::handle_tls_connection;
+use super::tls::{peek_sni, valid_tls_version};
 use crate::common::io::*;
-use crate::mux::channel::*;
-use crate::mux::mux::*;
-use crate::proxy::http::*;
+use crate::common::MyTcpStream;
 use crate::proxy::misc::*;
 
-use bytes::BytesMut;
-
 use std::net::SocketAddr;
-use url::{Host, HostAndPort, Url};
-
 use tokio::io::Error as TokioIOError;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio_io::io::ReadHalf;
-use tokio_io::io::WriteHalf;
 use tokio_io::AsyncRead;
 
 use tokio_io::io::{read_exact, read_until};
@@ -30,11 +26,11 @@ pub struct LocalContext {
     pub origin_dst: Option<SocketAddr>,
     pub is_https: bool,
     pub is_socks: bool,
-    pub target: Option<HostAndPort>,
+    pub target: Option<String>,
     pub default_port: u16,
 }
 impl LocalContext {
-    fn is_transparent(&self) -> bool {
+    pub fn is_transparent(&self) -> bool {
         self.origin_dst != None
     }
 }
@@ -43,41 +39,53 @@ fn handle_local_connection(socket: TcpStream) -> impl Future<Item = (), Error = 
     let origin_dst = get_origin_dst(&socket);
     let mut ctx: LocalContext = Default::default();
     ctx.origin_dst = origin_dst;
-    let (local_reader, local_writer) = socket.split();
-    peek_exact(local_reader, [0u8; 3]).and_then(move |(_reader, _data)| {
-        if ctx.origin_dst == None {
-            match _data[0] {
-                5 => {
-                    //socks5
-                }
-                4 => {
-                    //socks4
-                    error!("socks4 not supported!");
-                    return future::err(other("unimplemented"));
-                }
-                _ => {
-                    //continue
+    let mysocket = MyTcpStream::new(socket);
+    let (local_reader, local_writer) = mysocket.split();
+    peek_exact(local_reader, [0u8; 3])
+        .map_err(|(_r, e)| e)
+        .and_then(move |(_reader, _data)| {
+            if ctx.origin_dst == None {
+                match _data[0] {
+                    5 => {
+                        //socks5
+                        info!("Accept client as SOCKS5 proxy.");
+                        tokio::spawn(handle_socks5_connection(ctx, _reader, local_writer));
+                        return future::ok(());
+                    }
+                    4 => {
+                        //socks4
+                        error!("socks4 not supported!");
+                        return future::err(other("unimplemented"));
+                    }
+                    _ => {
+                        //continue
+                    }
                 }
             }
-        }
-        if let Ok(prefix_str) = std::str::from_utf8(&_data) {
-            let prefix_str = prefix_str.to_uppercase();
-            match prefix_str.as_str() {
-                "GET" | "PUT" | "POS" | "DEL" | "OPT" | "TRA" | "PAT" | "HEA" | "CON" => {
-                    //http proxy
-                    if prefix_str.as_str() == "CON" {
-                        ctx.is_https = true;
+            if let Ok(prefix_str) = std::str::from_utf8(&_data) {
+                let prefix_str = prefix_str.to_uppercase();
+                match prefix_str.as_str() {
+                    "GET" | "PUT" | "POS" | "DEL" | "OPT" | "TRA" | "PAT" | "HEA" | "CON" => {
+                        info!("Accept client as HTTP proxy with method:{}", prefix_str);
+                        //http proxy
+                        if prefix_str.as_str() == "CON" {
+                            ctx.is_https = true;
+                        }
+                        tokio::spawn(handle_http_connection(ctx, _reader, local_writer));
+                        return future::ok(());
                     }
-                    handle_http_connection(ctx, _reader, local_writer);
-                    //tokio::spawn(task);
+                    _ => {
+                        //try tls proxy
+                    }
+                };
+            } else {
+                if valid_tls_version(&_data[..]) {
+                    tokio::spawn(handle_tls_connection(ctx, _reader, local_writer));
+                    return future::ok(());
                 }
-                _ => {
-                    //try tls proxy
-                }
-            };
-        }
-        future::ok(())
-    })
+            }
+            future::err(other("unsupported traffic"))
+        })
 }
 
 pub fn start_local_server(addr: &str) {

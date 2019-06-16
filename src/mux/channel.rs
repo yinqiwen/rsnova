@@ -197,7 +197,7 @@ pub fn init_local_mux_channels(cs: &Vec<ChannelConfig>) {
                     }
                 }
                 Err(e) => {
-                    error!("invalid url:{}", u);
+                    error!("invalid url:{} for reason:{}", u, e);
                 }
             }
         }

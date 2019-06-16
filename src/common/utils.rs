@@ -53,26 +53,3 @@ pub fn get_available_udp_port() -> u16 {
         None => 0,
     }
 }
-
-pub fn find_str_in_bytes(buf: &BytesMut, s: &str) -> Option<usize> {
-    let mut i = 0;
-    let b = buf.as_ref();
-    while i < buf.len() {
-        let c = b[i] as char;
-        if s.find(c) != None {
-            if i + s.len() < buf.len() {
-                if let Ok(ss) = std::str::from_utf8(&b[i..(i + s.len())]) {
-                    if ss == s {
-                        return Some(i);
-                    }
-                }
-            } else {
-                return None;
-            }
-            i = i + 1;
-        } else {
-            i = i + s.len();
-        }
-    }
-    None
-}

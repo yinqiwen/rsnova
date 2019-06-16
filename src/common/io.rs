@@ -1,5 +1,6 @@
 use crate::common::utils::*;
 
+use std::io::Error;
 use std::io::ErrorKind;
 use tokio::prelude::*;
 use tokio_io::AsyncRead;
@@ -15,6 +16,10 @@ use std::mem;
 use futures::{Future, Poll};
 
 use std::net::SocketAddr;
+
+pub fn other_error(desc: &str) -> std::io::Error {
+    std::io::Error::new(ErrorKind::Other, desc)
+}
 
 pub enum HostPort {
     DomainPort(String, u16),
@@ -55,9 +60,12 @@ where
                         return Ok(Async::NotReady);
                     }
                     Ok(Async::Ready(n)) => {
+                        if 0 == n {
+                            return Err(Error::from(ErrorKind::ConnectionReset));
+                        }
                         buf.reserve(n);
                         buf.put_slice(&r[0..n]);
-                        if let Some(pos) = find_str_in_bytes(&buf, separator.as_str()) {
+                        if let Some(pos) = twoway::find_bytes(&buf, separator.as_bytes()) {
                             let wsize = separator.len();
                             let body = buf.split_off(pos + wsize);
                             match mem::replace(&mut self.state, State::Empty) {
@@ -81,14 +89,14 @@ where
     }
 }
 
-pub fn read_until_separator<A>(a: A, separator: &str, buf: &[u8]) -> ReadUntilSeparator<A>
+pub fn read_until_separator<A>(a: A, separator: &str) -> ReadUntilSeparator<A>
 where
     A: AsyncRead,
 {
     ReadUntilSeparator {
         state: State::Reading {
             separator: String::from(separator),
-            buf: BytesMut::from(buf),
+            buf: BytesMut::new(),
             reader: a,
         },
     }
@@ -131,6 +139,20 @@ where
     }
 }
 
+pub fn peek_exact2<R, T>(r: PeekableReader<R>, buf: T) -> PeekExact<R, T>
+where
+    R: AsyncRead,
+    T: AsMut<[u8]>,
+{
+    PeekExact {
+        state: PeekState::Reading {
+            a: r,
+            buf: buf,
+            pos: 0,
+        },
+    }
+}
+
 fn eof() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, "early eof")
 }
@@ -141,9 +163,10 @@ where
     T: AsMut<[u8]>,
 {
     type Item = (PeekableReader<R>, T);
-    type Error = io::Error;
+    type Error = (PeekableReader<R>, io::Error);
 
-    fn poll(&mut self) -> Poll<Self::Item, io::Error> {
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let mut err: Option<std::io::Error> = None;
         match self.state {
             PeekState::Reading {
                 ref mut a,
@@ -152,19 +175,35 @@ where
             } => {
                 let buf = buf.as_mut();
                 while *pos < buf.len() {
-                    let n = try_ready!(a.poll_peek(&mut buf[*pos..]));
-                    *pos += n;
-                    if n == 0 {
-                        return Err(eof());
+                    match a.poll_peek(&mut buf[*pos..]) {
+                        Ok(Async::NotReady) => {
+                            return Ok(Async::NotReady);
+                        }
+                        Ok(Async::Ready(n)) => {
+                            *pos += n;
+                            if n == 0 {
+                                err = Some(eof());
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
                     }
                 }
             }
             PeekState::Empty => panic!("poll a ReadExact after it's done"),
         }
-
-        match mem::replace(&mut self.state, PeekState::Empty) {
-            PeekState::Reading { a, buf, .. } => Ok((a, buf).into()),
-            PeekState::Empty => panic!(),
+        match err {
+            None => match mem::replace(&mut self.state, PeekState::Empty) {
+                PeekState::Reading { a, buf, .. } => Ok((a, buf).into()),
+                PeekState::Empty => panic!(),
+            },
+            Some(e) => match mem::replace(&mut self.state, PeekState::Empty) {
+                PeekState::Reading { a, buf, .. } => Err((a, e).into()),
+                PeekState::Empty => panic!(),
+            },
         }
     }
 }
@@ -224,15 +263,93 @@ where
     T: AsyncRead,
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        debug!("enter peek read {}!", self.peek_buf.len());
         if self.peek_buf.len() == 0 {
-            return self.inner.read(buf);
+            let ret = self.inner.read(buf);
+            match &ret {
+                Ok(v) => {
+                    debug!("enter peek read return {}!", v);
+                }
+                Err(e) => {
+                    debug!("enter peek read return {}!", e);
+                }
+            };
+            return ret;
         }
         let mut n = self.peek_buf.len();
         if n > buf.len() {
             n = buf.len();
         }
-        buf.copy_from_slice(&self.peek_buf[0..n]);
+        buf[0..n].copy_from_slice(&self.peek_buf[0..n]);
         self.peek_buf.advance(n);
+        debug!("enter peek read return ok {}!", n);
         Ok(n)
+    }
+}
+
+pub struct AsyncReadWriter<R, W> {
+    r: R,
+    w: W,
+}
+
+impl<R, W> AsyncReadWriter<R, W>
+where
+    R: AsyncRead,
+    W: AsyncWrite,
+{
+    pub fn new(a: R, b: W) -> Self {
+        Self { r: a, w: b }
+    }
+}
+
+impl<R, W> Read for AsyncReadWriter<R, W>
+where
+    R: AsyncRead,
+    W: AsyncWrite,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.r.read(buf)
+    }
+}
+
+impl<R, W> Write for AsyncReadWriter<R, W>
+where
+    R: AsyncRead,
+    W: AsyncWrite,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.w.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
+}
+
+impl<R, W> AsyncRead for AsyncReadWriter<R, W>
+where
+    R: AsyncRead,
+    W: AsyncWrite,
+{
+    unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [u8]) -> bool {
+        self.r.prepare_uninitialized_buffer(buf)
+    }
+
+    fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Poll<usize, std::io::Error> {
+        self.r.read_buf(buf)
+    }
+}
+
+impl<R, W> AsyncWrite for AsyncReadWriter<R, W>
+where
+    R: AsyncRead,
+    W: AsyncWrite,
+{
+    fn shutdown(&mut self) -> Poll<(), std::io::Error> {
+        self.w.shutdown()
+    }
+
+    fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, std::io::Error> {
+        self.w.write_buf(buf)
     }
 }

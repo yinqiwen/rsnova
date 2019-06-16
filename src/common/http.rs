@@ -44,7 +44,6 @@ pub struct HttpStream {
     socket: TcpStream,
     state: HttpDecodeState,
     recv_buf: BytesMut,
-    chunked_body: bool,
     body_length: i64,
 }
 
@@ -54,8 +53,7 @@ impl HttpStream {
             socket: sock,
             state: HttpDecodeState::DECODING_HEADER,
             recv_buf: BytesMut::new(),
-            chunked_body: false,
-            body_length: -1,
+            body_length: 0,
         }
     }
 }
@@ -70,9 +68,14 @@ impl Stream for HttpStream {
         self.recv_buf.reserve(1024);
         let pos = self.recv_buf.len();
         match self.socket.poll_read(&mut self.recv_buf[pos..]) {
-            Ok(Async::Ready(n)) => unsafe {
-                self.recv_buf.set_len(pos + n);
-            },
+            Ok(Async::Ready(n)) => {
+                if 0 == n {
+                    return Err(Error::from(ErrorKind::ConnectionReset));
+                }
+                unsafe {
+                    self.recv_buf.set_len(pos + n);
+                }
+            }
             Err(e) => {
                 return Err(e);
             }
@@ -117,7 +120,6 @@ impl Stream for HttpStream {
                     match hn.as_str() {
                         "transfer-encoding" => {
                             if String::from_utf8_lossy(&header.value[..]).contains("chunked") {
-                                self.chunked_body = true;
                                 self.body_length = -1;
                             }
                         }
@@ -125,7 +127,6 @@ impl Stream for HttpStream {
                             match String::from_utf8_lossy(&header.value[..]).parse::<u64>() {
                                 Ok(v) => {
                                     self.body_length = v as i64;
-                                    self.chunked_body = false;
                                 }
                                 Err(_) => {
                                     error!(
@@ -140,17 +141,25 @@ impl Stream for HttpStream {
                             //do nothing
                         }
                     }
-                    if hn == "transfer-encoding" {}
                     hreq.headers.push(header);
                 }
                 self.recv_buf.advance(header_len);
                 return Ok(Async::Ready(Some(HttpMessage::Request(hreq))));
             }
             DECODING_BODY => {
-                if self.chunked_body {
+                if self.body_length < 0 {
+                    let chunk = Bytes::from(&self.recv_buf[..]);
+                    self.recv_buf.clear();
 
+                    return Ok(Async::Ready(Some(HttpMessage::Chunk(chunk))));
+                } else if self.body_length > 0 {
+                    self.body_length = self.body_length - self.recv_buf.len() as i64;
+                    let chunk = Bytes::from(&self.recv_buf[..]);
+                    self.recv_buf.clear();
+                    return Ok(Async::Ready(Some(HttpMessage::Chunk(chunk))));
                 } else {
-
+                    self.state = HttpDecodeState::DECODING_HEADER;
+                    return Ok(Async::Ready(None));
                 }
                 return Ok(Async::Ready(None));
             }

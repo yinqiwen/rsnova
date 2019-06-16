@@ -42,7 +42,7 @@ impl Config {
                 key: String::from("44eb1a8421c5f9c96e405a77f70646c8"),
                 method: String::from("chacha20poly1305"),
             },
-            read_timeout_sec: 10,
+            read_timeout_sec: 30,
             local: Default::default(),
             remote: Default::default(),
         }

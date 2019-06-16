@@ -1,5 +1,6 @@
 #![feature(drain_filter)]
 #![feature(pattern)]
+#![feature(trait_alias)]
 
 extern crate actix_http;
 #[macro_use]
@@ -17,7 +18,6 @@ extern crate nix;
 extern crate nom;
 extern crate orion;
 extern crate rand;
-extern crate ring;
 extern crate simplelog;
 extern crate skip32;
 
@@ -26,6 +26,7 @@ extern crate tokio_io;
 extern crate tokio_io_timeout;
 extern crate tokio_sync;
 extern crate tokio_udp;
+extern crate twoway;
 
 extern crate url;
 

@@ -1,3 +1,5 @@
+use super::relay::relay_connection;
+use crate::common::io::*;
 use crate::common::udp::*;
 use crate::common::utils::*;
 use crate::config::*;
@@ -115,58 +117,16 @@ pub trait MuxSession: Send {
                 return;
             }
         };
-        let addr = match connect_req.addr.parse() {
-            Ok(m) => m,
-            Err(err) => {
-                error!(
-                    "Failed to parse addr with error:{} from connect request:{}",
-                    err, connect_req.addr
-                );
-                return;
-            }
-        };
-        if connect_req.proto == "udp" {
-            let lport = get_available_udp_port();
-            let laddr = format!("0.0.0.0:{}", lport).parse().unwrap();
-            let u = match UdpSocket::bind(&laddr) {
-                Ok(m) => m,
-                Err(err) => {
-                    error!("Failed to bind udp addr:{} with error:{}", laddr, err);
-                    return;
-                }
-            };
-            if let Err(e) = u.connect(&addr) {
-                error!("Failed to connect udp addr:{} with error:{}", addr, e);
-                return;
-            }
-            let conn = UdpConnection::new(u);
-            let proxy = proxy_stream(local_reader, local_writer, conn)
-                .map_err(|e| {
-                    error!("udp proxy error: {}", e);
-                })
-                .map(move |(from_client, from_server)| {
-                    info!(
-                        "client at {} wrote {} bytes and received {} bytes",
-                        addr, from_client, from_server
-                    );
-                });
-            tokio::spawn(proxy);
-        } else {
-            let proxy = TcpStream::connect(&addr)
-                .and_then(move |socket| proxy_stream(local_reader, local_writer, socket))
-                .map(move |(from_client, from_server)| {
-                    //self.close_stream(sid, true);
-                    info!(
-                        "client at {} wrote {} bytes and received {} bytes",
-                        addr, from_client, from_server
-                    );
-                })
-                .map_err(|e| {
-                    error!("tcp proxy error: {}", e);
-                    //local_writer.shutdown();
-                });
-            tokio::spawn(proxy);
-        }
+        let relay = relay_connection(
+            local_reader,
+            local_writer,
+            connect_req.proto.as_str(),
+            connect_req.addr.as_str(),
+            get_config().lock().unwrap().read_timeout_sec as u32,
+            None,
+        );
+
+        tokio::spawn(relay);
     }
     fn handle_mux_event(&mut self, ev: Event) -> Option<Event> {
         match ev.header.flags() {
