@@ -28,6 +28,7 @@ extern crate tokio_sync;
 extern crate tokio_udp;
 extern crate twoway;
 
+extern crate unicase;
 extern crate url;
 
 #[macro_use]

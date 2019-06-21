@@ -6,6 +6,8 @@ use crate::common::MyTcpStream;
 use super::channel::select_session;
 use super::mux::MuxSession;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio_io::io::{copy, shutdown};
 use tokio_io::{AsyncRead, AsyncWrite};
 
@@ -29,6 +31,7 @@ fn proxy_stream<R, W, A, B>(
     remote_writer: W,
     timeout_secs: u32,
     initial_data: Option<Bytes>,
+    close_on_local_eof: bool,
 ) -> impl Future<Item = (u64, u64), Error = std::io::Error>
 where
     R: AsyncRead,
@@ -43,27 +46,42 @@ where
     remote_reader.set_timeout(Some(timeout));
     local_reader.set_timeout(Some(timeout));
 
+    let close_local = Arc::new(AtomicBool::new(true));
+
     let preprocess = match initial_data {
         Some(data) => future::Either::A(
             write_all(remote_writer, data).and_then(|(_remote_writer, _)| Ok(_remote_writer)),
         ),
         None => future::Either::B(future::ok::<_, std::io::Error>(remote_writer)),
     };
+    let close_local2 = close_local.clone();
+    let should_close_on_local_eof = Arc::new(close_on_local_eof);
     preprocess.and_then(|_remote_writer| {
         let copy_to_remote =
-            copy(local_reader, _remote_writer).and_then(|(n, _, server_writer)| {
+            copy(local_reader, _remote_writer).and_then(move |(n, _, server_writer)| {
                 //
                 info!("###local read done!");
+                if !should_close_on_local_eof.as_ref() {
+                    close_local2.store(false, Ordering::SeqCst);
+                }
                 shutdown(server_writer).map(move |_| {
                     //debug!("###local shutdown done!");
                     n
                 })
             });
-        let copy_to_local = copy(remote_reader, local_writer).and_then(|(n, _, client_writer)| {
-            //
-            info!("####remote read done!");
-            shutdown(client_writer).map(move |_| n)
-        });
+        let copy_to_local =
+            copy(remote_reader, local_writer).and_then(move |(n, _, client_writer)| {
+                //
+                info!("####remote read done!");
+                if close_local.load(Ordering::SeqCst) {
+                    future::Either::A(future::ok::<u64, std::io::Error>(n))
+                } else {
+                    future::Either::B(shutdown(client_writer).map(move |_| {
+                        //debug!("###local shutdown done!");
+                        n
+                    }))
+                }
+            });
         copy_to_local.join(copy_to_remote)
     })
 }
@@ -75,6 +93,7 @@ pub fn relay_connection<R, W>(
     origin_addr: &str,
     timeout_secs: u32,
     initial_data: Option<Bytes>,
+    close_on_local_eof: bool,
 ) -> impl Future<Item = (), Error = ()>
 where
     R: AsyncRead,
@@ -119,6 +138,7 @@ where
                 conn_w,
                 timeout_secs,
                 initial_data,
+                close_on_local_eof,
             )
             .map_err(|e| {
                 error!("udp proxy error: {}", e);
@@ -148,6 +168,7 @@ where
                         conn_w,
                         timeout_secs,
                         initial_data,
+                        close_on_local_eof,
                     )
                 })
                 .map(move |(from_client, from_server)| {
@@ -172,12 +193,13 @@ pub fn mux_relay_connection<R, W>(
     addr: &str,
     timeout_secs: u32,
     initial_data: Option<Bytes>,
+    close_on_local_eof: bool,
 ) -> impl Future<Item = (), Error = ()>
 where
     R: AsyncRead + Send + 'static,
     W: AsyncWrite + Send + 'static,
 {
-    if let Some(session_task) = select_session() {
+    if let Some(mut session_task) = select_session() {
         let proto_str = String::from(proto);
         let addr_str = String::from(addr);
         let t = move |session: &mut dyn MuxSession| {
@@ -190,6 +212,7 @@ where
                 remote_w,
                 timeout_secs,
                 initial_data,
+                close_on_local_eof,
             )
             .map(|_| {
                 //
@@ -199,7 +222,8 @@ where
             });
             tokio::spawn(relay);
         };
-        session_task.send(Box::new(t));
+        session_task.start_send(Box::new(t));
+        session_task.poll_complete();
         future::Either::A(future::ok::<(), ()>(()))
     } else {
         future::Either::B(relay_connection(
@@ -209,6 +233,7 @@ where
             addr,
             timeout_secs,
             initial_data,
+            close_on_local_eof,
         ))
     }
 }

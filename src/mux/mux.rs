@@ -124,6 +124,7 @@ pub trait MuxSession: Send {
             connect_req.addr.as_str(),
             get_config().lock().unwrap().read_timeout_sec as u32,
             None,
+            true,
         );
 
         tokio::spawn(relay);

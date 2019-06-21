@@ -35,4 +35,5 @@ nix = "0.14.1"
 cfg-if = "0.1"
 actix-http = "0.2"
 twoway = "0.2"
+unicase = "2.4"
 

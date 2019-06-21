@@ -17,10 +17,10 @@ pub fn valid_tls_version(buf: &[u8]) -> bool {
     if buf[0] != 0x16 {
         return false;
     }
-    let tlsMajorVer = buf[1];
+    let tls_major_ver = buf[1];
     //let tlsMinorVer = buf[2];
 
-    if tlsMajorVer < 3 {
+    if tls_major_ver < 3 {
         //no SNI before sslv3
         return false;
     }
@@ -141,6 +141,6 @@ where
         .and_then(|(_reader, sni)| {
             let mut target = sni;
             target.push_str("443");
-            mux_relay_connection(_reader, writer, "tcp", target.as_str(), 30, None)
+            mux_relay_connection(_reader, writer, "tcp", target.as_str(), 30, None, true)
         })
 }
