@@ -6,8 +6,8 @@ use std::collections::vec_deque::VecDeque;
 use std::fmt::Write as fmt_write;
 use std::io::{Cursor, Error, ErrorKind};
 use std::io::{Read, Write};
-use tokio::net::TcpStream;
 use tokio_io::AsyncRead;
+use tokio_reactor::PollEvented;
 use unicase::Ascii;
 
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -88,7 +88,7 @@ pub enum HttpMessage {
     Request(HttpRequest),
     Chunk(Bytes),
 }
-
+#[derive(Debug, PartialEq)]
 enum HttpDecodeState {
     DECODING_HEADER,
     DECODING_BODY,
@@ -98,9 +98,11 @@ pub struct HttpProxyReader<T> {
     reader: T,
     state: HttpDecodeState,
     recv_buf: BytesMut,
-    ready_buf: Cursor<BytesMut>,
+    http_buf: BytesMut,
     body_length: i64,
     body_tail: VecDeque<u8>,
+    remote_host: String,
+    counter: u32,
 }
 
 impl<T: AsyncRead> HttpProxyReader<T> {
@@ -109,10 +111,19 @@ impl<T: AsyncRead> HttpProxyReader<T> {
             reader: sock,
             state: HttpDecodeState::DECODING_HEADER,
             recv_buf: BytesMut::new(),
-            ready_buf: Cursor::new(BytesMut::new()),
+            http_buf: BytesMut::new(),
             body_length: 0,
             body_tail: VecDeque::new(),
+            remote_host: String::new(),
+            counter: 0,
         }
+    }
+    pub fn get_remote_addr(&self) -> &str {
+        self.remote_host.as_str()
+    }
+    pub fn add_recv_content(&mut self, b: &[u8]) {
+        self.recv_buf.reserve(b.len());
+        self.recv_buf.put_slice(b);
     }
     pub fn parse_request(&mut self) -> Result<usize, std::io::Error> {
         self.body_length = 0;
@@ -167,22 +178,126 @@ impl<T: AsyncRead> HttpProxyReader<T> {
                         }
                     }
                 }
-                "host" => {}
+                "host" => {
+                    self.remote_host = String::from(String::from_utf8_lossy(h.value));
+                    if !self.remote_host.contains(':') {
+                        self.remote_host.push_str(":80");
+                    }
+                }
                 _ => {
                     //do nothing
                 }
             }
             hreq.headers.push(header);
         }
+        if let Some(v) = req.path {
+            if v.starts_with("http://") {
+                let vv = &v[7..];
+                if let Some(n) = vv.find('/') {
+                    hreq.path = Some(String::from(&vv[n..]));
+                } else {
+                    hreq.path = Some(String::from(v));
+                }
+            } else {
+                hreq.path = Some(String::from(v));
+            }
+        }
+        if let Some(v) = req.method {
+            hreq.method = Some(String::from(v));
+        }
+        if let Some(v) = req.version {
+            hreq.version = Some(v);
+        }
+        let b = hreq.to_bytes();
+        self.http_buf.clear();
+        self.http_buf.reserve(b.len());
+        self.http_buf.put_slice(&b[..]);
         self.recv_buf.advance(header_len);
+        if 0 == self.body_length {
+            self.switch_reading_header();
+            info!(
+                "switch to reading header while data len:{}",
+                self.recv_buf.len()
+            );
+        }
+
         return Ok(header_len);
     }
 
-    fn read_local_buf(&mut self, buf: &mut [u8]) -> usize {
-        if self.ready_buf.get_ref().len() == 0 {
+    fn read_local_http(&mut self, buf: &mut [u8]) -> usize {
+        if self.http_buf.len() == 0 {
             return 0;
         }
-        return self.ready_buf.read(buf).unwrap();
+        let mut n = buf.len();
+        if n > self.http_buf.len() {
+            n = self.http_buf.len();
+        }
+        buf[0..n].copy_from_slice(&self.http_buf[0..n]);
+        self.http_buf.advance(n);
+        if self.http_buf.len() == 0 {
+            self.http_buf.clear();
+        }
+        return n;
+    }
+
+    fn read_recv_buf(&mut self, buf: &mut [u8]) -> usize {
+        let mut n = buf.len();
+        if n > self.recv_buf.len() {
+            n = self.recv_buf.len();
+        }
+        buf[0..n].copy_from_slice(&self.recv_buf[0..n]);
+        self.recv_buf.advance(n);
+        if self.recv_buf.len() == 0 {
+            self.recv_buf.clear();
+        }
+        return n;
+    }
+
+    fn switch_reading_header(&mut self) {
+        self.state = HttpDecodeState::DECODING_HEADER;
+        self.body_tail.clear();
+        self.body_length = 0;
+    }
+
+    fn read_body(&mut self, buf: &mut [u8]) -> usize {
+        if self.state == HttpDecodeState::DECODING_HEADER {
+            return 0;
+        }
+        if self.body_length < 0 {
+            let mut tail_pos = 0;
+            if self.recv_buf.len() > 5 {
+                tail_pos = self.recv_buf.len() - 5;
+                self.body_tail.clear();
+            }
+            while tail_pos < self.recv_buf.len() {
+                self.body_tail.push_back(self.recv_buf[tail_pos]);
+                tail_pos = tail_pos + 1;
+                if self.body_tail.len() > 5 {
+                    self.body_tail.pop_front();
+                }
+            }
+            if self.body_tail.len() == 5 {
+                if self.body_tail[0] == '0' as u8
+                    && self.body_tail[1] == '\r' as u8
+                    && self.body_tail[2] == '\n' as u8
+                    && self.body_tail[3] == '\r' as u8
+                    && self.body_tail[4] == '\n' as u8
+                {
+                    self.switch_reading_header();
+                }
+            }
+            return self.read_recv_buf(buf);
+        } else if self.body_length > 0 {
+            let n = self.read_recv_buf(buf);
+            self.body_length = self.body_length - n as i64;
+            if self.body_length == 0 {
+                self.switch_reading_header();
+            }
+            return n;
+        } else {
+            self.switch_reading_header();
+            return 0;
+        }
     }
 }
 
@@ -190,87 +305,71 @@ impl<T: AsyncRead> AsyncRead for HttpProxyReader<T> {}
 
 impl<T: AsyncRead> Read for HttpProxyReader<T> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.read_local_buf(buf);
+        let mut n = self.read_local_http(buf);
         if n > 0 {
             return Ok(n);
         }
-        let mut not_ready = false;
+        n = self.read_body(buf);
+        if n > 0 {
+            return Ok(n);
+        }
         loop {
-            not_ready = false;
-            self.recv_buf.reserve(1024);
+            self.recv_buf.reserve(buf.len());
             let pos = self.recv_buf.len();
             let cap = self.recv_buf.capacity();
+            debug!(
+                "http try read {} bytes {}  {} {:?} {}!",
+                cap - pos,
+                pos,
+                self.body_length,
+                self.state,
+                self.counter,
+            );
             unsafe {
                 self.recv_buf.set_len(cap);
             }
+            //not_ready = false;
+            self.counter = self.counter + 1;
             match self.reader.poll_read(&mut self.recv_buf[pos..]) {
-                Ok(Async::Ready(n)) => {
-                    info!("http Recv {} bytes.", n);
+                Ok(Async::Ready(nn)) => {
+                    debug!("http Recv {} bytes. {}", nn, self.counter - 1);
                     unsafe {
-                        self.recv_buf.set_len(pos + n);
+                        self.recv_buf.set_len(pos + nn);
                     }
-                    if 0 == n {
-                        return Err(Error::from(ErrorKind::WouldBlock));
+                    if 0 == nn {
+                        return Ok(0);
                     }
                 }
                 Err(e) => {
                     return Err(e);
                 }
                 Ok(Async::NotReady) => {
+                    debug!("http Recv not ready. {}", self.counter - 1);
                     unsafe {
                         self.recv_buf.set_len(pos);
                     }
-                    if self.recv_buf.len() == 0 {
-                        return Err(Error::from(ErrorKind::WouldBlock));
-                    }
-                    not_ready = true;
+                    return Err(Error::from(ErrorKind::WouldBlock));
                 }
             }
             match &self.state {
                 DECODING_HEADER => {
-                    if not_ready {
-                        return Err(Error::from(ErrorKind::WouldBlock));
+                    // if not_ready {
+                    //     return Err(Error::from(ErrorKind::WouldBlock));
+                    // }
+                    match self.parse_request() {
+                        Ok(0) => {
+                            continue;
+                        }
+                        Ok(_) => {
+                            return Ok(self.read_local_http(buf));
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
                     }
-                    self.parse_request();
-                    return Ok(self.read_local_buf(buf));
                 }
                 DECODING_BODY => {
-                    if self.body_length < 0 {
-                        let chunk = Bytes::from(&self.recv_buf[..]);
-                        self.recv_buf.clear();
-                        let mut tail_pos = 0;
-                        if chunk.len() > 5 {
-                            tail_pos = chunk.len() - 5;
-                            self.body_tail.clear();
-                        }
-                        while tail_pos < chunk.len() {
-                            self.body_tail.push_back(chunk[tail_pos]);
-                            tail_pos = tail_pos + 1;
-                            if self.body_tail.len() > 5 {
-                                self.body_tail.pop_front();
-                            }
-                        }
-
-                        if self.body_tail.len() == 5 {
-                            if self.body_tail[0] == '0' as u8
-                                && self.body_tail[1] == '\r' as u8
-                                && self.body_tail[2] == '\n' as u8
-                                && self.body_tail[3] == '\r' as u8
-                                && self.body_tail[4] == '\n' as u8
-                            {
-                                self.state = HttpDecodeState::DECODING_HEADER;
-                            }
-                        }
-                        return Ok(self.read_local_buf(buf));
-                    } else if self.body_length > 0 {
-                        self.body_length = self.body_length - self.recv_buf.len() as i64;
-                        let chunk = Bytes::from(&self.recv_buf[..]);
-                        self.recv_buf.clear();
-                        return Ok(self.read_local_buf(buf));
-                    } else {
-                        self.state = HttpDecodeState::DECODING_HEADER;
-                        continue;
-                    }
+                    return Ok(self.read_body(buf));
                 }
             }
         }

@@ -118,13 +118,13 @@ pub trait MuxSession: Send {
             }
         };
         let relay = relay_connection(
+            s.id(),
             local_reader,
             local_writer,
             connect_req.proto.as_str(),
             connect_req.addr.as_str(),
             get_config().lock().unwrap().read_timeout_sec as u32,
             None,
-            true,
         );
 
         tokio::spawn(relay);

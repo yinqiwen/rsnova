@@ -1,9 +1,9 @@
 use super::http::handle_http_connection;
 use super::socks5::handle_socks5_connection;
 use super::tls::handle_tls_connection;
-use super::tls::{peek_sni, valid_tls_version};
+use super::tls::valid_tls_version;
 use crate::common::io::*;
-use crate::common::MyTcpStream;
+use crate::common::tcp_split;
 use crate::proxy::misc::*;
 
 use std::net::SocketAddr;
@@ -11,8 +11,6 @@ use tokio::io::Error as TokioIOError;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio_io::AsyncRead;
-
-use tokio_io::io::{read_exact, read_until};
 
 use std::io::ErrorKind;
 use tokio::prelude::*;
@@ -39,8 +37,9 @@ fn handle_local_connection(socket: TcpStream) -> impl Future<Item = (), Error = 
     let origin_dst = get_origin_dst(&socket);
     let mut ctx: LocalContext = Default::default();
     ctx.origin_dst = origin_dst;
-    let mysocket = MyTcpStream::new(socket);
-    let (local_reader, local_writer) = mysocket.split();
+    // let mysocket = MyTcpStream::new(socket);
+    // let (local_reader, local_writer) = mysocket.split();
+    let (local_reader, local_writer) = tcp_split(socket);
     peek_exact(local_reader, [0u8; 3])
         .map_err(|(_r, e)| e)
         .and_then(move |(_reader, _data)| {

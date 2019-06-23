@@ -1,6 +1,6 @@
 use crate::common::io::*;
 use crate::common::utils::*;
-use crate::common::{HttpMessage, HttpProxyReader, HttpRequest};
+use crate::common::HttpProxyReader;
 use crate::mux::relay::mux_relay_connection;
 use crate::proxy::local::*;
 
@@ -71,7 +71,7 @@ where
                     target.push_str(":80");
                 }
             }
-            info!("Relay target:{}", target);
+            //info!("Relay target:{}", target);
 
             if ctx.is_https {
                 let conn_res = "HTTP/1.0 200 Connection established\r\n\r\n";
@@ -100,11 +100,7 @@ where
         })
 }
 
-fn handle_normal_http_connection<R, W>(
-    ctx: LocalContext,
-    reader: R,
-    writer: W,
-) -> impl Future<Item = (), Error = ()>
+fn handle_normal_http_connection<R, W>(reader: R, writer: W) -> impl Future<Item = (), Error = ()>
 where
     R: AsyncRead + Send + 'static,
     W: AsyncWrite + Send + 'static,
@@ -114,30 +110,31 @@ where
             error!("error:{}", e);
         })
         .and_then(move |(_reader, header_data, body_data)| {
-            let mut headers = [httparse::EMPTY_HEADER; 32];
-            let mut req = httparse::Request::new(&mut headers);
-            let mut target: String = String::new();
-            // match req.parse(&header_data[..]) {
-            //     Ok(Status::Complete(_)) => {
-            //         for h in (&req).headers {
-            //             if h.name.to_lowercase() == "host" {
-            //                 target = String::from(String::from_utf8_lossy(h.value));
-            //                 break;
-            //             }
-            //         }
-            //     }
-            //     _ => {
-            //         error!("parse http request error");
-            //         return future::Either::A(futures::future::err(()));
-            //     }
-            // }
-            if !target.contains(':') {
-                target.push_str(":80");
-            }
             let mut http_reader = HttpProxyReader::new(_reader);
-            http_reader.parse_request();
-            //http_reader.set_request(req);
-            mux_relay_connection(http_reader, writer, "tcp", target.as_str(), 30, None, true)
+            http_reader.add_recv_content(&header_data[..]);
+            http_reader.add_recv_content(&body_data[..]);
+            match http_reader.parse_request() {
+                Ok(0) => {
+                    error!("parse http request prtial");
+                    return future::Either::A(futures::future::err(()));
+                }
+                Ok(_) => {
+                    let target = String::from(http_reader.get_remote_addr());
+                    return future::Either::B(mux_relay_connection(
+                        http_reader,
+                        writer,
+                        "tcp",
+                        target.as_str(),
+                        30,
+                        None,
+                        true,
+                    ));
+                }
+                Err(e) => {
+                    error!("parse http request error:{}", e);
+                    return future::Either::A(futures::future::err(()));
+                }
+            }
         })
 }
 
@@ -152,7 +149,9 @@ where
 {
     if ctx.is_https || ctx.is_transparent() {
         future::Either::A(handle_relay_connection(ctx, reader, writer))
+    //future::Either::A(futures::future::err(()))
     } else {
-        future::Either::B(handle_relay_connection(ctx, reader, writer))
+        future::Either::B(handle_normal_http_connection(reader, writer))
+        //future::Either::B(futures::future::err(()))
     }
 }

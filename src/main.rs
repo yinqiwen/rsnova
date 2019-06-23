@@ -24,6 +24,7 @@ extern crate skip32;
 extern crate tokio;
 extern crate tokio_io;
 extern crate tokio_io_timeout;
+extern crate tokio_reactor;
 extern crate tokio_sync;
 extern crate tokio_udp;
 extern crate twoway;

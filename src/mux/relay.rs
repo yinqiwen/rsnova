@@ -1,13 +1,12 @@
 use crate::common::future::FourEither;
+use crate::common::tcp_split;
 use crate::common::udp::*;
 use crate::common::utils::*;
-use crate::common::MyTcpStream;
 
 use super::channel::select_session;
 use super::mux::MuxSession;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio_io::io::{copy, shutdown};
 use tokio_io::{AsyncRead, AsyncWrite};
 
@@ -24,14 +23,18 @@ use tokio_io::io::write_all;
 use tokio::prelude::*;
 use tokio_io_timeout::TimeoutReader;
 
+lazy_static! {
+    static ref GLOBAL_RELAY_ID_SEED: AtomicU32 = AtomicU32::new(0);
+}
+
 fn proxy_stream<R, W, A, B>(
+    relay_id: u32,
     local_reader: A,
     local_writer: B,
     remote_reader: R,
     remote_writer: W,
     timeout_secs: u32,
     initial_data: Option<Bytes>,
-    close_on_local_eof: bool,
 ) -> impl Future<Item = (u64, u64), Error = std::io::Error>
 where
     R: AsyncRead,
@@ -46,7 +49,7 @@ where
     remote_reader.set_timeout(Some(timeout));
     local_reader.set_timeout(Some(timeout));
 
-    let close_local = Arc::new(AtomicBool::new(true));
+    // let close_local = Arc::new(AtomicBool::new(true));
 
     let preprocess = match initial_data {
         Some(data) => future::Either::A(
@@ -54,16 +57,17 @@ where
         ),
         None => future::Either::B(future::ok::<_, std::io::Error>(remote_writer)),
     };
-    let close_local2 = close_local.clone();
-    let should_close_on_local_eof = Arc::new(close_on_local_eof);
+    // let close_local2 = close_local.clone();
+    // let should_close_on_local_eof = Arc::new(close_on_local_eof);
+
     preprocess.and_then(|_remote_writer| {
         let copy_to_remote =
             copy(local_reader, _remote_writer).and_then(move |(n, _, server_writer)| {
                 //
-                info!("###local read done!");
-                if !should_close_on_local_eof.as_ref() {
-                    close_local2.store(false, Ordering::SeqCst);
-                }
+                //info!("###local read done!");
+                // if !should_close_on_local_eof.as_ref() {
+                //     close_local2.store(false, Ordering::SeqCst);
+                // }
                 shutdown(server_writer).map(move |_| {
                     //debug!("###local shutdown done!");
                     n
@@ -72,28 +76,32 @@ where
         let copy_to_local =
             copy(remote_reader, local_writer).and_then(move |(n, _, client_writer)| {
                 //
-                info!("####remote read done!");
-                if close_local.load(Ordering::SeqCst) {
-                    future::Either::A(future::ok::<u64, std::io::Error>(n))
-                } else {
-                    future::Either::B(shutdown(client_writer).map(move |_| {
-                        //debug!("###local shutdown done!");
-                        n
-                    }))
-                }
+                //info!("####remote read done");
+                // if !close_local.load(Ordering::SeqCst) {
+                //     future::Either::A(future::ok::<u64, std::io::Error>(n))
+                // } else {
+                //     future::Either::B(shutdown(client_writer).map(move |_| {
+                //         //debug!("###local shutdown done!");
+                //         n
+                //     }))
+                // }
+                shutdown(client_writer).map(move |_| {
+                    //debug!("###local shutdown done!");
+                    n
+                })
             });
         copy_to_local.join(copy_to_remote)
     })
 }
 
 pub fn relay_connection<R, W>(
+    relay_id: u32,
     local_reader: R,
     local_writer: W,
     proto: &str,
     origin_addr: &str,
     timeout_secs: u32,
     initial_data: Option<Bytes>,
-    close_on_local_eof: bool,
 ) -> impl Future<Item = (), Error = ()>
 where
     R: AsyncRead,
@@ -110,6 +118,7 @@ where
         }
     };
     let oaddr = String::from(origin_addr);
+    let eaddr = String::from(origin_addr);
     let addr: SocketAddr = raddr[0];
     // let addr: SocketAddr = addr.parse().unwrap();
     debug!("{:?}", addr);
@@ -120,38 +129,47 @@ where
         let u = match UdpSocket::bind(&laddr) {
             Ok(m) => m,
             Err(err) => {
-                error!("Failed to bind udp addr:{} with error:{}", laddr, err);
+                error!(
+                    "[{}]Failed to bind udp addr:{} with error:{}",
+                    relay_id, laddr, err
+                );
                 return FourEither::A(futures::future::err(()));
             }
         };
         if let Err(e) = u.connect(&addr) {
-            error!("Failed to connect udp addr:{} with error:{}", addr, e);
+            error!(
+                "[{}]Failed to connect udp addr:{} with error:{}",
+                relay_id, addr, e
+            );
             return FourEither::D(futures::future::err(()));
         }
         let conn = UdpConnection::new(u);
         let (conn_r, conn_w) = conn.split();
+        let relay_id1 = relay_id;
+        let relay_id2 = relay_id;
         FourEither::B(
             proxy_stream(
+                relay_id,
                 local_reader,
                 local_writer,
                 conn_r,
                 conn_w,
                 timeout_secs,
                 initial_data,
-                close_on_local_eof,
             )
-            .map_err(|e| {
-                error!("udp proxy error: {}", e);
+            .map_err(move |e| {
+                error!("[{}]udp proxy error: {}", relay_id2, e);
             })
             .map(move |(from_client, from_server)| {
                 info!(
-                    "client at {} wrote {} bytes and received {} bytes",
-                    addr, from_client, from_server
+                    "[{}]client at {} wrote {} bytes and received {} bytes",
+                    relay_id1, addr, from_client, from_server
                 );
             }),
         )
     } else {
-        debug!("Connect tcp:{}", addr);
+        debug!("[{}]Connect tcp:{}", relay_id, addr);
+        let relay_id1 = relay_id;
         FourEither::C(
             TcpStream::connect(&addr)
                 .and_then(move |socket| {
@@ -160,26 +178,27 @@ where
                         socket.local_addr().unwrap(),
                         socket.peer_addr().unwrap()
                     );
-                    let (conn_r, conn_w) = MyTcpStream::new(socket).split();
+                    let (conn_r, conn_w) = tcp_split(socket);
+                    //let (conn_r, conn_w) = MyTcpStream::new(socket).split();
                     proxy_stream(
+                        relay_id,
                         local_reader,
                         local_writer,
                         conn_r,
                         conn_w,
                         timeout_secs,
                         initial_data,
-                        close_on_local_eof,
                     )
                 })
                 .map(move |(from_client, from_server)| {
                     //self.close_stream(sid, true);
                     info!(
-                        "client to {} wrote {} bytes and received {} bytes",
-                        oaddr, from_client, from_server
+                        "[{}]proxy to {} wrote {} bytes and received {} bytes",
+                        relay_id, oaddr, from_client, from_server
                     );
                 })
-                .map_err(|e| {
-                    error!("tcp proxy error: {}", e);
+                .map_err(move |e| {
+                    error!("[{}]proxy to {} error: {}", relay_id1, eaddr, e);
                     //local_writer.shutdown();
                 }),
         )
@@ -199,6 +218,8 @@ where
     R: AsyncRead + Send + 'static,
     W: AsyncWrite + Send + 'static,
 {
+    let relay_id = GLOBAL_RELAY_ID_SEED.fetch_add(1, Ordering::SeqCst);
+    info!("[{}]Relay connection to {}", relay_id, addr);
     if let Some(mut session_task) = select_session() {
         let proto_str = String::from(proto);
         let addr_str = String::from(addr);
@@ -206,13 +227,13 @@ where
             let mut remote = session.open_stream(proto_str.as_str(), addr_str.as_str());
             let (remote_r, remote_w) = remote.split();
             let relay = proxy_stream(
+                relay_id,
                 local_reader,
                 local_writer,
                 remote_r,
                 remote_w,
                 timeout_secs,
                 initial_data,
-                close_on_local_eof,
             )
             .map(|_| {
                 //
@@ -227,13 +248,13 @@ where
         future::Either::A(future::ok::<(), ()>(()))
     } else {
         future::Either::B(relay_connection(
+            relay_id,
             local_reader,
             local_writer,
             proto,
             addr,
             timeout_secs,
             initial_data,
-            close_on_local_eof,
         ))
     }
 }

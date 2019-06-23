@@ -49,7 +49,8 @@ where
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let mut r = [0u8; 1024];
-        loop {
+        'top: loop {
+            //info!("enter with state");
             match self.state {
                 State::Reading {
                     ref mut separator,
@@ -76,8 +77,9 @@ where
                                 } => return Ok((reader, buf.freeze(), body.freeze()).into()),
                                 State::Empty => unreachable!(),
                             }
+                        } else {
+                            continue 'top;
                         }
-                        continue;
                     }
                     Err(e) => {
                         return Err(e);
@@ -226,6 +228,7 @@ where
     pub fn poll_peek(&mut self, buf: &mut [u8]) -> Poll<usize, std::io::Error> {
         loop {
             let cur_n = self.peek_buf.len();
+            //debug!("enter peek peek {} {} !", cur_n, buf.len());
             if cur_n < buf.len() {
                 self.peek_buf.reserve(buf.len() - cur_n);
                 unsafe {
@@ -244,9 +247,15 @@ where
                         }
                         return Ok(Async::NotReady);
                     }
-                    Ok(Async::Ready(n)) => unsafe {
-                        self.peek_buf.set_len(cur_n + n);
-                    },
+                    Ok(Async::Ready(n)) => {
+                        //debug!("###enter peek peek read {}!", n);
+                        unsafe {
+                            self.peek_buf.set_len(cur_n + n);
+                        }
+                        if 0 == n {
+                            return Err(Error::from(ErrorKind::ConnectionReset));
+                        }
+                    }
                 }
             } else {
                 buf.copy_from_slice(&self.peek_buf[0..buf.len()]);
@@ -265,16 +274,18 @@ where
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         debug!("enter peek read {}!", self.peek_buf.len());
         if self.peek_buf.len() == 0 {
-            let ret = self.inner.read(buf);
-            match &ret {
-                Ok(v) => {
-                    debug!("enter peek read return {}!", v);
+            match self.inner.poll_read(buf) {
+                Ok(Async::Ready(nn)) => {
+                    return Ok(nn);
                 }
                 Err(e) => {
-                    debug!("enter peek read return {}!", e);
+                    return Err(e);
                 }
-            };
-            return ret;
+                Ok(Async::NotReady) => {
+                    return Err(Error::from(ErrorKind::WouldBlock));
+                }
+            }
+            //return self.inner.read(buf);
         }
         let mut n = self.peek_buf.len();
         if n > buf.len() {
