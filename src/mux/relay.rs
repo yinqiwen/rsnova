@@ -1,3 +1,4 @@
+use crate::common::buf_copy;
 use crate::common::future::FourEither;
 use crate::common::tcp_split;
 use crate::common::udp::*;
@@ -61,8 +62,8 @@ where
     // let should_close_on_local_eof = Arc::new(close_on_local_eof);
 
     preprocess.and_then(|_remote_writer| {
-        let copy_to_remote =
-            copy(local_reader, _remote_writer).and_then(move |(n, _, server_writer)| {
+        let copy_to_remote = buf_copy(local_reader, _remote_writer, Box::new([0; 32 * 1024]))
+            .and_then(move |(n, _, server_writer)| {
                 //
                 //info!("###local read done!");
                 // if !should_close_on_local_eof.as_ref() {
@@ -73,8 +74,8 @@ where
                     n
                 })
             });
-        let copy_to_local =
-            copy(remote_reader, local_writer).and_then(move |(n, _, client_writer)| {
+        let copy_to_local = buf_copy(remote_reader, local_writer, Box::new([0; 32 * 1024]))
+            .and_then(move |(n, _, client_writer)| {
                 //
                 //info!("####remote read done");
                 // if !close_local.load(Ordering::SeqCst) {

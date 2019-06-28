@@ -56,7 +56,7 @@ pub fn get_config() -> &'static Mutex<Config> {
 pub fn add_channel_config(url: &str) {
     let mut ch: ChannelConfig = Default::default();
     ch.urls.push(String::from(url));
-    ch.conns_per_host = 2;
+    ch.conns_per_host = 1;
     ch.name = String::from("default");
     get_config().lock().unwrap().local.channels.push(ch);
 }

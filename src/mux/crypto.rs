@@ -79,10 +79,12 @@ pub fn read_encrypt_event<T: AsyncRead>(
 }
 
 pub fn none_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut) {
+    out.reserve(EVENT_HEADER_LEN);
     out.put_u32_le(ev.header.flag_len);
     out.put_u32_le(ev.header.stream_id);
 
     if ev.body.len() > 0 {
+        out.reserve(ev.body.len());
         out.put_slice(&ev.body[..]);
     }
 }
@@ -103,7 +105,7 @@ pub fn none_decrypt_event(ctx: &CryptoContext, buf: &mut BytesMut) -> Result<Eve
         stream_id: e2,
     };
     let flags = header.flags();
-    if (FLAG_DATA != flags && FLAG_AUTH != flags) || 0 == header.len() {
+    if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
         buf.advance(EVENT_HEADER_LEN);
         return Ok(Event {
             header: header,
@@ -135,8 +137,17 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
     sk[2..].copy_from_slice(&ctx.encrypt_nonce.to_le_bytes());
     let e1 = skip32::encode(&sk, ev.header.flag_len);
     let e2 = skip32::encode(&sk, ev.header.stream_id);
+    out.reserve(EVENT_HEADER_LEN);
     out.put_u32_le(e1);
     out.put_u32_le(e2);
+
+    // info!(
+    //     "encrypt ev:{} with counter:{} and len:{} {}",
+    //     ev.header.flags(),
+    //     ctx.encrypt_nonce,
+    //     ev.body.len(),
+    //     ev.header.len(),
+    // );
 
     if ev.body.len() > 0 {
         let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
@@ -169,6 +180,7 @@ pub fn chacha20poly1305_decrypt_event(
     if buf.len() < EVENT_HEADER_LEN {
         return Err((EVENT_HEADER_LEN as u32 - buf.len() as u32, ""));
     }
+    //info!("decrypt ev with counter:{}", ctx.decrypt_nonce);
     let mut sk: [u8; 10] = Default::default();
     sk[0..2].copy_from_slice(&ctx.key.as_bytes()[0..2]);
     sk[2..].copy_from_slice(&ctx.decrypt_nonce.to_le_bytes());
@@ -183,7 +195,7 @@ pub fn chacha20poly1305_decrypt_event(
         stream_id: e2,
     };
     let flags = header.flags();
-    if (FLAG_DATA != flags && FLAG_AUTH != flags) || 0 == header.len() {
+    if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
         buf.advance(EVENT_HEADER_LEN);
         return Ok(Event {
             header: header,
@@ -203,6 +215,12 @@ pub fn chacha20poly1305_decrypt_event(
     unsafe {
         out.set_len(dlen);
     }
+    // info!(
+    //     "decode event:{} body with len {}, {}",
+    //     header.flags(),
+    //     header.len(),
+    //     out.len()
+    // );
     let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
     let xnonce: u128 = ctx.decrypt_nonce as u128;
     let nonce = chacha20poly1305::Nonce::from_slice(&xnonce.to_le_bytes()[0..12]).unwrap();
