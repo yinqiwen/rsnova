@@ -90,7 +90,7 @@ pub trait MuxSession: Send {
                 s.handle_window_update(ev.header.len());
             }
             None => {
-                //
+                error!("No stream found for window event:{}", ev.header.stream_id);
             }
         }
     }
@@ -100,10 +100,11 @@ pub trait MuxSession: Send {
     fn handle_data(&mut self, ev: Event) {
         match self.get_stream(ev.header.stream_id) {
             Some(s) => {
+                //info!("Recv data with len:{} {}", ev.header.len(), ev.body.len());
                 s.handle_recv_data(ev.body);
             }
             None => {
-                //
+                error!("No stream found for data event:{}", ev.header.stream_id);
             }
         }
     }
@@ -113,7 +114,12 @@ pub trait MuxSession: Send {
         let connect_req: ConnectRequest = match bincode::deserialize(&ev.body[..]) {
             Ok(m) => m,
             Err(err) => {
-                error!("Failed to parse ConnectRequest with error:{}", err);
+                error!(
+                    "Failed to parse ConnectRequest with error:{} while data len:{} {}",
+                    err,
+                    ev.body.len(),
+                    ev.header.len(),
+                );
                 return;
             }
         };
@@ -145,7 +151,7 @@ pub trait MuxSession: Send {
             }
             FLAG_PING => {
                 //self.handle_window_update(ev);
-                info!("Recv ping.");
+                //info!("Recv ping.");
                 //self.ping();
                 None
             }
@@ -292,7 +298,12 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                     }
                     Some(ev) => {
                         not_ready = false;
-                        debug!("recv local event:{}", ev.header.flags());
+                        // info!(
+                        //     "[{}]recv local event:{} {}",
+                        //     ev.header.stream_id,
+                        //     ev.header.flags(),
+                        //     ev.body.len(),
+                        // );
                         if FLAG_FIN == ev.header.flags() {
                             self.session.close_stream(ev.header.stream_id, true);
                         }
@@ -302,7 +313,9 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                                 self.close();
                                 return Err(Error::from(ErrorKind::ConnectionReset));
                             }
-                            _ => {}
+                            _ => {
+                                //self.remote_ev_send.poll_complete();
+                            }
                         }
                         //return Ok(Async::Ready(Some(())));
                     }
@@ -359,7 +372,12 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                     return Err(Error::from(ErrorKind::ConnectionReset));
                 }
                 Some(ev) => {
-                    info!("recv remote event:{}", ev.header.flags());
+                    info!(
+                        "[{}]recv remote event:{}, body len:{}",
+                        ev.header.stream_id,
+                        ev.header.flags(),
+                        ev.body.len(),
+                    );
                     self.session.handle_mux_event(ev);
                     not_ready = false;
                 }
@@ -445,36 +463,37 @@ impl<T: AsyncRead + AsyncWrite> Stream for MuxConnectionProcessor<T> {
             return Err(Error::from(ErrorKind::ConnectionReset));
         }
         let mut all_not_ready = true;
-        match self.poll_remote_event() {
-            Err(e) => {
-                return Err(e);
-            }
-            Ok(Async::Ready(_)) => {
-                info!("0 return with {}", all_not_ready);
-                all_not_ready = false;
-            }
-            Ok(Async::NotReady) => {
-                //
-            }
-        };
         match self.poll_local_event() {
             Err(e) => {
                 return Err(e);
             }
             Ok(Async::Ready(_)) => {
-                info!("1 return with {}", all_not_ready);
+                debug!("1 return with {}", all_not_ready);
                 all_not_ready = false;
             }
             Ok(Async::NotReady) => {
                 //
             }
         };
+        match self.poll_remote_event() {
+            Err(e) => {
+                return Err(e);
+            }
+            Ok(Async::Ready(_)) => {
+                debug!("0 return with {}", all_not_ready);
+                all_not_ready = false;
+            }
+            Ok(Async::NotReady) => {
+                //
+            }
+        };
+
         match self.poll_task() {
             Err(e) => {
                 return Err(e);
             }
             Ok(Async::Ready(_)) => {
-                info!("2 return with {}", all_not_ready);
+                debug!("2 return with {}", all_not_ready);
                 all_not_ready = false;
             }
             Ok(Async::NotReady) => {

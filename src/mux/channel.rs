@@ -63,7 +63,7 @@ impl MuxSessionManager {
         for state in self.channel_states.values() {
             if state.conns < state.conns_per_host {
                 let gap = state.conns_per_host - state.conns;
-                for n in 0..gap {
+                for _ in 0..gap {
                     init_local_mux_connection(&state.channel, &state.url);
                 }
             }

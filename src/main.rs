@@ -2,7 +2,6 @@
 #![feature(pattern)]
 #![feature(trait_alias)]
 
-extern crate actix_http;
 #[macro_use]
 extern crate log;
 extern crate bincode;
@@ -24,9 +23,9 @@ extern crate skip32;
 extern crate tokio;
 extern crate tokio_io;
 extern crate tokio_io_timeout;
-extern crate tokio_reactor;
 extern crate tokio_sync;
 extern crate tokio_udp;
+//extern crate trust_dns_server;
 extern crate twoway;
 
 extern crate unicase;

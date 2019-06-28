@@ -25,18 +25,18 @@ pub struct Header {
 }
 
 fn get_flag_len(len: u32, flag: u8) -> u32 {
-    (len << 24) | (flag as u32)
+    (len << 8) | (flag as u32)
 }
 
 impl Header {
     fn set_flag_len(&mut self, len: u32, flag: u8) {
-        self.flag_len = (len << 24) | (flag as u32);
+        self.flag_len = (len << 8) | (flag as u32);
     }
     pub fn flags(&self) -> u8 {
         return (self.flag_len & 0xFF) as u8;
     }
     pub fn len(&self) -> u32 {
-        (self.flag_len >> 24)
+        (self.flag_len >> 8)
     }
     pub fn set_len(&mut self, v: u32) {
         let f = self.flags();
@@ -121,7 +121,7 @@ pub fn new_data_event(sid: u32, buf: &[u8], local: bool) -> Event {
 pub fn new_window_update_event(sid: u32, len: u32, local: bool) -> Event {
     Event {
         header: Header {
-            flag_len: get_flag_len(len, FLAG_DATA),
+            flag_len: get_flag_len(len, FLAG_WIN_UPDATE),
             stream_id: sid,
         },
         body: Vec::new(),
@@ -155,6 +155,13 @@ impl Encoder for EventCodec {
         // we have to reserve memory before we try to write to it.
         //buf.reserve(line.len() + 1);
         // And now, we write out our stuff!
+        // info!(
+        //     "[{}]encode ev:{} with len {}:{}",
+        //     ev.header.stream_id,
+        //     ev.header.flags(),
+        //     ev.header.len(),
+        //     ev.body.len()
+        // );
         self.ctx.encrypt(&ev, buf);
         Ok(())
     }

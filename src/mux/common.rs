@@ -33,6 +33,11 @@ struct MuxStreamInner {
 
 impl MuxStreamInner {
     fn close(&mut self) {
+        // info!(
+        //     "[{}]close stream:{}",
+        //     self.state.stream_id,
+        //     self.state.closed.load(Ordering::SeqCst)
+        // );
         if !self.state.closed.load(Ordering::SeqCst) {
             self.state.closed.store(true, Ordering::SeqCst);
             self.send_channel
@@ -58,6 +63,11 @@ impl Read for MuxStreamInner {
                 Ok(Async::NotReady) => Err(Error::from(ErrorKind::WouldBlock)),
                 Ok(Async::Ready(None)) => Err(Error::from(ErrorKind::ConnectionReset)),
                 Ok(Async::Ready(Some(b))) => {
+                    // info!(
+                    //     "[{}]Got recv data with len:{}",
+                    //     self.state.stream_id,
+                    //     b.len()
+                    // );
                     self.recv_buf = Cursor::new(Bytes::from(b));
                     self.recv_buf.read(buf)
                 }
@@ -96,6 +106,12 @@ impl Write for MuxStreamInner {
             send_len = self.state.send_buf_window.load(Ordering::SeqCst) as usize;
         }
         let ev = new_data_event(self.state.stream_id, &buf[0..send_len], true);
+        // info!(
+        //     "[{}]new data ev with len:{} {}",
+        //     self.state.stream_id,
+        //     ev.header.len(),
+        //     ev.body.len()
+        // );
         let r = self.send_channel.start_send(ev);
         match r {
             Ok(AsyncSink::Ready) => {
@@ -129,7 +145,7 @@ impl ChannelMuxStream {
     pub fn new(id: u32, s: &mpsc::Sender<Event>) -> Self {
         let state = MuxStreamState {
             stream_id: id,
-            send_buf_window: AtomicU32::new(0),
+            send_buf_window: AtomicU32::new(512 * 1024),
             recv_buf_window: AtomicU32::new(0),
             window_sem: Semaphore::new(1),
             closed: AtomicBool::new(false),
@@ -170,13 +186,16 @@ impl MuxStream for ChannelMuxStream {
         let data_len = data.len() as u32;
         match &mut self.recv_data_channel {
             Some(tx) => {
+                //info!("handle recv data with len:{}", data.len());
                 tx.start_send(data);
                 tx.poll_complete();
             }
             None => {
+                error!("No stream data sender for {}", self.id());
                 return;
             }
         }
+        //info!("[{}]Recv data with len:{}", self.state.stream_id, data_len);
         let recv_window_size = self
             .state
             .recv_buf_window

@@ -7,7 +7,6 @@ use std::fmt::Write as fmt_write;
 use std::io::{Cursor, Error, ErrorKind};
 use std::io::{Read, Write};
 use tokio_io::AsyncRead;
-use tokio_reactor::PollEvented;
 use unicase::Ascii;
 
 #[derive(Clone, PartialEq, Debug, Default)]
