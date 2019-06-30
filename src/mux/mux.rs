@@ -374,12 +374,12 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                     return Err(Error::from(ErrorKind::ConnectionReset));
                 }
                 Some(ev) => {
-                    info!(
-                        "[{}]recv remote event:{}, body len:{}",
-                        ev.header.stream_id,
-                        ev.header.flags(),
-                        ev.body.len(),
-                    );
+                    // info!(
+                    //     "[{}]recv remote event:{}, body len:{}",
+                    //     ev.header.stream_id,
+                    //     ev.header.flags(),
+                    //     ev.body.len(),
+                    // );
                     self.session.handle_mux_event(ev);
                     not_ready = false;
                 }

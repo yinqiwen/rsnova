@@ -273,7 +273,14 @@ pub fn chacha20poly1305_decrypt_event(
     ) {
         Ok(_) => {}
         Err(e) => {
-            error!("decrypt error:{}", e);
+            error!(
+                "decrypt error:{} for event:{} {} {} {}",
+                e,
+                header.stream_id,
+                header.flags(),
+                header.len(),
+                buf.len(),
+            );
             return Err((0, "Decrypt error"));
         }
     }
