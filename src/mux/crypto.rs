@@ -2,7 +2,8 @@ use bytes::{BufMut, BytesMut};
 use tokio::prelude::*;
 use tokio_io::io::{read_exact, write_all};
 
-use orion::hazardous::aead::{chacha20poly1305, xchacha20poly1305};
+//use orion::hazardous::aead::{chacha20poly1305, xchacha20poly1305};
+use ring::aead::*;
 use std::io::{Error, ErrorKind};
 
 use crate::mux::event::*;
@@ -16,6 +17,9 @@ pub struct CryptoContext {
     pub decrypt_nonce: u64,
     pub encrypter: EncryptFunc,
     pub decrypter: DecryptFunc,
+
+    chacha20poly1305SealKey: Option<SealingKey>,
+    chacha20poly1305OpeningKey: Option<OpeningKey>,
 }
 
 type DecryptError = (u32, &'static str);
@@ -24,6 +28,37 @@ type EncryptFunc = fn(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut);
 type DecryptFunc = fn(ctx: &CryptoContext, buf: &mut BytesMut) -> Result<Event, DecryptError>;
 
 impl CryptoContext {
+    pub fn new(method: &str, k: &str, nonce: u64) -> Self {
+        let mut key = String::from(k);
+        while key.len() < 32 {
+            key.push('F');
+        }
+        match method {
+            METHOD_CHACHA20_POLY1305 => CryptoContext {
+                encrypt_nonce: nonce,
+                decrypt_nonce: nonce,
+                encrypter: chacha20poly1305_encrypt_event,
+                decrypter: chacha20poly1305_decrypt_event,
+                chacha20poly1305SealKey: Some(
+                    SealingKey::new(&CHACHA20_POLY1305, &key.as_bytes()[0..32]).unwrap(),
+                ),
+                chacha20poly1305OpeningKey: Some(
+                    OpeningKey::new(&CHACHA20_POLY1305, &key.as_bytes()[0..32]).unwrap(),
+                ),
+                key: key,
+            },
+            METHOD_NONE => CryptoContext {
+                key: key,
+                encrypt_nonce: nonce,
+                decrypt_nonce: nonce,
+                encrypter: none_encrypt_event,
+                decrypter: none_decrypt_event,
+                chacha20poly1305SealKey: None,
+                chacha20poly1305OpeningKey: None,
+            },
+            _ => panic!("not supported crypto method."),
+        }
+    }
     pub fn encrypt(&mut self, ev: &Event, out: &mut BytesMut) {
         (self.encrypter)(&self, ev, out);
         self.encrypt_nonce = self.encrypt_nonce + 1;
@@ -150,22 +185,23 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
     // );
 
     if ev.body.len() > 0 {
-        let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
-        let xnonce: u128 = ctx.encrypt_nonce as u128;
-        let dlen = EVENT_HEADER_LEN + 16 + ev.body.len() as usize;
+        //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
+        let additional_data: [u8; 0] = [];
+        let dlen = EVENT_HEADER_LEN + CHACHA20_POLY1305.tag_len() + ev.body.len() as usize;
         out.reserve(dlen);
+        out.put_slice(&ev.body[..]);
         unsafe {
             out.set_len(dlen);
         }
-        let nonce = chacha20poly1305::Nonce::from_slice(&xnonce.to_le_bytes()[0..12]).unwrap();
-        match chacha20poly1305::seal(
-            &key,
-            &nonce,
-            &ev.body[..],
-            None,
+        let xnonce: u128 = ctx.encrypt_nonce as u128;
+        match seal_in_place(
+            ctx.chacha20poly1305SealKey.as_ref().unwrap(),
+            Nonce::try_assume_unique_for_key(&xnonce.to_le_bytes()[0..12]).unwrap(),
+            Aad::from(&additional_data),
             &mut out[EVENT_HEADER_LEN..],
+            CHACHA20_POLY1305.tag_len(),
         ) {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) => {
                 error!("encrypt error:{} {}", e, out.len());
             }
@@ -203,66 +239,50 @@ pub fn chacha20poly1305_decrypt_event(
             local: false,
         });
     }
-    if buf.len() - EVENT_HEADER_LEN < (header.len() as usize + 16) {
+    if buf.len() - EVENT_HEADER_LEN < (header.len() as usize + CHACHA20_POLY1305.tag_len()) {
         return Err((
-            header.len() + EVENT_HEADER_LEN as u32 + 16 - buf.len() as u32,
+            header.len() + (EVENT_HEADER_LEN + CHACHA20_POLY1305.tag_len() - buf.len()) as u32,
             "",
         ));
     }
     buf.advance(EVENT_HEADER_LEN);
     let dlen = header.len() as usize;
-    let mut out = Vec::with_capacity(dlen);
-    unsafe {
-        out.set_len(dlen);
-    }
+    // let mut out = Vec::with_capacity(dlen);
+    // unsafe {
+    //     out.set_len(dlen);
+    // }
     // info!(
     //     "decode event:{} body with len {}, {}",
     //     header.flags(),
     //     header.len(),
     //     out.len()
     // );
-    let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
+    //let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
     let xnonce: u128 = ctx.decrypt_nonce as u128;
-    let nonce = chacha20poly1305::Nonce::from_slice(&xnonce.to_le_bytes()[0..12]).unwrap();
-    match chacha20poly1305::open(&key, &nonce, &buf[0..dlen + 16], None, &mut out) {
-        Ok(()) => {}
+    // let nonce = chacha20poly1305::Nonce::from_slice(&xnonce.to_le_bytes()[0..12]).unwrap();
+
+    let additional_data: [u8; 0] = [];
+    //match chacha20poly1305::open(&key, &nonce, &buf[0..dlen + 16], None, &mut out) {
+    match open_in_place(
+        ctx.chacha20poly1305OpeningKey.as_ref().unwrap(),
+        Nonce::try_assume_unique_for_key(&xnonce.to_le_bytes()[0..12]).unwrap(),
+        Aad::from(&additional_data),
+        0,
+        &mut buf[..],
+    ) {
+        Ok(_) => {}
         Err(e) => {
-            error!("decrypt error:{} {}", e, out.len());
+            error!("decrypt error:{}", e);
             return Err((0, "Decrypt error"));
         }
     }
-    buf.advance(dlen + 16);
+    let out = Vec::from(&buf[0..dlen]);
+    buf.advance(dlen + CHACHA20_POLY1305.tag_len());
     Ok(Event {
         header: header,
         body: out,
         local: false,
     })
-}
-
-impl CryptoContext {
-    pub fn new(method: &str, k: &str, nonce: u64) -> Self {
-        let mut key = String::from(k);
-        while key.len() < 32 {
-            key.push('F');
-        }
-        match method {
-            METHOD_CHACHA20_POLY1305 => CryptoContext {
-                key: key,
-                encrypt_nonce: nonce,
-                decrypt_nonce: nonce,
-                encrypter: chacha20poly1305_encrypt_event,
-                decrypter: chacha20poly1305_decrypt_event,
-            },
-            METHOD_NONE => CryptoContext {
-                key: key,
-                encrypt_nonce: nonce,
-                decrypt_nonce: nonce,
-                encrypter: none_encrypt_event,
-                decrypter: none_decrypt_event,
-            },
-            _ => panic!("not supported crypto method."),
-        }
-    }
 }
 
 #[cfg(test)]

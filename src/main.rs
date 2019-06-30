@@ -15,8 +15,9 @@ extern crate serde;
 
 extern crate nix;
 extern crate nom;
-extern crate orion;
+//extern crate orion;
 extern crate rand;
+extern crate ring;
 extern crate simplelog;
 extern crate skip32;
 
