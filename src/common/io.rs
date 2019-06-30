@@ -415,6 +415,13 @@ where
         loop {
             // If our buffer is empty, then we need to read some data to
             // continue.
+            // info!(
+            //     "### enter copy:{} {} {} {}",
+            //     self.pos,
+            //     self.cap,
+            //     self.read_done,
+            //     self.buf.len(),
+            // );
             if self.pos == self.cap && !self.read_done {
                 let reader = self.reader.as_mut().unwrap();
                 let n = try_ready!(reader.poll_read(&mut self.buf));

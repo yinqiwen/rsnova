@@ -62,7 +62,7 @@ where
     // let should_close_on_local_eof = Arc::new(close_on_local_eof);
 
     preprocess.and_then(|_remote_writer| {
-        let copy_to_remote = buf_copy(local_reader, _remote_writer, Box::new([0; 32 * 1024]))
+        let copy_to_remote = buf_copy(local_reader, _remote_writer, Box::new([0; 33 * 1024]))
             .and_then(move |(n, _, server_writer)| {
                 //
                 //info!("###local read done!");

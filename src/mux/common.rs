@@ -12,8 +12,9 @@ use tokio::io;
 use tokio_io::io::shutdown;
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use futures::sync::mpsc;
 use tokio::prelude::*;
+use tokio::sync::mpsc::channel;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_sync::semaphore::{Permit, Semaphore};
 
 struct MuxStreamState {
@@ -27,8 +28,8 @@ struct MuxStreamState {
 struct MuxStreamInner {
     state: Arc<MuxStreamState>,
     recv_buf: Cursor<Bytes>,
-    send_channel: mpsc::Sender<Event>,
-    recv_channel: mpsc::Receiver<Vec<u8>>,
+    send_channel: Sender<Event>,
+    recv_channel: Receiver<Vec<u8>>,
 }
 
 impl MuxStreamInner {
@@ -59,6 +60,7 @@ impl Read for MuxStreamInner {
             return Ok(n);
         } else {
             let r = self.recv_channel.poll();
+            //info!("recn poll {:?}", r);
             match r {
                 Ok(Async::NotReady) => Err(Error::from(ErrorKind::WouldBlock)),
                 Ok(Async::Ready(None)) => Err(Error::from(ErrorKind::ConnectionReset)),
@@ -137,12 +139,12 @@ impl Write for MuxStreamInner {
 
 pub struct ChannelMuxStream {
     state: Arc<MuxStreamState>,
-    send_channel: mpsc::Sender<Event>,
-    recv_data_channel: Option<mpsc::Sender<Vec<u8>>>,
+    send_channel: Sender<Event>,
+    recv_data_channel: Option<Sender<Vec<u8>>>,
 }
 
 impl ChannelMuxStream {
-    pub fn new(id: u32, s: &mpsc::Sender<Event>) -> Self {
+    pub fn new(id: u32, s: &Sender<Event>) -> Self {
         let state = MuxStreamState {
             stream_id: id,
             send_buf_window: AtomicU32::new(512 * 1024),
@@ -160,7 +162,7 @@ impl ChannelMuxStream {
 
 impl MuxStream for ChannelMuxStream {
     fn split(&mut self) -> (Box<dyn AsyncRead + Send>, Box<dyn AsyncWrite + Send>) {
-        let (send, recv) = mpsc::channel(1024);
+        let (send, recv) = channel(1024);
         self.recv_data_channel = Some(send);
 
         let inner = MuxStreamInner {
@@ -224,14 +226,14 @@ impl MuxStream for ChannelMuxStream {
 }
 
 pub struct ChannelMuxSession {
-    event_trigger_send: mpsc::Sender<Event>,
+    event_trigger_send: Sender<Event>,
     streams: HashMap<u32, ChannelMuxStream>,
     next_stream_id: AtomicU32,
     is_client: bool,
 }
 
 impl ChannelMuxSession {
-    pub fn new(send: &mpsc::Sender<Event>, is_client: bool) -> Self {
+    pub fn new(send: &Sender<Event>, is_client: bool) -> Self {
         let mut seed = AtomicU32::new(1);
         if !is_client {
             seed = AtomicU32::new(2);

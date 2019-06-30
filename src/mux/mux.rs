@@ -23,7 +23,7 @@ use futures::Sink;
 use futures::Stream;
 use tokio_io_timeout::TimeoutReader;
 
-use futures::sync::mpsc;
+use tokio::sync::mpsc;
 
 use bytes::BytesMut;
 
@@ -263,11 +263,13 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
         }
     }
     fn close(&mut self) {
-        self.closed = true;
-        self.session.close();
-        self.local_ev_send.close();
-        self.remote_ev_send.close();
-        self.task_send.close();
+        if !self.closed {
+            self.closed = true;
+            self.session.close();
+            self.local_ev_send.close();
+            self.remote_ev_send.close();
+            self.task_send.close();
+        }
     }
 
     fn try_send_event(&mut self, ev: Event) -> Result<bool, std::io::Error> {

@@ -8,8 +8,8 @@ use std::time::Duration;
 use tokio::prelude::*;
 use tokio::timer::Interval;
 
-use futures::sync::mpsc;
 use futures::Stream;
+use tokio::sync::mpsc;
 
 use url::{ParseError, Url};
 
@@ -69,7 +69,9 @@ impl MuxSessionManager {
             }
         }
         for s in self.all_sessions.iter_mut() {
-            if !s.task_sender.is_closed() {
+            if let Err(_) = s.task_sender.poll_ready() {
+                //
+            } else {
                 s.task_sender.start_send(Box::new(ping_session));
             }
         }
@@ -108,14 +110,17 @@ impl MuxSessionManager {
         let c = self.cursor + 1;
         self.cursor = c;
         let idx = c as usize % self.all_sessions.len();
-        if let Some(data) = self.all_sessions.get(idx) {
-            if data.task_sender.is_closed() {
-                let k = channel_url_key(data.channel.as_str(), data.url.as_str());
-                if let Some(s) = self.channel_states.get_mut(&k) {
-                    s.conns = s.conns - 1;
+        if let Some(mut data) = self.all_sessions.get_mut(idx) {
+            match data.task_sender.poll_ready() {
+                Err(e) => {
+                    let k = channel_url_key(data.channel.as_str(), data.url.as_str());
+                    if let Some(s) = self.channel_states.get_mut(&k) {
+                        s.conns = s.conns - 1;
+                    }
+                    self.all_sessions.remove(idx as usize);
+                    return None;
                 }
-                self.all_sessions.remove(idx as usize);
-                return None;
+                _ => {}
             }
             if ch.len() == 0 || data.channel == ch {
                 return Some(data.task_sender.clone());

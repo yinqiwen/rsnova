@@ -241,7 +241,8 @@ pub fn chacha20poly1305_decrypt_event(
     }
     if buf.len() - EVENT_HEADER_LEN < (header.len() as usize + CHACHA20_POLY1305.tag_len()) {
         return Err((
-            header.len() + (EVENT_HEADER_LEN + CHACHA20_POLY1305.tag_len() - buf.len()) as u32,
+            header.len() + (EVENT_HEADER_LEN + CHACHA20_POLY1305.tag_len()) as u32
+                - buf.len() as u32,
             "",
         ));
     }
@@ -268,7 +269,7 @@ pub fn chacha20poly1305_decrypt_event(
         Nonce::try_assume_unique_for_key(&xnonce.to_le_bytes()[0..12]).unwrap(),
         Aad::from(&additional_data),
         0,
-        &mut buf[..],
+        &mut buf[0..(dlen + CHACHA20_POLY1305.tag_len())],
     ) {
         Ok(_) => {}
         Err(e) => {
