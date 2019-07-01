@@ -1,28 +1,43 @@
+use super::channel::ChannelState;
+use crate::common::http_proxy_connect;
 use crate::mux::mux::*;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 
 use url::Url;
 
-pub fn init_local_tcp_channel(channel: &str, url: &Url) {
-    let remote = ::common::utils::get_hostport_from_url(url).unwrap();
+pub fn init_local_tcp_channel(channel: &ChannelState) {
+    let remote = ::common::utils::get_hostport_from_url(&channel.url).unwrap();
     let remote_addr = remote.parse().unwrap();
-    let channel_str = String::from(channel);
-    let url_str = String::from(url.as_str());
-    let f = TcpStream::connect(&remote_addr)
-        .and_then(move |socket| {
-            tokio::spawn(
+    let channel_str = String::from(&channel.channel);
+    let url_str = String::from(channel.url.as_str());
+    let proxy_str = String::from(channel.config.proxy.as_str());
+
+    if proxy_str.is_empty() {
+        let f = TcpStream::connect(&remote_addr)
+            .and_then(move |socket| {
                 process_client_connection(channel_str.as_str(), url_str.as_str(), socket).then(
                     |_| {
                         info!("Server connection closed.");
                         Ok(())
                     },
-                ),
-            );
-            Ok(())
-        })
-        .map_err(|e| error!("tcp connect error:{}", e));
-    tokio::spawn(f);
+                )
+            })
+            .map_err(|e| error!("tcp connect error:{}", e));
+        tokio::spawn(f);
+    } else {
+        let f = http_proxy_connect(proxy_str.as_str(), remote.as_str())
+            .and_then(move |socket| {
+                process_client_connection(channel_str.as_str(), url_str.as_str(), socket).then(
+                    |_| {
+                        info!("Server connection closed.");
+                        Ok(())
+                    },
+                )
+            })
+            .map_err(|e| error!("tcp proxy connect error:{}", e));
+        tokio::spawn(f);
+    }
 }
 
 pub fn init_remote_tcp_channel(url: &Url) {
@@ -38,7 +53,6 @@ pub fn init_remote_tcp_channel(url: &Url) {
     match listener {
         Err(e) => {
             error!("Failed to bind on addr:{} with error:{}", remote, e);
-            return;
         }
         Ok(l) => {
             let server = l

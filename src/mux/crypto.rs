@@ -2,7 +2,6 @@ use bytes::{BufMut, BytesMut};
 use tokio::prelude::*;
 use tokio_io::io::{read_exact, write_all};
 
-//use orion::hazardous::aead::{chacha20poly1305, xchacha20poly1305};
 use ring::aead::*;
 use std::io::{Error, ErrorKind};
 
@@ -143,9 +142,8 @@ pub fn none_decrypt_event(ctx: &CryptoContext, buf: &mut BytesMut) -> Result<Eve
     if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
         buf.advance(EVENT_HEADER_LEN);
         return Ok(Event {
-            header: header,
+            header,
             body: vec![],
-            local: false,
         });
     }
     if buf.len() - EVENT_HEADER_LEN < header.len() as usize {
@@ -159,11 +157,7 @@ pub fn none_decrypt_event(ctx: &CryptoContext, buf: &mut BytesMut) -> Result<Eve
     let mut out = Vec::with_capacity(dlen);
     out.put_slice(&buf[0..dlen]);
     buf.advance(dlen);
-    Ok(Event {
-        header: header,
-        body: out,
-        local: false,
-    })
+    Ok(Event { header, body: out })
 }
 
 pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut) {
@@ -184,7 +178,7 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
     //     ev.header.len(),
     // );
 
-    if ev.body.len() > 0 {
+    if !ev.body.is_empty() {
         //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
         let additional_data: [u8; 0] = [];
         let dlen = EVENT_HEADER_LEN + CHACHA20_POLY1305.tag_len() + ev.body.len() as usize;
@@ -234,9 +228,8 @@ pub fn chacha20poly1305_decrypt_event(
     if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
         buf.advance(EVENT_HEADER_LEN);
         return Ok(Event {
-            header: header,
+            header,
             body: vec![],
-            local: false,
         });
     }
     if buf.len() - EVENT_HEADER_LEN < (header.len() as usize + CHACHA20_POLY1305.tag_len()) {
@@ -286,11 +279,7 @@ pub fn chacha20poly1305_decrypt_event(
     }
     let out = Vec::from(&buf[0..dlen]);
     buf.advance(dlen + CHACHA20_POLY1305.tag_len());
-    Ok(Event {
-        header: header,
-        body: out,
-        local: false,
-    })
+    Ok(Event { header, body: out })
 }
 
 #[cfg(test)]

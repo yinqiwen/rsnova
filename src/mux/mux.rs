@@ -1,7 +1,5 @@
 use super::relay::relay_connection;
-use crate::common::io::*;
-use crate::common::udp::*;
-use crate::common::utils::*;
+
 use crate::config::*;
 use crate::mux::channel::*;
 use crate::mux::common::*;
@@ -10,18 +8,13 @@ use crate::mux::event::*;
 use crate::mux::message::*;
 use std::io::{Error, ErrorKind};
 
-use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::net::UdpSocket;
-
+use tokio_io::io::shutdown;
 use tokio_io::io::write_all;
-use tokio_io::io::{copy, shutdown};
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use futures::Future;
 use futures::Sink;
 use futures::Stream;
-use tokio_io_timeout::TimeoutReader;
 
 use tokio::sync::mpsc;
 
@@ -41,27 +34,6 @@ pub trait MuxStream: Sync + Send {
     fn id(&self) -> u32;
 }
 
-fn proxy_stream<R>(
-    local_reader: Box<dyn AsyncRead + Send>,
-    local_writer: Box<dyn AsyncWrite + Send>,
-    remote: R,
-) -> impl Future<Item = (u64, u64), Error = std::io::Error>
-where
-    R: AsyncRead + AsyncWrite,
-{
-    let (remote_reader, remote_writer) = remote.split();
-    let mut remote_reader = TimeoutReader::new(remote_reader);
-    let mut local_reader = TimeoutReader::new(local_reader);
-    let timeout = Duration::from_secs(get_config().lock().unwrap().read_timeout_sec);
-    remote_reader.set_timeout(Some(timeout));
-    local_reader.set_timeout(Some(timeout));
-    let copy_to_remote = copy(local_reader, remote_writer)
-        .and_then(|(n, _, server_writer)| shutdown(server_writer).map(move |_| n));;
-    let copy_to_local = copy(remote_reader, local_writer)
-        .and_then(|(n, _, client_writer)| shutdown(client_writer).map(move |_| n));;
-    copy_to_remote.join(copy_to_local)
-}
-
 //pub type MuxStreamRef = Box<dyn MuxStream>;
 
 pub trait MuxSession: Send {
@@ -79,7 +51,7 @@ pub trait MuxSession: Send {
             proto: String::from(proto),
             addr: String::from(addr),
         };
-        let cev = new_syn_event(next_id, &c, true);
+        let cev = new_syn_event(next_id, &c);
         s.write_event(cev);
         s
     }
@@ -195,16 +167,14 @@ where
         key: String::from(key),
         method: String::from(method),
     };
-    stream_event_rpc(ctx, conn, new_auth_event(sid, &auth, true)).and_then(
-        |(_ctx, conn, auth_res)| {
-            let decoded: AuthResponse = bincode::deserialize(&auth_res.body[..]).unwrap();
-            if !decoded.success {
-                shutdown(conn);
-                return Err(Error::from(ErrorKind::ConnectionRefused));
-            }
-            Ok((_ctx, conn, decoded))
-        },
-    )
+    stream_event_rpc(ctx, conn, new_auth_event(sid, &auth)).and_then(|(_ctx, conn, auth_res)| {
+        let decoded: AuthResponse = bincode::deserialize(&auth_res.body[..]).unwrap();
+        if !decoded.success {
+            shutdown(conn);
+            return Err(Error::from(ErrorKind::ConnectionRefused));
+        }
+        Ok((_ctx, conn, decoded))
+    })
 }
 
 fn server_auth_session<T>(
@@ -222,7 +192,7 @@ where
             rand: rng.gen::<u64>(),
             method: String::from(METHOD_CHACHA20_POLY1305),
         };
-        let res = new_auth_event(0, &auth_res, true);
+        let res = new_auth_event(0, &auth_res);
         let mut buf = BytesMut::new();
         _ctx.encrypt(&res, &mut buf);
         let evbuf = buf.to_vec();
@@ -230,7 +200,7 @@ where
     })
 }
 
-pub type SessionTaskClosure = Box<FnOnce(&mut dyn MuxSession) + Send>;
+pub type SessionTaskClosure = Box<dyn FnOnce(&mut dyn MuxSession) + Send>;
 
 struct MuxConnectionProcessor<T: AsyncRead + AsyncWrite> {
     local_ev_send: mpsc::Sender<Event>,
@@ -257,7 +227,7 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
             remote_ev_recv: reader,
             task_send: atx,
             task_recv: arx,
-            session: session,
+            session,
             last_unsent_event: new_empty_event(),
             closed: false,
         }
@@ -274,9 +244,7 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
 
     fn try_send_event(&mut self, ev: Event) -> Result<bool, std::io::Error> {
         match self.remote_ev_send.start_send(ev) {
-            Ok(AsyncSink::Ready) => {
-                return Ok(true);
-            }
+            Ok(AsyncSink::Ready) => Ok(true),
             Ok(AsyncSink::NotReady(v)) => {
                 self.last_unsent_event = v;
                 Ok(false)
@@ -284,7 +252,7 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
             Err(e) => {
                 error!("Remote event send error:{}", e);
                 self.close();
-                return Err(Error::from(ErrorKind::ConnectionReset));
+                Err(Error::from(ErrorKind::ConnectionReset))
             }
         }
     }
@@ -309,15 +277,10 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                         if FLAG_FIN == ev.header.flags() {
                             self.session.close_stream(ev.header.stream_id, true);
                         }
-                        match self.try_send_event(ev) {
-                            Err(e) => {
-                                error!("Remote event send error:{}", e);
-                                self.close();
-                                return Err(Error::from(ErrorKind::ConnectionReset));
-                            }
-                            _ => {
-                                //self.remote_ev_send.poll_complete();
-                            }
+                        if let Err(e) = self.try_send_event(ev) {
+                            error!("Remote event send error:{}", e);
+                            self.close();
+                            return Err(Error::from(ErrorKind::ConnectionReset));
                         }
                         //return Ok(Async::Ready(Some(())));
                     }

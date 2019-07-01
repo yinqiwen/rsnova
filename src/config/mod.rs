@@ -5,12 +5,13 @@ lazy_static! {
     static ref GLOBAL_CONFIG: Mutex<Config> = Mutex::new(Config::new());
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct ChannelConfig {
     pub name: String,
     pub urls: Vec<String>,
     pub ping_interval_sec: u32,
     pub conns_per_host: u32,
+    pub proxy: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -53,10 +54,11 @@ pub fn get_config() -> &'static Mutex<Config> {
     &GLOBAL_CONFIG
 }
 
-pub fn add_channel_config(url: &str) {
+pub fn add_channel_config(url: &str, proxy: &str) {
     let mut ch: ChannelConfig = Default::default();
     ch.urls.push(String::from(url));
     ch.conns_per_host = 1;
     ch.name = String::from("default");
+    ch.proxy = String::from(proxy);
     get_config().lock().unwrap().local.channels.push(ch);
 }

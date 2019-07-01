@@ -18,12 +18,12 @@ lazy_static! {
 }
 
 #[derive(Clone)]
-struct ChannelState {
-    //config: ChannelConfig,
-    channel: String,
-    url: Url,
-    conns: u32,
-    conns_per_host: u32,
+pub struct ChannelState {
+    pub config: ChannelConfig,
+    pub channel: String,
+    pub url: Url,
+    pub conns: u32,
+    //conns_per_host: u32,
 }
 
 struct SessionData {
@@ -61,15 +61,15 @@ impl MuxSessionManager {
 
     fn routine(&mut self) {
         for state in self.channel_states.values() {
-            if state.conns < state.conns_per_host {
-                let gap = state.conns_per_host - state.conns;
+            if state.conns < state.config.conns_per_host {
+                let gap = state.config.conns_per_host - state.conns;
                 for _ in 0..gap {
-                    init_local_mux_connection(&state.channel, &state.url);
+                    init_local_mux_connection(&state);
                 }
             }
         }
         for s in self.all_sessions.iter_mut() {
-            if let Err(_) = s.task_sender.poll_ready() {
+            if s.task_sender.poll_ready().is_err() {
                 //
             } else {
                 s.task_sender.start_send(Box::new(ping_session));
@@ -96,7 +96,7 @@ impl MuxSessionManager {
         let k = channel_url_key(data.channel.as_str(), data.url.as_str());
         info!("add session for {}", k);
         if let Some(s) = self.channel_states.get_mut(&k) {
-            s.conns = s.conns + 1;
+            s.conns += 1;
             info!("session count {}", s.conns);
             self.all_sessions.push(data);
             true
@@ -126,7 +126,7 @@ impl MuxSessionManager {
                 return Some(data.task_sender.clone());
             }
         }
-        return None;
+        None
     }
 
     pub fn select_session_by_channel(
@@ -135,13 +135,13 @@ impl MuxSessionManager {
     ) -> Option<mpsc::Sender<SessionTaskClosure>> {
         let mut loop_count = 0;
         while loop_count < self.all_sessions.len() {
-            if self.all_sessions.len() == 0 {
+            if self.all_sessions.is_empty() {
                 return None;
             }
             if let Some(v) = self.do_select_session(ch) {
                 return Some(v);
             }
-            loop_count = loop_count + 1;
+            loop_count += 1;
         }
         None
     }
@@ -171,34 +171,34 @@ pub fn add_session(
         .add_session(channel, url, task_sender)
 }
 
-fn init_local_mux_connection(channel: &str, url: &Url) {
-    match url.scheme() {
+fn init_local_mux_connection(channel: &ChannelState) {
+    match channel.url.scheme() {
         "tcp" => {
-            init_local_tcp_channel(channel, url);
+            init_local_tcp_channel(channel);
         }
         _ => {
-            error!("unknown scheme:{}", url.scheme());
+            error!("unknown scheme:{}", channel.url.scheme());
         }
     }
 }
 
-pub fn init_local_mux_channels(cs: &Vec<ChannelConfig>) {
+pub fn init_local_mux_channels(cs: &[ChannelConfig]) {
     for c in cs {
         for u in &c.urls {
             match Url::parse(u.as_str()) {
                 Ok(url) => {
                     let state = ChannelState {
+                        config: c.clone(),
                         channel: String::from(c.name.as_str()),
-                        url: url,
+                        url,
                         conns: 0,
-                        conns_per_host: c.conns_per_host,
                     };
                     let init_state = state.clone();
                     let key = channel_url_key(c.name.as_str(), state.url.as_str());
                     SESSIONS_HOLDER.lock().unwrap().add_channel_url(key, state);
 
                     for _ in 0..c.conns_per_host {
-                        init_local_mux_connection(&init_state.channel, &init_state.url);
+                        init_local_mux_connection(&init_state);
                     }
                 }
                 Err(e) => {
@@ -225,7 +225,6 @@ pub fn init_remote_mux_server(url: &String) {
     match remote_url {
         Err(e) => {
             error!("invalid remote url:{} with error:{}", url, e);
-            return;
         }
         Ok(u) => match u.scheme() {
             "tcp" => {

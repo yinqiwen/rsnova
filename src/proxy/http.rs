@@ -43,7 +43,7 @@ where
                     return future::Either::A(futures::future::err(()));
                 }
             }
-            if target.len() == 0 {
+            if target.is_empty() {
                 if let Some(p) = req.path {
                     let mut url = String::from(p);
                     if !p.contains("://") {
@@ -60,7 +60,7 @@ where
                     }
                 }
             }
-            if target.len() == 0 {
+            if target.is_empty() {
                 error!("No target address found.");
                 return future::Either::A(futures::future::err(()));
             }

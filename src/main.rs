@@ -107,6 +107,13 @@ fn main() {
                 .multiple(true),
         )
         .arg(
+            Arg::with_name("proxy")
+                .long("proxy")
+                .help("Proxy setting")
+                .default_value("")
+                .multiple(false),
+        )
+        .arg(
             Arg::with_name("debug")
                 .short("d")
                 .long("debug")
@@ -137,7 +144,10 @@ fn main() {
 
     CombinedLogger::init(loggers).unwrap();
 
-    //test::start();
+    let mut proxy = String::new();
+    if let Some(v) = matches.value_of("proxy") {
+        proxy = String::from(v);
+    }
 
     // Create the runtime
     let mut rt = Runtime::new().unwrap();
@@ -186,7 +196,7 @@ fn main() {
         Some(ss) => {
             let servers: Vec<_> = ss.collect();
             for s in &servers {
-                config::add_channel_config(*s);
+                config::add_channel_config(*s, proxy.as_str());
             }
             rt.spawn(future::lazy(|| {
                 mux::channel::init_local_mux_channels(

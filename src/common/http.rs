@@ -1,4 +1,3 @@
-use crate::common::io::*;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{Async, Poll, Stream};
 use httparse::Status;
@@ -372,5 +371,17 @@ impl<T: AsyncRead> Read for HttpProxyReader<T> {
                 }
             }
         }
+    }
+}
+
+pub fn is_ok_response(buf: &[u8]) -> bool {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut res = httparse::Response::new(&mut headers);
+    match res.parse(buf) {
+        Ok(Status::Complete(_)) => {
+            info!("code is {}", res.code.unwrap());
+            res.code.unwrap() < 300
+        }
+        _ => false,
     }
 }

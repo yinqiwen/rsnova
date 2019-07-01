@@ -8,7 +8,7 @@ use super::channel::select_session;
 use super::mux::MuxSession;
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio_io::io::{copy, shutdown};
+use tokio_io::io::shutdown;
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use std::time::Duration;
@@ -46,7 +46,7 @@ where
     //let (remote_reader, remote_writer) = remote.split();
     let mut remote_reader = TimeoutReader::new(remote_reader);
     let mut local_reader = TimeoutReader::new(local_reader);
-    let timeout = Duration::from_secs(timeout_secs as u64);
+    let timeout = Duration::from_secs(u64::from(timeout_secs));
     remote_reader.set_timeout(Some(timeout));
     local_reader.set_timeout(Some(timeout));
 

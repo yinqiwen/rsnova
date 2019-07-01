@@ -1,5 +1,3 @@
-use crate::common::utils::*;
-
 use std::io::Error;
 use std::io::ErrorKind;
 use tokio::prelude::*;
@@ -21,10 +19,10 @@ pub fn other_error(desc: &str) -> std::io::Error {
     std::io::Error::new(ErrorKind::Other, desc)
 }
 
-pub enum HostPort {
-    DomainPort(String, u16),
-    IPPort(SocketAddr),
-}
+// pub enum HostPort {
+//     DomainPort(String, u16),
+//     IPPort(SocketAddr),
+// }
 
 #[derive(Debug)]
 enum State<A> {
@@ -273,7 +271,7 @@ where
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         debug!("enter peek read {}!", self.peek_buf.len());
-        if self.peek_buf.len() == 0 {
+        if self.peek_buf.is_empty() {
             match self.inner.poll_read(buf) {
                 Ok(Async::Ready(nn)) => {
                     return Ok(nn);

@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use bytes::Bytes;
 
 use tokio::io;
-use tokio_io::io::shutdown;
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use tokio::prelude::*;
@@ -42,7 +41,7 @@ impl MuxStreamInner {
         if !self.state.closed.load(Ordering::SeqCst) {
             self.state.closed.store(true, Ordering::SeqCst);
             self.send_channel
-                .start_send(new_fin_event(self.state.stream_id, true));
+                .start_send(new_fin_event(self.state.stream_id));
             self.send_channel.poll_complete();
             self.state.window_sem.close();
         }
@@ -107,7 +106,7 @@ impl Write for MuxStreamInner {
         if send_len > self.state.send_buf_window.load(Ordering::SeqCst) as usize {
             send_len = self.state.send_buf_window.load(Ordering::SeqCst) as usize;
         }
-        let ev = new_data_event(self.state.stream_id, &buf[0..send_len], true);
+        let ev = new_data_event(self.state.stream_id, &buf[0..send_len]);
         // info!(
         //     "[{}]new data ev with len:{} {}",
         //     self.state.stream_id,
@@ -178,7 +177,7 @@ impl MuxStream for ChannelMuxStream {
         if !self.state.closed.load(Ordering::SeqCst) {
             self.state.closed.store(true, Ordering::SeqCst);
             self.send_channel
-                .start_send(new_fin_event(self.state.stream_id, true));
+                .start_send(new_fin_event(self.state.stream_id));
             if let Some(s) = &mut self.recv_data_channel {
                 s.close();
             }
@@ -203,7 +202,7 @@ impl MuxStream for ChannelMuxStream {
             .recv_buf_window
             .fetch_add(data_len, Ordering::SeqCst);
         if recv_window_size >= 32 * 1024 {
-            let ev = new_window_update_event(self.state.stream_id, recv_window_size, true);
+            let ev = new_window_update_event(self.state.stream_id, recv_window_size);
             self.send_channel.start_send(ev);
             self.send_channel.poll_complete();
             self.state

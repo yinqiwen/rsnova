@@ -1,13 +1,9 @@
 use crate::mux::crypto::*;
-use byteorder::{ByteOrder, LittleEndian};
 use bytes::BytesMut;
 use tokio::codec::{Decoder, Encoder};
 
 use std::io::{Error, ErrorKind};
-use tokio::prelude::*;
 
-use tokio_io::io::{read_exact, write_all};
-use tokio_io::{AsyncRead, AsyncWrite};
 pub const FLAG_SYN: u8 = 1;
 pub const FLAG_FIN: u8 = 2;
 pub const FLAG_DATA: u8 = 3;
@@ -25,15 +21,15 @@ pub struct Header {
 }
 
 fn get_flag_len(len: u32, flag: u8) -> u32 {
-    (len << 8) | (flag as u32)
+    (len << 8) | u32::from(flag)
 }
 
 impl Header {
     fn set_flag_len(&mut self, len: u32, flag: u8) {
-        self.flag_len = (len << 8) | (flag as u32);
+        self.flag_len = (len << 8) | u32::from(flag);
     }
     pub fn flags(&self) -> u8 {
-        return (self.flag_len & 0xFF) as u8;
+        (self.flag_len & 0xFF) as u8
     }
     pub fn len(&self) -> u32 {
         (self.flag_len >> 8)
@@ -51,8 +47,6 @@ impl Header {
 pub struct Event {
     pub header: Header,
     pub body: Vec<u8>,
-
-    pub local: bool,
 }
 
 impl Event {
@@ -68,32 +62,30 @@ pub fn new_empty_event() -> Event {
             stream_id: 0,
         },
         body: Vec::new(),
-        local: false,
     }
 }
 
-pub fn new_auth_event<T: serde::Serialize>(sid: u32, msg: &T, local: bool) -> Event {
+pub fn new_auth_event<T: serde::Serialize>(sid: u32, msg: &T) -> Event {
     let data = bincode::serialize(msg).unwrap();
-    let mut ev = new_data_event(sid, &data[..], local);
+    let mut ev = new_data_event(sid, &data[..]);
     ev.header.set_flag(FLAG_AUTH);
     ev
 }
 
-pub fn new_syn_event<T: serde::Serialize>(sid: u32, msg: &T, local: bool) -> Event {
+pub fn new_syn_event<T: serde::Serialize>(sid: u32, msg: &T) -> Event {
     let data = bincode::serialize(msg).unwrap();
-    let mut ev = new_data_event(sid, &data[..], local);
+    let mut ev = new_data_event(sid, &data[..]);
     ev.header.set_flag(FLAG_SYN);
     ev
 }
 
-pub fn new_fin_event(sid: u32, local: bool) -> Event {
+pub fn new_fin_event(sid: u32) -> Event {
     Event {
         header: Header {
             flag_len: get_flag_len(0, FLAG_FIN),
             stream_id: sid,
         },
         body: Vec::new(),
-        local: local,
     }
 }
 
@@ -104,28 +96,25 @@ pub fn new_ping_event(sid: u32) -> Event {
             stream_id: sid,
         },
         body: Vec::new(),
-        local: false,
     }
 }
 
-pub fn new_data_event(sid: u32, buf: &[u8], local: bool) -> Event {
+pub fn new_data_event(sid: u32, buf: &[u8]) -> Event {
     Event {
         header: Header {
             flag_len: get_flag_len(buf.len() as u32, FLAG_DATA),
             stream_id: sid,
         },
         body: Vec::from(buf),
-        local: local,
     }
 }
-pub fn new_window_update_event(sid: u32, len: u32, local: bool) -> Event {
+pub fn new_window_update_event(sid: u32, len: u32) -> Event {
     Event {
         header: Header {
             flag_len: get_flag_len(len, FLAG_WIN_UPDATE),
             stream_id: sid,
         },
         body: Vec::new(),
-        local: local,
     }
 }
 
@@ -137,7 +126,7 @@ pub struct EventCodec {
 
 impl EventCodec {
     pub fn new(ctx: CryptoContext) -> Self {
-        Self { ctx: ctx }
+        Self { ctx }
     }
 }
 
@@ -185,7 +174,7 @@ impl Decoder for EventCodec {
                 if reason.len() > 0 {
                     return Err(Error::from(ErrorKind::InvalidData));
                 }
-                return Ok(None);
+                Ok(None)
             }
         }
     }
