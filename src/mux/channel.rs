@@ -4,14 +4,14 @@ use crate::mux::tcp::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::prelude::*;
 use tokio::timer::Interval;
 
 use futures::Stream;
 use tokio::sync::mpsc;
 
-use url::{ParseError, Url};
+use url::Url;
 
 lazy_static! {
     static ref SESSIONS_HOLDER: Mutex<MuxSessionManager> = Mutex::new(MuxSessionManager::new());
@@ -26,14 +26,18 @@ pub struct ChannelState {
     //conns_per_host: u32,
 }
 
+#[derive(Clone)]
 struct SessionData {
     channel: String,
     url: String,
+    born_time: Instant,
+    max_alive_secs: u32,
     task_sender: mpsc::Sender<SessionTaskClosure>,
 }
 
 struct MuxSessionManager {
     all_sessions: Vec<SessionData>,
+    retire_sessions: Vec<SessionData>,
     cursor: u32,
 
     channel_states: HashMap<String, ChannelState>,
@@ -50,10 +54,18 @@ fn ping_session(session: &mut dyn MuxSession) {
     session.ping();
 }
 
+fn try_close_session(session: &mut dyn MuxSession) {
+    if session.num_of_streams() == 0 {
+        info!("Close retired session.");
+        session.close();
+    }
+}
+
 impl MuxSessionManager {
     fn new() -> Self {
         MuxSessionManager {
             all_sessions: Vec::new(),
+            retire_sessions: Vec::new(),
             cursor: 0,
             channel_states: HashMap::new(),
         }
@@ -68,13 +80,30 @@ impl MuxSessionManager {
                 }
             }
         }
-        for s in self.all_sessions.iter_mut() {
+        let mut retired = self
+            .all_sessions
+            .drain_filter(|s| {
+                if s.task_sender.poll_ready().is_err() {
+                    true
+                } else {
+                    s.task_sender.start_send(Box::new(ping_session));
+                    if 0 == s.max_alive_secs {
+                        return false;
+                    }
+                    s.born_time.elapsed().as_secs() > u64::from(s.max_alive_secs)
+                }
+            })
+            .collect::<Vec<_>>();
+        self.retire_sessions.append(&mut retired);
+
+        self.retire_sessions.drain_filter(|s| {
             if s.task_sender.poll_ready().is_err() {
-                //
+                true
             } else {
-                s.task_sender.start_send(Box::new(ping_session));
+                s.task_sender.start_send(Box::new(try_close_session));
+                false
             }
-        }
+        });
     }
 
     fn add_channel_url(&mut self, key: String, state: ChannelState) {
@@ -88,15 +117,18 @@ impl MuxSessionManager {
         url: &str,
         task_sender: &mpsc::Sender<SessionTaskClosure>,
     ) -> bool {
-        let data = SessionData {
+        let mut data = SessionData {
             channel: String::from(channel),
             url: String::from(url),
+            born_time: Instant::now(),
+            max_alive_secs: 0,
             task_sender: task_sender.clone(),
         };
         let k = channel_url_key(data.channel.as_str(), data.url.as_str());
         info!("add session for {}", k);
         if let Some(s) = self.channel_states.get_mut(&k) {
             s.conns += 1;
+            data.max_alive_secs = s.config.max_alive_mins * 60;
             info!("session count {}", s.conns);
             self.all_sessions.push(data);
             true
@@ -110,19 +142,16 @@ impl MuxSessionManager {
         let c = self.cursor + 1;
         self.cursor = c;
         let idx = c as usize % self.all_sessions.len();
-        if let Some(mut data) = self.all_sessions.get_mut(idx) {
-            match data.task_sender.poll_ready() {
-                Err(e) => {
-                    let k = channel_url_key(data.channel.as_str(), data.url.as_str());
-                    if let Some(s) = self.channel_states.get_mut(&k) {
-                        s.conns = s.conns - 1;
-                    }
-                    self.all_sessions.remove(idx as usize);
-                    return None;
+        if let Some(data) = self.all_sessions.get_mut(idx) {
+            if data.task_sender.poll_ready().is_err() {
+                let k = channel_url_key(data.channel.as_str(), data.url.as_str());
+                if let Some(s) = self.channel_states.get_mut(&k) {
+                    s.conns -= 1;
                 }
-                _ => {}
+                self.all_sessions.remove(idx as usize);
+                return None;
             }
-            if ch.len() == 0 || data.channel == ch {
+            if ch.is_empty() || data.channel == ch {
                 return Some(data.task_sender.clone());
             }
         }

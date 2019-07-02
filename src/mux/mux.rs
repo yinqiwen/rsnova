@@ -43,6 +43,7 @@ pub trait MuxSession: Send {
     fn close_stream(&mut self, sid: u32, initial: bool);
     fn close(&mut self);
     fn ping(&mut self);
+    fn num_of_streams(&self) -> usize;
 
     fn open_stream(&mut self, proto: &str, addr: &str) -> &mut dyn MuxStream {
         let next_id = self.next_stream_id();

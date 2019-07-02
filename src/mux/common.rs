@@ -241,13 +241,18 @@ impl ChannelMuxSession {
             event_trigger_send: send.clone(),
             streams: HashMap::new(),
             next_stream_id: seed,
-            is_client: is_client,
+            is_client,
         }
     }
 }
 
 impl MuxSession for ChannelMuxSession {
-    fn close(&mut self) {}
+    fn num_of_streams(&self) -> usize {
+        self.streams.len()
+    }
+    fn close(&mut self) {
+        self.event_trigger_send.close();
+    }
     fn ping(&mut self) {
         //info!("Send ping.");
         self.event_trigger_send.start_send(new_ping_event(0));

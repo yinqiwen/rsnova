@@ -1,6 +1,6 @@
 use bytes::{BufMut, BytesMut};
 use tokio::prelude::*;
-use tokio_io::io::{read_exact, write_all};
+use tokio_io::io::read_exact;
 
 use ring::aead::*;
 use std::io::{Error, ErrorKind};
@@ -44,10 +44,10 @@ impl CryptoContext {
                 chacha20poly1305OpeningKey: Some(
                     OpeningKey::new(&CHACHA20_POLY1305, &key.as_bytes()[0..32]).unwrap(),
                 ),
-                key: key,
+                key,
             },
             METHOD_NONE => CryptoContext {
-                key: key,
+                key,
                 encrypt_nonce: nonce,
                 decrypt_nonce: nonce,
                 encrypter: none_encrypt_event,
@@ -58,17 +58,47 @@ impl CryptoContext {
             _ => panic!("not supported crypto method."),
         }
     }
+
+    fn get_decrypt_nonce(&self) -> Nonce {
+        let mut d = [0u8; NONCE_LEN];
+        let v = self.decrypt_nonce.to_le_bytes();
+        d[0..8].copy_from_slice(&v[..]);
+        Nonce::assume_unique_for_key(d)
+    }
+
+    fn get_encrypt_nonce(&self) -> Nonce {
+        let mut d = [0u8; NONCE_LEN];
+        let v = self.encrypt_nonce.to_le_bytes();
+        d[0..8].copy_from_slice(&v[..]);
+        Nonce::assume_unique_for_key(d)
+    }
+
+    fn skip32_decrypt_key(&self) -> [u8; 10] {
+        let mut sk: [u8; 10] = Default::default();
+        sk[0..10].copy_from_slice(&self.key.as_bytes()[0..10]);
+        let dk = self.decrypt_nonce.to_le_bytes();
+        for i in 2..10 {
+            sk[i] |= dk[i - 2];
+        }
+        sk
+    }
+    fn skip32_encrypt_key(&self) -> [u8; 10] {
+        let mut sk: [u8; 10] = Default::default();
+        sk[0..10].copy_from_slice(&self.key.as_bytes()[0..10]);
+        let dk = self.encrypt_nonce.to_le_bytes();
+        for i in 2..10 {
+            sk[i] |= dk[i - 2];
+        }
+        sk
+    }
     pub fn encrypt(&mut self, ev: &Event, out: &mut BytesMut) {
         (self.encrypter)(&self, ev, out);
-        self.encrypt_nonce = self.encrypt_nonce + 1;
+        self.encrypt_nonce += 1;
     }
     pub fn decrypt(&mut self, buf: &mut BytesMut) -> Result<Event, DecryptError> {
         let r = (self.decrypter)(&self, buf);
-        match r {
-            Ok(_) => {
-                self.decrypt_nonce = self.decrypt_nonce + 1;
-            }
-            _ => {}
+        if r.is_ok() {
+            self.decrypt_nonce += 1;
         }
         r
     }
@@ -90,7 +120,7 @@ pub fn read_encrypt_event<T: AsyncRead>(
         match r {
             Ok(ev) => future::Either::A(future::ok((ctx, _stream, ev))),
             Err((n, reason)) => {
-                if reason.len() > 0 {
+                if !reason.is_empty() {
                     return future::Either::A(future::err(Error::from(
                         ErrorKind::PermissionDenied,
                     )));
@@ -117,7 +147,7 @@ pub fn none_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut) {
     out.put_u32_le(ev.header.flag_len);
     out.put_u32_le(ev.header.stream_id);
 
-    if ev.body.len() > 0 {
+    if !ev.body.is_empty() {
         out.reserve(ev.body.len());
         out.put_slice(&ev.body[..]);
     }
@@ -161,9 +191,7 @@ pub fn none_decrypt_event(ctx: &CryptoContext, buf: &mut BytesMut) -> Result<Eve
 }
 
 pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut) {
-    let mut sk: [u8; 10] = Default::default();
-    sk[0..2].copy_from_slice(&ctx.key.as_bytes()[0..2]);
-    sk[2..].copy_from_slice(&ctx.encrypt_nonce.to_le_bytes());
+    let sk = ctx.skip32_encrypt_key();
     let e1 = skip32::encode(&sk, ev.header.flag_len);
     let e2 = skip32::encode(&sk, ev.header.stream_id);
     out.reserve(EVENT_HEADER_LEN);
@@ -187,10 +215,9 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
         unsafe {
             out.set_len(dlen);
         }
-        let xnonce: u128 = ctx.encrypt_nonce as u128;
         match seal_in_place(
             ctx.chacha20poly1305SealKey.as_ref().unwrap(),
-            Nonce::try_assume_unique_for_key(&xnonce.to_le_bytes()[0..12]).unwrap(),
+            ctx.get_encrypt_nonce(),
             Aad::from(&additional_data),
             &mut out[EVENT_HEADER_LEN..],
             CHACHA20_POLY1305.tag_len(),
@@ -211,9 +238,7 @@ pub fn chacha20poly1305_decrypt_event(
         return Err((EVENT_HEADER_LEN as u32 - buf.len() as u32, ""));
     }
     //info!("decrypt ev with counter:{}", ctx.decrypt_nonce);
-    let mut sk: [u8; 10] = Default::default();
-    sk[0..2].copy_from_slice(&ctx.key.as_bytes()[0..2]);
-    sk[2..].copy_from_slice(&ctx.decrypt_nonce.to_le_bytes());
+    let sk = ctx.skip32_decrypt_key();
     let mut xbuf: [u8; 4] = Default::default();
     xbuf.copy_from_slice(&buf[0..4]);
     let e1 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
@@ -252,14 +277,14 @@ pub fn chacha20poly1305_decrypt_event(
     //     out.len()
     // );
     //let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
-    let xnonce: u128 = ctx.decrypt_nonce as u128;
+    //let xnonce: u128 = ctx.decrypt_nonce as u128;
     // let nonce = chacha20poly1305::Nonce::from_slice(&xnonce.to_le_bytes()[0..12]).unwrap();
 
     let additional_data: [u8; 0] = [];
     //match chacha20poly1305::open(&key, &nonce, &buf[0..dlen + 16], None, &mut out) {
     match open_in_place(
         ctx.chacha20poly1305OpeningKey.as_ref().unwrap(),
-        Nonce::try_assume_unique_for_key(&xnonce.to_le_bytes()[0..12]).unwrap(),
+        ctx.get_decrypt_nonce(),
         Aad::from(&additional_data),
         0,
         &mut buf[0..(dlen + CHACHA20_POLY1305.tag_len())],
@@ -289,7 +314,7 @@ mod tests {
     use std::str;
     #[test]
     fn test_crypto1() {
-        let ev = new_fin_event(100, false);
+        let ev = new_fin_event(100);
         let mut ctx = CryptoContext::new(
             METHOD_CHACHA20_POLY1305,
             "21321321321321312321321321212asdfasdasdas1",
@@ -308,7 +333,7 @@ mod tests {
     #[test]
     fn test_crypto2() {
         let s = "hello,world";
-        let ev = new_data_event(100, s.as_bytes(), false);
+        let ev = new_data_event(100, s.as_bytes());
         let mut ctx = CryptoContext::new(
             METHOD_CHACHA20_POLY1305,
             "21321321321321312321321321212asdfasdasdas1",
@@ -337,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_crypto3() {
-        let ev = new_fin_event(100, false);
+        let ev = new_fin_event(100);
         let mut ctx = CryptoContext::new(
             "none",
             "21321321321321312321321321212asdfasdasdas1",
@@ -356,7 +381,7 @@ mod tests {
     #[test]
     fn test_crypto4() {
         let s = "hello,world";
-        let ev = new_data_event(100, s.as_bytes(), false);
+        let ev = new_data_event(100, s.as_bytes());
         let mut ctx = CryptoContext::new(
             "none",
             "21321321321321312321321321212asdfasdasdas1",

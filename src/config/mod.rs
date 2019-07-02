@@ -11,6 +11,7 @@ pub struct ChannelConfig {
     pub urls: Vec<String>,
     pub ping_interval_sec: u32,
     pub conns_per_host: u32,
+    pub max_alive_mins: u32,
     pub proxy: String,
 }
 
@@ -58,6 +59,7 @@ pub fn add_channel_config(url: &str, proxy: &str) {
     let mut ch: ChannelConfig = Default::default();
     ch.urls.push(String::from(url));
     ch.conns_per_host = 1;
+    ch.max_alive_mins = 3;
     ch.name = String::from("default");
     ch.proxy = String::from(proxy);
     get_config().lock().unwrap().local.channels.push(ch);
