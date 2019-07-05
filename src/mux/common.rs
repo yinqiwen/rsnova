@@ -251,7 +251,8 @@ impl MuxSession for ChannelMuxSession {
         self.streams.len()
     }
     fn close(&mut self) {
-        self.event_trigger_send.close();
+        self.event_trigger_send.start_send(new_shutdown_event(0));
+        self.event_trigger_send.poll_complete();
     }
     fn ping(&mut self) {
         //info!("Send ping.");

@@ -237,9 +237,9 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
         if !self.closed {
             self.closed = true;
             self.session.close();
-            self.local_ev_send.close();
+            self.local_ev_recv.close();
             self.remote_ev_send.close();
-            self.task_send.close();
+            self.task_recv.close();
         }
     }
 
@@ -275,6 +275,10 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                         //     ev.header.flags(),
                         //     ev.body.len(),
                         // );
+                        if FLAG_SHUTDOWN == ev.header.flags() {
+                            self.close();
+                            return Err(Error::from(ErrorKind::ConnectionReset));
+                        }
                         if FLAG_FIN == ev.header.flags() {
                             self.session.close_stream(ev.header.stream_id, true);
                         }
