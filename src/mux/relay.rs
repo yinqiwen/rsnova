@@ -44,11 +44,11 @@ where
     B: AsyncWrite,
 {
     //let (remote_reader, remote_writer) = remote.split();
-    let mut remote_reader = TimeoutReader::new(remote_reader);
-    let mut local_reader = TimeoutReader::new(local_reader);
-    let timeout = Duration::from_secs(u64::from(timeout_secs));
-    remote_reader.set_timeout(Some(timeout));
-    local_reader.set_timeout(Some(timeout));
+    // let mut remote_reader = TimeoutReader::new(remote_reader);
+    // let mut local_reader = TimeoutReader::new(local_reader);
+    // let timeout = Duration::from_secs(u64::from(timeout_secs));
+    // remote_reader.set_timeout(Some(timeout));
+    // local_reader.set_timeout(Some(timeout));
 
     // let close_local = Arc::new(AtomicBool::new(true));
 
@@ -62,7 +62,7 @@ where
     // let should_close_on_local_eof = Arc::new(close_on_local_eof);
 
     preprocess.and_then(|_remote_writer| {
-        let copy_to_remote = buf_copy(local_reader, _remote_writer, Box::new([0; 33 * 1024]))
+        let copy_to_remote = buf_copy(local_reader, _remote_writer, Box::new([0; 32 * 1024]))
             .and_then(move |(n, _, server_writer)| {
                 //
                 //info!("###local read done!");
@@ -225,7 +225,7 @@ where
         let proto_str = String::from(proto);
         let addr_str = String::from(addr);
         let t = move |session: &mut dyn MuxSession| {
-            let mut remote = session.open_stream(proto_str.as_str(), addr_str.as_str());
+            let remote = session.open_stream(proto_str.as_str(), addr_str.as_str());
             let (remote_r, remote_w) = remote.split();
             let relay = proxy_stream(
                 relay_id,

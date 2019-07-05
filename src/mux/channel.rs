@@ -125,7 +125,7 @@ impl MuxSessionManager {
         info!("add session for {}", k);
         if let Some(s) = self.channel_states.get_mut(&k) {
             let n = s.conns.fetch_add(1, Ordering::SeqCst);
-            info!("session count {}", n);
+            info!("session count {}", n + 1);
             let data = SessionData {
                 channel: s.clone(),
                 born_time: Instant::now(),
