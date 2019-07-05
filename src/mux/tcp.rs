@@ -1,12 +1,13 @@
 use super::channel::ChannelState;
 use crate::common::http_proxy_connect;
 use crate::mux::mux::*;
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 
 use url::Url;
 
-pub fn init_local_tcp_channel(channel: &ChannelState) {
+pub fn init_local_tcp_channel(channel: Arc<ChannelState>) {
     let remote = ::common::utils::get_hostport_from_url(&channel.url).unwrap();
     let remote_addr = remote.parse().unwrap();
     let channel_str = String::from(&channel.channel);

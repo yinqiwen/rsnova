@@ -2,6 +2,8 @@ use crate::config::*;
 use crate::mux::mux::*;
 use crate::mux::tcp::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use std::time::{Duration, Instant};
@@ -17,19 +19,17 @@ lazy_static! {
     static ref SESSIONS_HOLDER: Mutex<MuxSessionManager> = Mutex::new(MuxSessionManager::new());
 }
 
-#[derive(Clone)]
 pub struct ChannelState {
     pub config: ChannelConfig,
     pub channel: String,
     pub url: Url,
-    pub conns: u32,
+    pub conns: AtomicU32,
     //conns_per_host: u32,
 }
 
 #[derive(Clone)]
 struct SessionData {
-    channel: String,
-    url: String,
+    channel: Arc<ChannelState>,
     born_time: Instant,
     max_alive_secs: u32,
     task_sender: mpsc::Sender<SessionTaskClosure>,
@@ -40,7 +40,7 @@ struct MuxSessionManager {
     retire_sessions: Vec<SessionData>,
     cursor: u32,
 
-    channel_states: HashMap<String, ChannelState>,
+    channel_states: HashMap<String, Arc<ChannelState>>,
 }
 
 fn channel_url_key(n: &str, u: &str) -> String {
@@ -73,10 +73,10 @@ impl MuxSessionManager {
 
     fn routine(&mut self) {
         for state in self.channel_states.values() {
-            if state.conns < state.config.conns_per_host {
-                let gap = state.config.conns_per_host - state.conns;
+            if state.conns.load(Ordering::SeqCst) < state.config.conns_per_host {
+                let gap = state.config.conns_per_host - state.conns.load(Ordering::SeqCst);
                 for _ in 0..gap {
-                    init_local_mux_connection(&state);
+                    init_local_mux_connection(state.clone());
                 }
             }
         }
@@ -86,7 +86,7 @@ impl MuxSessionManager {
                 if s.task_sender.poll_ready().is_err() {
                     true
                 } else {
-                    s.task_sender.start_send(Box::new(ping_session));
+                    let _ = s.task_sender.start_send(Box::new(ping_session));
                     if 0 == s.max_alive_secs {
                         return false;
                     }
@@ -94,6 +94,10 @@ impl MuxSessionManager {
                 }
             })
             .collect::<Vec<_>>();
+        for s in &retired {
+            s.channel.conns.fetch_sub(1, Ordering::SeqCst);
+        }
+
         self.retire_sessions.append(&mut retired);
 
         self.retire_sessions.drain_filter(|s| {
@@ -106,7 +110,7 @@ impl MuxSessionManager {
         });
     }
 
-    fn add_channel_url(&mut self, key: String, state: ChannelState) {
+    fn add_channel_url(&mut self, key: String, state: Arc<ChannelState>) {
         info!("add state for key:{}", key);
         self.channel_states.entry(key).or_insert(state);
     }
@@ -117,19 +121,17 @@ impl MuxSessionManager {
         url: &str,
         task_sender: &mpsc::Sender<SessionTaskClosure>,
     ) -> bool {
-        let mut data = SessionData {
-            channel: String::from(channel),
-            url: String::from(url),
-            born_time: Instant::now(),
-            max_alive_secs: 0,
-            task_sender: task_sender.clone(),
-        };
-        let k = channel_url_key(data.channel.as_str(), data.url.as_str());
+        let k = channel_url_key(channel, url);
         info!("add session for {}", k);
         if let Some(s) = self.channel_states.get_mut(&k) {
-            s.conns += 1;
-            data.max_alive_secs = s.config.max_alive_mins * 60;
-            info!("session count {}", s.conns);
+            let n = s.conns.fetch_add(1, Ordering::SeqCst);
+            info!("session count {}", n);
+            let data = SessionData {
+                channel: s.clone(),
+                born_time: Instant::now(),
+                max_alive_secs: s.config.max_alive_mins * 60,
+                task_sender: task_sender.clone(),
+            };
             self.all_sessions.push(data);
             true
         } else {
@@ -144,14 +146,11 @@ impl MuxSessionManager {
         let idx = c as usize % self.all_sessions.len();
         if let Some(data) = self.all_sessions.get_mut(idx) {
             if data.task_sender.poll_ready().is_err() {
-                let k = channel_url_key(data.channel.as_str(), data.url.as_str());
-                if let Some(s) = self.channel_states.get_mut(&k) {
-                    s.conns -= 1;
-                }
+                let _ = data.channel.conns.fetch_sub(1, Ordering::SeqCst);
                 self.all_sessions.remove(idx as usize);
                 return None;
             }
-            if ch.is_empty() || data.channel == ch {
+            if ch.is_empty() || data.channel.channel == ch {
                 return Some(data.task_sender.clone());
             }
         }
@@ -182,6 +181,8 @@ pub fn select_session() -> Option<mpsc::Sender<SessionTaskClosure>> {
         .unwrap()
         .select_session_by_channel("")
 }
+
+#[allow(dead_code)]
 pub fn select_session_by_channel(ch: &str) -> Option<mpsc::Sender<SessionTaskClosure>> {
     SESSIONS_HOLDER
         .lock()
@@ -200,7 +201,7 @@ pub fn add_session(
         .add_session(channel, url, task_sender)
 }
 
-fn init_local_mux_connection(channel: &ChannelState) {
+fn init_local_mux_connection(channel: Arc<ChannelState>) {
     match channel.url.scheme() {
         "tcp" => {
             init_local_tcp_channel(channel);
@@ -216,18 +217,22 @@ pub fn init_local_mux_channels(cs: &[ChannelConfig]) {
         for u in &c.urls {
             match Url::parse(u.as_str()) {
                 Ok(url) => {
-                    let state = ChannelState {
+                    let state = Arc::new(ChannelState {
                         config: c.clone(),
                         channel: String::from(c.name.as_str()),
                         url,
-                        conns: 0,
-                    };
-                    let init_state = state.clone();
+                        conns: AtomicU32::new(0),
+                    });
+                    //let v = Arc::new(state);
+                    //let init_state = state.clone();
                     let key = channel_url_key(c.name.as_str(), state.url.as_str());
-                    SESSIONS_HOLDER.lock().unwrap().add_channel_url(key, state);
+                    SESSIONS_HOLDER
+                        .lock()
+                        .unwrap()
+                        .add_channel_url(key, state.clone());
 
                     for _ in 0..c.conns_per_host {
-                        init_local_mux_connection(&init_state);
+                        init_local_mux_connection(state.clone());
                     }
                 }
                 Err(e) => {
