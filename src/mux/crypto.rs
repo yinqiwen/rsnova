@@ -215,15 +215,16 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
     out.put_u32_le(e1);
     out.put_u32_le(e2);
 
-    // info!(
-    //     "encrypt ev:{} with counter:{} and len:{} {}",
-    //     ev.header.flags(),
-    //     ctx.encrypt_nonce,
-    //     ev.body.len(),
-    //     ev.header.len(),
-    // );
-
     if !ev.body.is_empty() {
+        info!(
+            "encrypt ev: {} {} {} {} {} {}",
+            ev.header.stream_id,
+            ev.header.flags(),
+            ev.header.len(),
+            ev.body.len(),
+            ctx.encrypt_nonce,
+            crc32::checksum_ieee(&ev.body[..]),
+        );
         //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
         let additional_data: [u8; 0] = [];
         let dlen = EVENT_HEADER_LEN + CHACHA20_POLY1305.tag_len() + ev.body.len() as usize;

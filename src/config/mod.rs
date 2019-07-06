@@ -59,7 +59,7 @@ pub fn get_config() -> &'static Mutex<Config> {
 pub fn add_channel_config(url: &str, proxy: &str) {
     let mut ch: ChannelConfig = Default::default();
     ch.urls.push(String::from(url));
-    ch.conns_per_host = 5;
+    ch.conns_per_host = 1;
     ch.max_alive_mins = 15;
     ch.name = String::from("default");
     ch.proxy = String::from(proxy);
