@@ -223,7 +223,7 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
             ev.header.len(),
             ev.body.len(),
             ctx.encrypt_nonce,
-            crc32::checksum_ieee(&ev.body[..]),
+            out.len()),
         );
         //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
         let additional_data: [u8; 0] = [];
@@ -288,14 +288,14 @@ pub fn chacha20poly1305_decrypt_event(
     // unsafe {
     //     out.set_len(dlen);
     // }
-    // info!(
-    //     "decrypt event:{} {} {} {} {}",
-    //     header.stream_id,
-    //     header.flags(),
-    //     header.len(),
-    //     buf.len(),
-    //     ctx.decrypt_nonce,
-    // );
+    info!(
+        "decrypt event:{} {} {} {} {}",
+        header.stream_id,
+        header.flags(),
+        header.len(),
+        buf.len(),
+        ctx.decrypt_nonce,
+    );
     //let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
     //let xnonce: u128 = ctx.decrypt_nonce as u128;
     // let nonce = chacha20poly1305::Nonce::from_slice(&xnonce.to_le_bytes()[0..12]).unwrap();
