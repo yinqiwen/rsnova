@@ -7,6 +7,7 @@ use std::io::{Error, ErrorKind};
 
 use crate::mux::event::*;
 
+pub const METHOD_AES128_GCM: &str = "aes128gcm";
 pub const METHOD_CHACHA20_POLY1305: &str = "chacha20poly1305";
 pub const METHOD_NONE: &str = "none";
 
@@ -17,8 +18,8 @@ pub struct CryptoContext {
     pub encrypter: EncryptFunc,
     pub decrypter: DecryptFunc,
 
-    chacha20poly1305SealKey: Option<SealingKey>,
-    chacha20poly1305OpeningKey: Option<OpeningKey>,
+    sealing_key: Option<SealingKey>,
+    opening_key: Option<OpeningKey>,
 }
 
 type DecryptError = (u32, &'static str);
@@ -32,16 +33,17 @@ impl CryptoContext {
         while key.len() < 32 {
             key.push('F');
         }
+        let aes_key = key.clone();
         match method {
             METHOD_CHACHA20_POLY1305 => CryptoContext {
                 encrypt_nonce: nonce,
                 decrypt_nonce: nonce,
                 encrypter: chacha20poly1305_encrypt_event,
                 decrypter: chacha20poly1305_decrypt_event,
-                chacha20poly1305SealKey: Some(
+                sealing_key: Some(
                     SealingKey::new(&CHACHA20_POLY1305, &key.as_bytes()[0..32]).unwrap(),
                 ),
-                chacha20poly1305OpeningKey: Some(
+                opening_key: Some(
                     OpeningKey::new(&CHACHA20_POLY1305, &key.as_bytes()[0..32]).unwrap(),
                 ),
                 key,
@@ -52,8 +54,21 @@ impl CryptoContext {
                 decrypt_nonce: nonce,
                 encrypter: none_encrypt_event,
                 decrypter: none_decrypt_event,
-                chacha20poly1305SealKey: None,
-                chacha20poly1305OpeningKey: None,
+                sealing_key: None,
+                opening_key: None,
+            },
+            METHOD_AES128_GCM => CryptoContext {
+                key,
+                encrypt_nonce: nonce,
+                decrypt_nonce: nonce,
+                encrypter: aes128gcm_encrypt_event,
+                decrypter: aes128gcm_decrypt_event,
+                sealing_key: Some(
+                    SealingKey::new(&AES_128_GCM, &aes_key.as_bytes()[0..16]).unwrap(),
+                ),
+                opening_key: Some(
+                    OpeningKey::new(&AES_128_GCM, &aes_key.as_bytes()[0..16]).unwrap(),
+                ),
             },
             _ => panic!("not supported crypto method."),
         }
@@ -216,7 +231,7 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
             out.set_len(dlen);
         }
         match seal_in_place(
-            ctx.chacha20poly1305SealKey.as_ref().unwrap(),
+            ctx.sealing_key.as_ref().unwrap(),
             ctx.get_encrypt_nonce(),
             Aad::from(&additional_data),
             &mut out[EVENT_HEADER_LEN..],
@@ -285,7 +300,7 @@ pub fn chacha20poly1305_decrypt_event(
     let additional_data: [u8; 0] = [];
     //match chacha20poly1305::open(&key, &nonce, &buf[0..dlen + 16], None, &mut out) {
     match open_in_place(
-        ctx.chacha20poly1305OpeningKey.as_ref().unwrap(),
+        ctx.opening_key.as_ref().unwrap(),
         ctx.get_decrypt_nonce(),
         Aad::from(&additional_data),
         0,
@@ -307,6 +322,102 @@ pub fn chacha20poly1305_decrypt_event(
     }
     let out = Vec::from(&buf[0..dlen]);
     buf.advance(dlen + CHACHA20_POLY1305.tag_len());
+    Ok(Event { header, body: out })
+}
+
+pub fn aes128gcm_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut) {
+    let sk = ctx.skip32_encrypt_key();
+    let e1 = skip32::encode(&sk, ev.header.flag_len);
+    let e2 = skip32::encode(&sk, ev.header.stream_id);
+    out.reserve(EVENT_HEADER_LEN);
+    out.put_u32_le(e1);
+    out.put_u32_le(e2);
+
+    if !ev.body.is_empty() {
+        //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
+        let additional_data: [u8; 0] = [];
+        let dlen = EVENT_HEADER_LEN + AES_128_GCM.tag_len() + ev.body.len() as usize;
+        out.reserve(dlen);
+        out.put_slice(&ev.body[..]);
+        unsafe {
+            out.set_len(dlen);
+        }
+        match seal_in_place(
+            ctx.sealing_key.as_ref().unwrap(),
+            ctx.get_encrypt_nonce(),
+            Aad::from(&additional_data),
+            &mut out[EVENT_HEADER_LEN..],
+            AES_128_GCM.tag_len(),
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                error!("encrypt error:{} {}", e, out.len());
+            }
+        }
+    }
+}
+
+pub fn aes128gcm_decrypt_event(
+    ctx: &CryptoContext,
+    buf: &mut BytesMut,
+) -> Result<Event, DecryptError> {
+    if buf.len() < EVENT_HEADER_LEN {
+        return Err((EVENT_HEADER_LEN as u32 - buf.len() as u32, ""));
+    }
+    //info!("decrypt ev with counter:{}", ctx.decrypt_nonce);
+    let sk = ctx.skip32_decrypt_key();
+    let mut xbuf: [u8; 4] = Default::default();
+    xbuf.copy_from_slice(&buf[0..4]);
+    let e1 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
+    xbuf.copy_from_slice(&buf[4..8]);
+    let e2 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
+
+    let header = Header {
+        flag_len: e1,
+        stream_id: e2,
+    };
+    let flags = header.flags();
+    if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
+        buf.advance(EVENT_HEADER_LEN);
+        return Ok(Event {
+            header,
+            body: vec![],
+        });
+    }
+    if buf.len() - EVENT_HEADER_LEN < (header.len() as usize + AES_128_GCM.tag_len()) {
+        return Err((
+            header.len() + (EVENT_HEADER_LEN + AES_128_GCM.tag_len()) as u32 - buf.len() as u32,
+            "",
+        ));
+    }
+    buf.advance(EVENT_HEADER_LEN);
+    let dlen = header.len() as usize;
+
+    let additional_data: [u8; 0] = [];
+    //match chacha20poly1305::open(&key, &nonce, &buf[0..dlen + 16], None, &mut out) {
+    match open_in_place(
+        ctx.opening_key.as_ref().unwrap(),
+        ctx.get_decrypt_nonce(),
+        Aad::from(&additional_data),
+        0,
+        &mut buf[0..(dlen + AES_128_GCM.tag_len())],
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            error!(
+                "decrypt error:{} for event:{} {} {} {} {}",
+                e,
+                header.stream_id,
+                header.flags(),
+                header.len(),
+                buf.len(),
+                ctx.decrypt_nonce,
+            );
+            return Err((0, "Decrypt error"));
+        }
+    }
+    let out = Vec::from(&buf[0..dlen]);
+    buf.advance(dlen + AES_128_GCM.tag_len());
     Ok(Event { header, body: out })
 }
 
@@ -387,6 +498,36 @@ mod tests {
         let ev = new_data_event(100, s.as_bytes());
         let mut ctx = CryptoContext::new(
             "none",
+            "21321321321321312321321321212asdfasdasdas1",
+            21321312,
+        );
+        let mut buf = BytesMut::new();
+        ctx.encrypt(&ev, &mut buf);
+        println!(
+            "encoded buf len:{} {} {} {}",
+            buf.capacity(),
+            buf.len(),
+            ev.header.flag_len,
+            ev.header.stream_id
+        );
+
+        let r = ctx.decrypt(&mut buf).unwrap();
+        println!(
+            "decode event len:{} {}",
+            r.header.flag_len, r.header.stream_id
+        );
+        assert_eq!(r.header.stream_id, 100);
+        assert_eq!(r.header.flags(), FLAG_DATA);
+        assert_eq!(buf.len(), 0);
+        assert_eq!(str::from_utf8(&r.body[..]).unwrap(), s);
+    }
+
+    #[test]
+    fn test_crypto5() {
+        let s = "hello,world";
+        let ev = new_data_event(100, s.as_bytes());
+        let mut ctx = CryptoContext::new(
+            "aes128gcm",
             "21321321321321312321321321212asdfasdasdas1",
             21321312,
         );

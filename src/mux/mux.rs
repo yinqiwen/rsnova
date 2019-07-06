@@ -506,7 +506,7 @@ pub fn process_client_connection<T: AsyncRead + AsyncWrite>(
 ) -> impl Future<Item = (), Error = ()> {
     let key = String::from(get_config().lock().unwrap().cipher.key.as_str());
     let method = String::from(get_config().lock().unwrap().cipher.method.as_str());
-    let ctx = CryptoContext::new(METHOD_CHACHA20_POLY1305, key.as_str(), 0);
+    let ctx = CryptoContext::new(METHOD_AES128_GCM, key.as_str(), 0);
     let channel_str = String::from(channel);
     let url_str = String::from(url);
     client_auth_session(ctx, conn, key.as_str(), method.as_str())
