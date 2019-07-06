@@ -119,7 +119,22 @@ fn main() {
                 .short("d")
                 .long("debug")
                 .help("Enable debug mode")
-                .multiple(false)
+                .multiple(false),
+        )
+        .arg(
+            Arg::with_name("key")
+                .short("k")
+                .long("key")
+                .help("Default cipher key")
+                .default_value("a3ac5c834538c8ee421610ab78f2f4c2")
+                .multiple(false),
+        )
+        .arg(
+            Arg::with_name("method")
+                .short("m")
+                .long("method")
+                .help("Default cipher method")
+                .default_value("chacha20poly1305")
                 .multiple(false),
         )
         .get_matches();
@@ -141,13 +156,18 @@ fn main() {
             ));
         }
     }
-    //let mut loggers:Vec<Box<SharedLogger>;
-
     CombinedLogger::init(loggers).unwrap();
 
     let mut proxy = String::new();
     if let Some(v) = matches.value_of("proxy") {
         proxy = String::from(v);
+    }
+
+    if let Some(v) = matches.value_of("key") {
+        config::set_default_cipher_key(v);
+    }
+    if let Some(v) = matches.value_of("method") {
+        config::set_default_cipher_method(v);
     }
 
     // Create the runtime

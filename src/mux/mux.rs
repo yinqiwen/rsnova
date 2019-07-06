@@ -24,6 +24,8 @@ use tokio::codec::*;
 use tokio::prelude::*;
 
 use rand::Rng;
+use std::borrow::Cow;
+use url::Url;
 
 pub trait MuxStream: Sync + Send {
     fn split(&mut self) -> (Box<dyn AsyncRead + Send>, Box<dyn AsyncWrite + Send>);
@@ -527,7 +529,22 @@ pub fn process_client_connection<T: AsyncRead + AsyncWrite>(
         })
         .and_then(move |(_, conn, res)| {
             info!("Connected server with  method:{} rand:{}", method, res.rand);
-            let ctx = CryptoContext::new(method.as_str(), key.as_str(), res.rand);
+            let mut cipher_key = key;
+            let mut cipher_method = method;
+            if let Ok(u) = Url::parse(url_str.as_str()) {
+                for (k, v) in u.query_pairs() {
+                    match k {
+                        Cow::Borrowed("key") => {
+                            cipher_key = String::from(v);
+                        }
+                        Cow::Borrowed("method") => {
+                            cipher_method = String::from(v);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let ctx = CryptoContext::new(cipher_method.as_str(), cipher_key.as_str(), res.rand);
             let processor = MuxConnectionProcessor::new(ctx, conn, true);
             if add_session(channel_str.as_str(), url_str.as_str(), &processor.task_send) {
                 future::Either::A(processor.for_each(|_| Ok(())).map_err(|_| {}))

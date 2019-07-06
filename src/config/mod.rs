@@ -64,3 +64,11 @@ pub fn add_channel_config(url: &str, proxy: &str) {
     ch.proxy = String::from(proxy);
     get_config().lock().unwrap().local.channels.push(ch);
 }
+
+pub fn set_default_cipher_key(key: &str) {
+    get_config().lock().unwrap().cipher.key = String::from(key);
+}
+
+pub fn set_default_cipher_method(method: &str) {
+    get_config().lock().unwrap().cipher.method = String::from(method);
+}
