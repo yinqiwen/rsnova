@@ -227,17 +227,19 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
         );
         //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
         let additional_data: [u8; 0] = [];
-        let dlen = EVENT_HEADER_LEN + CHACHA20_POLY1305.tag_len() + ev.body.len() as usize;
+        let vlen = CHACHA20_POLY1305.tag_len() + ev.body.len() as usize;
+        let dlen = EVENT_HEADER_LEN + vlen;
+
         out.reserve(dlen);
-        out.put_slice(&ev.body[..]);
-        unsafe {
-            out.set_len(dlen);
-        }
+        out.put_slice(&vec![0; CHACHA20_POLY1305.tag_len()]);
+        let tlen = out.len();
+
+        let data = &mut out[(tlen - vlen)..tlen];
         match seal_in_place(
             ctx.sealing_key.as_ref().unwrap(),
             ctx.get_encrypt_nonce(),
             Aad::from(&additional_data),
-            &mut out[EVENT_HEADER_LEN..],
+            data,
             CHACHA20_POLY1305.tag_len(),
         ) {
             Ok(_) => {}
