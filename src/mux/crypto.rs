@@ -231,9 +231,9 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
         let dlen = EVENT_HEADER_LEN + vlen;
 
         out.reserve(dlen);
+        out.put_slice(&ev.body[..]);
         out.put_slice(&vec![0; CHACHA20_POLY1305.tag_len()]);
         let tlen = out.len();
-
         let data = &mut out[(tlen - vlen)..tlen];
         match seal_in_place(
             ctx.sealing_key.as_ref().unwrap(),
@@ -341,22 +341,23 @@ pub fn aes128gcm_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesM
     if !ev.body.is_empty() {
         //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
         let additional_data: [u8; 0] = [];
-        let dlen = EVENT_HEADER_LEN + AES_128_GCM.tag_len() + ev.body.len() as usize + 4;
+        let vlen = AES_128_GCM.tag_len() + ev.body.len() as usize + 4;
+        let dlen = EVENT_HEADER_LEN + vlen;
         out.reserve(dlen);
         out.put_slice(&ev.body[..]);
-        unsafe {
-            out.set_len(dlen);
-        }
+        out.put_slice(&vec![0; AES_128_GCM.tag_len()]);
+        let tlen = out.len();
+        let data = &mut out[(tlen - vlen)..(tlen - 4)];
         match seal_in_place(
             ctx.sealing_key.as_ref().unwrap(),
             ctx.get_encrypt_nonce(),
             Aad::from(&additional_data),
-            &mut out[EVENT_HEADER_LEN..(dlen - 4)],
+            data,
             AES_128_GCM.tag_len(),
         ) {
             Ok(_) => {
                 let cksm = crc32::checksum_ieee(&out[EVENT_HEADER_LEN..(dlen - 4)]).to_le_bytes();
-                out[(dlen - 4)..].copy_from_slice(&cksm);
+                out[(tlen - 4)..].copy_from_slice(&cksm);
             }
             Err(e) => {
                 error!("encrypt error:{} {}", e, out.len());
