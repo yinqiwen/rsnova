@@ -5,6 +5,8 @@ use tokio_io::io::read_exact;
 use ring::aead::*;
 use std::io::{Error, ErrorKind};
 
+use crc::{crc32, Hasher32};
+
 use crate::mux::event::*;
 
 pub const METHOD_AES128_GCM: &str = "aes128gcm";
@@ -336,7 +338,7 @@ pub fn aes128gcm_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesM
     if !ev.body.is_empty() {
         //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
         let additional_data: [u8; 0] = [];
-        let dlen = EVENT_HEADER_LEN + AES_128_GCM.tag_len() + ev.body.len() as usize;
+        let dlen = EVENT_HEADER_LEN + AES_128_GCM.tag_len() + ev.body.len() as usize + 4;
         out.reserve(dlen);
         out.put_slice(&ev.body[..]);
         unsafe {
@@ -346,10 +348,13 @@ pub fn aes128gcm_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesM
             ctx.sealing_key.as_ref().unwrap(),
             ctx.get_encrypt_nonce(),
             Aad::from(&additional_data),
-            &mut out[EVENT_HEADER_LEN..],
+            &mut out[EVENT_HEADER_LEN..(dlen - 4)],
             AES_128_GCM.tag_len(),
         ) {
-            Ok(_) => {}
+            Ok(_) => {
+                let cksm = crc32::checksum_ieee(&out[EVENT_HEADER_LEN..(dlen - 4)]).to_le_bytes();
+                out[(dlen - 4)..].copy_from_slice(&cksm);
+            }
             Err(e) => {
                 error!("encrypt error:{} {}", e, out.len());
             }
@@ -384,14 +389,22 @@ pub fn aes128gcm_decrypt_event(
             body: vec![],
         });
     }
-    if buf.len() - EVENT_HEADER_LEN < (header.len() as usize + AES_128_GCM.tag_len()) {
+    if buf.len() - EVENT_HEADER_LEN < (header.len() as usize + AES_128_GCM.tag_len() + 4) {
         return Err((
-            header.len() + (EVENT_HEADER_LEN + AES_128_GCM.tag_len()) as u32 - buf.len() as u32,
+            header.len() + (EVENT_HEADER_LEN + AES_128_GCM.tag_len() + 4) as u32 - buf.len() as u32,
             "",
         ));
     }
     buf.advance(EVENT_HEADER_LEN);
     let dlen = header.len() as usize;
+    let klen = dlen + AES_128_GCM.tag_len();
+    let crc32 = crc32::checksum_ieee(&buf[0..(klen)]);
+    let mut tmpv = [0u8; 4];
+    tmpv[..].copy_from_slice(&buf[klen..(klen + 4)]);
+    let recv_crc32 = u32::from_le_bytes(tmpv);
+    if crc32 != recv_crc32 {
+        error!("invalid crc32 {}:{}", crc32, recv_crc32);
+    }
 
     let additional_data: [u8; 0] = [];
     //match chacha20poly1305::open(&key, &nonce, &buf[0..dlen + 16], None, &mut out) {
@@ -400,7 +413,7 @@ pub fn aes128gcm_decrypt_event(
         ctx.get_decrypt_nonce(),
         Aad::from(&additional_data),
         0,
-        &mut buf[0..(dlen + AES_128_GCM.tag_len())],
+        &mut buf[0..klen],
     ) {
         Ok(_) => {}
         Err(e) => {
@@ -417,7 +430,7 @@ pub fn aes128gcm_decrypt_event(
         }
     }
     let out = Vec::from(&buf[0..dlen]);
-    buf.advance(dlen + AES_128_GCM.tag_len());
+    buf.advance(dlen + AES_128_GCM.tag_len() + 4);
     Ok(Event { header, body: out })
 }
 

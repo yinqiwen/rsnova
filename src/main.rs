@@ -8,6 +8,7 @@ extern crate bincode;
 extern crate byteorder;
 extern crate bytes;
 extern crate clap;
+extern crate crc;
 #[macro_use]
 extern crate futures;
 extern crate httparse;

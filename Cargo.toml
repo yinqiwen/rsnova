@@ -34,5 +34,6 @@ cfg-if = "0.1"
 twoway = "0.2"
 unicase = "2.4"
 trust-dns = "0.16"
-ring = "0.15.0-alpha3"
+ring = "0.14"
+crc = "^1.0.0"
 
