@@ -223,7 +223,7 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
             ev.header.len(),
             ev.body.len(),
             ctx.encrypt_nonce,
-            out.len()),
+            out.len(),
         );
         //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
         let additional_data: [u8; 0] = [];
