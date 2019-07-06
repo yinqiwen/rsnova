@@ -191,7 +191,7 @@ where
             success: true,
             err: String::new(),
             rand: rng.gen::<u64>(),
-            method: String::from(METHOD_CHACHA20_POLY1305),
+            method: String::from(METHOD_AES128_GCM),
         };
         let res = new_auth_event(0, &auth_res);
         let mut buf = BytesMut::new();
