@@ -23,6 +23,7 @@ pub struct CipherConfig {
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct LocalConfig {
+    pub transparent: bool,
     pub channels: Vec<ChannelConfig>,
 }
 
@@ -58,8 +59,8 @@ pub fn get_config() -> &'static Mutex<Config> {
 pub fn add_channel_config(url: &str, proxy: &str) {
     let mut ch: ChannelConfig = Default::default();
     ch.urls.push(String::from(url));
-    ch.conns_per_host = 3;
-    ch.max_alive_mins = 10;
+    ch.conns_per_host = 5;
+    ch.max_alive_mins = 15;
     ch.name = String::from("default");
     ch.proxy = String::from(proxy);
     get_config().lock().unwrap().local.channels.push(ch);
@@ -71,4 +72,8 @@ pub fn set_default_cipher_key(key: &str) {
 
 pub fn set_default_cipher_method(method: &str) {
     get_config().lock().unwrap().cipher.method = String::from(method);
+}
+
+pub fn set_local_transparent(v: bool) {
+    get_config().lock().unwrap().local.transparent = v;
 }

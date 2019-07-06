@@ -43,8 +43,7 @@ mod proxy;
 mod test;
 
 use clap::{App, Arg};
-use config::Config;
-use futures::future::{self, FutureResult};
+use futures::future::{self};
 use futures::prelude::*;
 use std::fs::File;
 
@@ -115,6 +114,12 @@ fn main() {
                 .multiple(false),
         )
         .arg(
+            Arg::with_name("transparent")
+                .long("transparent")
+                .help("Serving as transparent tcp proxy.")
+                .multiple(false),
+        )
+        .arg(
             Arg::with_name("debug")
                 .short("d")
                 .long("debug")
@@ -157,6 +162,8 @@ fn main() {
         }
     }
     CombinedLogger::init(loggers).unwrap();
+
+    config::set_local_transparent(matches.is_present("transparent"));
 
     let mut proxy = String::new();
     if let Some(v) = matches.value_of("proxy") {

@@ -4,9 +4,6 @@ use crate::proxy::local::*;
 
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use bytes::BufMut;
-use bytes::BytesMut;
-
 use futures::Future;
 
 pub fn valid_tls_version(buf: &[u8]) -> bool {
@@ -15,6 +12,7 @@ pub fn valid_tls_version(buf: &[u8]) -> bool {
     }
     //recordTypeHandshake
     if buf[0] != 0x16 {
+        //info!("###1 here {}", buf[0]);
         return false;
     }
     let tls_major_ver = buf[1];
@@ -22,6 +20,7 @@ pub fn valid_tls_version(buf: &[u8]) -> bool {
 
     if tls_major_ver < 3 {
         //no SNI before sslv3
+        //info!("###2 here {}", tls_major_ver);
         return false;
     }
     return true;
@@ -112,7 +111,7 @@ where
                             }
                             if name_type == 0 {
                                 let server_name = String::from_utf8_lossy(&data[0..name_len]);
-                                info!("####Peek SNI:{}", server_name);
+                                debug!("####Peek SNI:{}", server_name);
                                 return Ok((_reader, String::from(server_name)));
                             }
                             data = &data[name_len..];
@@ -140,7 +139,7 @@ where
         })
         .and_then(|(_reader, sni)| {
             let mut target = sni;
-            target.push_str("443");
+            target.push_str(":443");
             mux_relay_connection(_reader, writer, "tcp", target.as_str(), 30, None, true)
         })
 }

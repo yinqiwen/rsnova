@@ -261,6 +261,13 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
         match self.remote_ev_send.start_send(ev) {
             Ok(AsyncSink::Ready) => Ok(true),
             Ok(AsyncSink::NotReady(v)) => {
+                info!(
+                    "##Not ready for ev {} {} {} {}",
+                    v.header.stream_id,
+                    v.header.flags(),
+                    v.header.len(),
+                    v.body.len()
+                );
                 self.last_unsent_event = v;
                 Ok(false)
             }
@@ -518,9 +525,23 @@ pub fn process_client_connection<T: AsyncRead + AsyncWrite>(
     url: &str,
     conn: T,
 ) -> impl Future<Item = (), Error = ()> {
-    let key = String::from(get_config().lock().unwrap().cipher.key.as_str());
-    let method = String::from(get_config().lock().unwrap().cipher.method.as_str());
-    let ctx = CryptoContext::new(METHOD_AES128_GCM, key.as_str(), 0);
+    let mut key = String::from(get_config().lock().unwrap().cipher.key.as_str());
+    let mut method = String::from(get_config().lock().unwrap().cipher.method.as_str());
+    if let Ok(u) = Url::parse(url) {
+        for (k, v) in u.query_pairs() {
+            match k {
+                Cow::Borrowed("key") => {
+                    key = String::from(v);
+                }
+                Cow::Borrowed("method") => {
+                    method = String::from(v);
+                }
+                _ => {}
+            }
+        }
+    }
+    info!("Try to connect server with  method:{} key:{}", method, key);
+    let ctx = CryptoContext::new(method.as_str(), key.as_str(), 0);
     let channel_str = String::from(channel);
     let url_str = String::from(url);
     client_auth_session(ctx, conn, key.as_str(), method.as_str())
@@ -529,22 +550,7 @@ pub fn process_client_connection<T: AsyncRead + AsyncWrite>(
         })
         .and_then(move |(_, conn, res)| {
             info!("Connected server with  method:{} rand:{}", method, res.rand);
-            let mut cipher_key = key;
-            let mut cipher_method = method;
-            if let Ok(u) = Url::parse(url_str.as_str()) {
-                for (k, v) in u.query_pairs() {
-                    match k {
-                        Cow::Borrowed("key") => {
-                            cipher_key = String::from(v);
-                        }
-                        Cow::Borrowed("method") => {
-                            cipher_method = String::from(v);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            let ctx = CryptoContext::new(cipher_method.as_str(), cipher_key.as_str(), res.rand);
+            let ctx = CryptoContext::new(method.as_str(), key.as_str(), res.rand);
             let processor = MuxConnectionProcessor::new(ctx, conn, true);
             if add_session(channel_str.as_str(), url_str.as_str(), &processor.task_send) {
                 future::Either::A(processor.for_each(|_| Ok(())).map_err(|_| {}))
