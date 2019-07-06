@@ -8,7 +8,7 @@ pub struct ConnectRequest {
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct AuthRequest {
-    pub key: String,
+    //pub key: String,
     pub method: String,
 }
 

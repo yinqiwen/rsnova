@@ -97,7 +97,7 @@ impl Write for MuxStreamInner {
                 return Err(Error::from(ErrorKind::Other));
             }
             Ok(Async::NotReady) => {
-                error!("failed to acuire send window buf");
+                warn!("failed to acuire send window buf.");
                 return Err(Error::from(ErrorKind::WouldBlock));
             }
             _ => {}

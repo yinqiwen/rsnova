@@ -165,7 +165,7 @@ where
 {
     let sid = 0 as u32;
     let auth = AuthRequest {
-        key: String::from(key),
+        //key: String::from(key),
         method: String::from(method),
     };
     stream_event_rpc(ctx, conn, new_auth_event(sid, &auth)).and_then(|(_ctx, conn, auth_res)| {
@@ -187,17 +187,29 @@ where
 {
     read_encrypt_event(ctx, conn).and_then(|(mut _ctx, _conn, _ev)| {
         let mut rng = rand::thread_rng();
+        let auth_req: AuthRequest = match bincode::deserialize(&_ev.body[..]) {
+            Ok(m) => m,
+            Err(err) => {
+                error!(
+                    "Failed to parse ConnectRequest with error:{} while data len:{} {}",
+                    err,
+                    _ev.body.len(),
+                    _ev.header.len(),
+                );
+                return future::Either::A(future::err(Error::from(ErrorKind::PermissionDenied)));
+            }
+        };
         let auth_res = AuthResponse {
             success: true,
             err: String::new(),
             rand: rng.gen::<u64>(),
-            method: String::from(METHOD_AES128_GCM),
+            method: String::from(auth_req.method),
         };
         let res = new_auth_event(0, &auth_res);
         let mut buf = BytesMut::new();
         _ctx.encrypt(&res, &mut buf);
         let evbuf = buf.to_vec();
-        write_all(_conn, evbuf).map(move |(_conn, _)| (_ctx, _conn, auth_res))
+        future::Either::B(write_all(_conn, evbuf).map(move |(_conn, _)| (_ctx, _conn, auth_res)))
     })
 }
 
