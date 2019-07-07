@@ -26,6 +26,7 @@ extern crate tokio;
 extern crate tokio_io;
 extern crate tokio_io_timeout;
 extern crate tokio_sync;
+extern crate tokio_timer;
 extern crate tokio_udp;
 //extern crate trust_dns_server;
 extern crate twoway;
@@ -50,7 +51,7 @@ use std::fs::File;
 use tokio::runtime::Runtime;
 
 use simplelog::Config as LogConfig;
-use simplelog::{CombinedLogger, LevelFilter, TermLogger, WriteLogger};
+use simplelog::{CombinedLogger, LevelFilter, TermLogger, TerminalMode, WriteLogger};
 
 fn main() {
     let matches = App::new("rsnova")
@@ -152,7 +153,9 @@ fn main() {
     }
     for log in logs.iter() {
         if log.to_lowercase() == "console" {
-            loggers.push(TermLogger::new(log_level, LogConfig::default()).unwrap());
+            loggers.push(
+                TermLogger::new(log_level, LogConfig::default(), TerminalMode::Mixed).unwrap(),
+            );
         } else {
             loggers.push(WriteLogger::new(
                 log_level,

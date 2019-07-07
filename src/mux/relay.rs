@@ -3,17 +3,21 @@ use crate::common::future::FourEither;
 use crate::common::tcp_split;
 use crate::common::udp::*;
 use crate::common::utils::*;
+use crate::common::RelayTimeoutReader;
 
 use super::channel::select_session;
 use super::mux::MuxSession;
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
 use tokio_io::io::shutdown;
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
+use tokio_timer::Delay;
 
 use bytes::Bytes;
 
@@ -44,11 +48,15 @@ where
     A: AsyncRead,
     B: AsyncWrite,
 {
+    let delay = Arc::new(Mutex::new(Delay::new(Instant::now())));
+    //RelayTimeoutReader::new(reader: R, d: &Arc<Mutex<Delay>>)
     // let mut remote_reader = TimeoutReader::new(remote_reader);
     // let mut local_reader = TimeoutReader::new(local_reader);
-    // let timeout = Duration::from_secs(u64::from(timeout_secs));
-    // remote_reader.set_timeout(Some(timeout));
-    // local_reader.set_timeout(Some(timeout));
+    let mut remote_reader = RelayTimeoutReader::new(remote_reader, &delay);
+    let mut local_reader = RelayTimeoutReader::new(local_reader, &delay);
+    let timeout = Duration::from_secs(u64::from(timeout_secs));
+    remote_reader.set_timeout(Some(timeout));
+    local_reader.set_timeout(Some(timeout));
 
     // let close_local = Arc::new(AtomicBool::new(true));
 
