@@ -63,7 +63,7 @@ where
         let copy_to_remote = buf_copy(local_reader, _remote_writer, Box::new([0; 32 * 1024]))
             .and_then(move |(n, _, server_writer)| {
                 //
-                //info!("###local read done!");
+                info!("###local read done!");
                 // if !should_close_on_local_eof.as_ref() {
                 //     close_local2.store(false, Ordering::SeqCst);
                 // }
@@ -75,7 +75,7 @@ where
         let copy_to_local = buf_copy(remote_reader, local_writer, Box::new([0; 32 * 1024]))
             .and_then(move |(n, _, client_writer)| {
                 //
-                //info!("####remote read done");
+                info!("####remote read done");
                 // if !close_local.load(Ordering::SeqCst) {
                 //     future::Either::A(future::ok::<u64, std::io::Error>(n))
                 // } else {
