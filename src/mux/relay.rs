@@ -26,6 +26,7 @@ use tokio_io_timeout::TimeoutReader;
 
 lazy_static! {
     static ref GLOBAL_RELAY_ID_SEED: AtomicU32 = AtomicU32::new(0);
+    static ref GLOBAL_ALIVE_RELAY_COUNTER: AtomicU32 = AtomicU32::new(0);
 }
 
 fn proxy_stream<R, W, A, B>(
@@ -43,7 +44,6 @@ where
     A: AsyncRead,
     B: AsyncWrite,
 {
-    //let (remote_reader, remote_writer) = remote.split();
     // let mut remote_reader = TimeoutReader::new(remote_reader);
     // let mut local_reader = TimeoutReader::new(local_reader);
     // let timeout = Duration::from_secs(u64::from(timeout_secs));
@@ -58,8 +58,6 @@ where
         ),
         None => future::Either::B(future::ok::<_, std::io::Error>(remote_writer)),
     };
-    // let close_local2 = close_local.clone();
-    // let should_close_on_local_eof = Arc::new(close_on_local_eof);
 
     preprocess.and_then(|_remote_writer| {
         let copy_to_remote = buf_copy(local_reader, _remote_writer, Box::new([0; 32 * 1024]))
@@ -123,7 +121,11 @@ where
     let addr: SocketAddr = raddr[0];
     // let addr: SocketAddr = addr.parse().unwrap();
     debug!("{:?}", addr);
-
+    info!(
+        "[{}]Relay connection with alive counter:{}",
+        relay_id,
+        GLOBAL_ALIVE_RELAY_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
     if proto == "udp" {
         let lport = get_available_udp_port();
         let laddr = format!("0.0.0.0:{}", lport).parse().unwrap();
@@ -160,12 +162,14 @@ where
             )
             .map_err(move |e| {
                 error!("[{}]udp proxy error: {}", relay_id2, e);
+                GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
             })
             .map(move |(from_client, from_server)| {
                 info!(
                     "[{}]client at {} wrote {} bytes and received {} bytes",
                     relay_id1, addr, from_client, from_server
                 );
+                GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
             }),
         )
     } else {
@@ -197,8 +201,10 @@ where
                         "[{}]proxy to {} wrote {} bytes and received {} bytes",
                         relay_id, oaddr, from_client, from_server
                     );
+                    GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
                 })
                 .map_err(move |e| {
+                    GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
                     error!("[{}]proxy to {} error: {}", relay_id1, eaddr, e);
                     //local_writer.shutdown();
                 }),

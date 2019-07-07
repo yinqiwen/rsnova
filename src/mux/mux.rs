@@ -261,13 +261,13 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
         match self.remote_ev_send.start_send(ev) {
             Ok(AsyncSink::Ready) => Ok(true),
             Ok(AsyncSink::NotReady(v)) => {
-                info!(
-                    "##Not ready for ev {} {} {} {}",
-                    v.header.stream_id,
-                    v.header.flags(),
-                    v.header.len(),
-                    v.body.len()
-                );
+                // info!(
+                //     "##Not ready for ev {} {} {} {}",
+                //     v.header.stream_id,
+                //     v.header.flags(),
+                //     v.header.len(),
+                //     v.body.len()
+                // );
                 self.last_unsent_event = v;
                 Ok(false)
             }
