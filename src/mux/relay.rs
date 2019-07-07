@@ -7,10 +7,12 @@ use crate::common::{RelayTimeoutReader, SharedTimeoutState};
 
 use super::channel::select_session;
 use super::mux::MuxSession;
+use super::mux::SessionTaskClosure;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio_io::io::shutdown;
 use tokio_io::{AsyncRead, AsyncWrite};
 
@@ -220,6 +222,14 @@ where
     }
 }
 
+fn close_session_stream(mut s: mpsc::Sender<SessionTaskClosure>, sid: u32) {
+    let t = move |session: &mut dyn MuxSession| {
+        session.close_stream(sid, true);
+    };
+    s.start_send(Box::new(t));
+    s.poll_complete();
+}
+
 pub fn mux_relay_connection<R, W>(
     local_reader: R,
     local_writer: W,
@@ -243,8 +253,12 @@ where
         );
         let proto_str = String::from(proto);
         let addr_str = String::from(addr);
+
+        let s1 = session_task.clone();
+        let s2 = session_task.clone();
         let t = move |session: &mut dyn MuxSession| {
             let remote = session.open_stream(proto_str.as_str(), addr_str.as_str());
+            let sid = remote.id();
             let (remote_r, remote_w) = remote.split();
             let relay = proxy_stream(
                 relay_id,
@@ -255,13 +269,15 @@ where
                 timeout_secs,
                 initial_data,
             )
-            .map(|_| {
+            .map(move |_| {
                 //
                 GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                close_session_stream(s1, sid);
             })
-            .map_err(|e| {
+            .map_err(move |e| {
                 //error!("relay error: {}", e);
                 GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                close_session_stream(s2, sid);
             });
             tokio::spawn(relay);
         };

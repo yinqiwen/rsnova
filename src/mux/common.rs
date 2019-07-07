@@ -248,6 +248,11 @@ impl MuxSession for ChannelMuxSession {
     fn num_of_streams(&self) -> usize {
         self.streams.len()
     }
+
+    fn get_local_event_sender(&self) -> UnboundedSender<Event> {
+        self.event_trigger_send.clone()
+    }
+
     fn close(&mut self) {
         self.event_trigger_send.start_send(new_shutdown_event(0));
         self.event_trigger_send.poll_complete();

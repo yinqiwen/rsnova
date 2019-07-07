@@ -46,6 +46,7 @@ pub trait MuxSession: Send {
     fn close(&mut self);
     fn ping(&mut self);
     fn num_of_streams(&self) -> usize;
+    fn get_local_event_sender(&self) -> mpsc::UnboundedSender<Event>;
 
     fn open_stream(&mut self, proto: &str, addr: &str) -> &mut dyn MuxStream {
         let next_id = self.next_stream_id();
@@ -98,15 +99,24 @@ pub trait MuxSession: Send {
                 return;
             }
         };
+        let sid = s.id();
+        let mut esender = self.get_local_event_sender();
         let relay = relay_connection(
-            s.id(),
+            sid,
             local_reader,
             local_writer,
             connect_req.proto.as_str(),
             connect_req.addr.as_str(),
             get_config().lock().unwrap().read_timeout_sec as u32,
             None,
-        );
+        )
+        .then(move |_| {
+            //
+            //self.close_stream(sid, true);
+            esender.start_send(new_fin_event(sid));
+            esender.poll_complete();
+            Ok(())
+        });
 
         tokio::spawn(relay);
     }

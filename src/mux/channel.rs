@@ -58,6 +58,8 @@ fn try_close_session(session: &mut dyn MuxSession) {
     if session.num_of_streams() == 0 {
         info!("Close retired session.");
         session.close();
+    } else {
+        info!("{} streams left", session.num_of_streams());
     }
 }
 
