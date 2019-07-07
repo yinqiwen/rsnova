@@ -3,7 +3,7 @@ use crate::common::future::FourEither;
 use crate::common::tcp_split;
 use crate::common::udp::*;
 use crate::common::utils::*;
-use crate::common::RelayTimeoutReader;
+use crate::common::{RelayTimeoutReader, SharedTimeoutState};
 
 use super::channel::select_session;
 use super::mux::MuxSession;
@@ -48,15 +48,16 @@ where
     A: AsyncRead,
     B: AsyncWrite,
 {
-    let delay = Arc::new(Mutex::new(Delay::new(Instant::now())));
     //RelayTimeoutReader::new(reader: R, d: &Arc<Mutex<Delay>>)
     // let mut remote_reader = TimeoutReader::new(remote_reader);
     // let mut local_reader = TimeoutReader::new(local_reader);
-    let mut remote_reader = RelayTimeoutReader::new(remote_reader, &delay);
-    let mut local_reader = RelayTimeoutReader::new(local_reader, &delay);
     let timeout = Duration::from_secs(u64::from(timeout_secs));
-    remote_reader.set_timeout(Some(timeout));
-    local_reader.set_timeout(Some(timeout));
+    let ts = Arc::new(Mutex::new(SharedTimeoutState::new()));
+    ts.lock().unwrap().set_timeout(Some(timeout));
+    let remote_reader = RelayTimeoutReader::new(remote_reader, &ts);
+    let local_reader = RelayTimeoutReader::new(local_reader, &ts);
+    // remote_reader.set_timeout(Some(timeout));
+    // local_reader.set_timeout(Some(timeout));
 
     // let close_local = Arc::new(AtomicBool::new(true));
 

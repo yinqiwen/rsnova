@@ -8,30 +8,36 @@ use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_timer::Delay;
 
 #[derive(Debug)]
-struct TimeoutState {
+pub struct SharedTimeoutState {
     timeout: Option<Duration>,
-    cur: Arc<Mutex<Delay>>,
+    cur: Delay,
     active: bool,
 }
 
-impl TimeoutState {
+// #[derive(Debug)]
+// struct TimeoutState {
+//     timeout: Option<Duration>,
+//     cur: Arc<Mutex<Delay>>,
+//     active: bool,
+// }
+
+impl SharedTimeoutState {
     #[inline]
-    fn new(d: &Arc<Mutex<Delay>>) -> TimeoutState {
-        TimeoutState {
+    pub fn new() -> Self {
+        Self {
             timeout: None,
-            //cur: Delay::new(Instant::now()),
-            cur: d.clone(),
+            cur: Delay::new(Instant::now()),
             active: false,
         }
     }
 
     #[inline]
-    fn timeout(&self) -> Option<Duration> {
+    pub fn timeout(&self) -> Option<Duration> {
         self.timeout
     }
 
     #[inline]
-    fn set_timeout(&mut self, timeout: Option<Duration>) {
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
         self.reset();
     }
@@ -40,7 +46,7 @@ impl TimeoutState {
     fn reset(&mut self) {
         if self.active {
             self.active = false;
-            self.cur.lock().unwrap().reset(Instant::now());
+            self.cur.reset(Instant::now());
         }
     }
 
@@ -52,14 +58,12 @@ impl TimeoutState {
         };
 
         if !self.active {
-            self.cur.lock().unwrap().reset(Instant::now() + timeout);
+            self.cur.reset(Instant::now() + timeout);
             self.active = true;
         }
 
         if self
             .cur
-            .lock()
-            .unwrap()
             .poll()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
             .is_ready()
@@ -75,7 +79,7 @@ impl TimeoutState {
 #[derive(Debug)]
 pub struct RelayTimeoutReader<R> {
     reader: R,
-    state: TimeoutState,
+    state: Arc<Mutex<SharedTimeoutState>>,
 }
 
 impl<R> RelayTimeoutReader<R>
@@ -85,24 +89,19 @@ where
     /// Returns a new `TimeoutReader` wrapping the specified reader.
     ///
     /// There is initially no timeout.
-    pub fn new(reader: R, d: &Arc<Mutex<Delay>>) -> RelayTimeoutReader<R> {
+    pub fn new(reader: R, d: &Arc<Mutex<SharedTimeoutState>>) -> RelayTimeoutReader<R> {
         RelayTimeoutReader {
             reader,
-            state: TimeoutState::new(d),
+            state: d.clone(),
         }
-    }
-
-    /// Returns the current read timeout.
-    pub fn timeout(&self) -> Option<Duration> {
-        self.state.timeout()
     }
 
     /// Sets the read timeout.
     ///
     /// This will reset any pending timeout.
-    pub fn set_timeout(&mut self, timeout: Option<Duration>) {
-        self.state.set_timeout(timeout);
-    }
+    // pub fn set_timeout(&mut self, timeout: Option<Duration>) {
+    //     self.state.set_timeout(timeout);
+    // }
 
     /// Returns a shared reference to the inner reader.
     pub fn get_ref(&self) -> &R {
@@ -127,8 +126,10 @@ where
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let r = self.reader.read(buf);
         match r {
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => self.state.check()?,
-            _ => self.state.reset(),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.state.lock().unwrap().check()?
+            }
+            _ => self.state.lock().unwrap().reset(),
         }
         r
     }
@@ -145,8 +146,8 @@ where
     fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
         let r = self.reader.read_buf(buf);
         match r {
-            Ok(Async::NotReady) => self.state.check()?,
-            _ => self.state.reset(),
+            Ok(Async::NotReady) => self.state.lock().unwrap().check()?,
+            _ => self.state.lock().unwrap().reset(),
         }
         r
     }
