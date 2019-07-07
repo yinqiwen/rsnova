@@ -160,12 +160,11 @@ pub fn read_encrypt_event<T: AsyncRead>(
 }
 
 pub fn none_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut) {
-    out.reserve(EVENT_HEADER_LEN);
+    out.reserve(EVENT_HEADER_LEN + ev.body.len());
     out.put_u32_le(ev.header.flag_len);
     out.put_u32_le(ev.header.stream_id);
 
     if !ev.body.is_empty() {
-        out.reserve(ev.body.len());
         out.put_slice(&ev.body[..]);
     }
 }
@@ -216,16 +215,16 @@ pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut
     out.put_u32_le(e2);
 
     if !ev.body.is_empty() {
-        info!(
-            "encrypt ev: {} {} {} {} {} {}",
-            ev.header.stream_id,
-            ev.header.flags(),
-            ev.header.len(),
-            ev.body.len(),
-            ctx.encrypt_nonce,
-            out.len(),
-        );
-        //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
+        // info!(
+        //     "encrypt ev: {} {} {} {} {} {}",
+        //     ev.header.stream_id,
+        //     ev.header.flags(),
+        //     ev.header.len(),
+        //     ev.body.len(),
+        //     ctx.encrypt_nonce,
+        //     out.len(),
+        // );
+
         let additional_data: [u8; 0] = [];
         let vlen = CHACHA20_POLY1305.tag_len() + ev.body.len() as usize;
         let dlen = EVENT_HEADER_LEN + vlen;
@@ -286,18 +285,14 @@ pub fn chacha20poly1305_decrypt_event(
     }
     buf.advance(EVENT_HEADER_LEN);
     let dlen = header.len() as usize;
-    // let mut out = Vec::with_capacity(dlen);
-    // unsafe {
-    //     out.set_len(dlen);
-    // }
-    info!(
-        "decrypt event:{} {} {} {} {}",
-        header.stream_id,
-        header.flags(),
-        header.len(),
-        buf.len(),
-        ctx.decrypt_nonce,
-    );
+    // info!(
+    //     "decrypt event:{} {} {} {} {}",
+    //     header.stream_id,
+    //     header.flags(),
+    //     header.len(),
+    //     buf.len(),
+    //     ctx.decrypt_nonce,
+    // );
     //let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
     //let xnonce: u128 = ctx.decrypt_nonce as u128;
     // let nonce = chacha20poly1305::Nonce::from_slice(&xnonce.to_le_bytes()[0..12]).unwrap();
