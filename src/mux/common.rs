@@ -12,8 +12,8 @@ use tokio::io;
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use tokio::prelude::*;
-use tokio::sync::mpsc::channel;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use tokio_sync::semaphore::{Permit, Semaphore};
 
 struct MuxStreamState {
@@ -27,8 +27,8 @@ struct MuxStreamState {
 struct MuxStreamInner {
     state: Arc<MuxStreamState>,
     recv_buf: Cursor<Bytes>,
-    send_channel: Sender<Event>,
-    recv_channel: Receiver<Vec<u8>>,
+    send_channel: mpsc::UnboundedSender<Event>,
+    recv_channel: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
 impl MuxStreamInner {
@@ -138,12 +138,12 @@ impl Write for MuxStreamInner {
 
 pub struct ChannelMuxStream {
     state: Arc<MuxStreamState>,
-    send_channel: Sender<Event>,
-    recv_data_channel: Option<Sender<Vec<u8>>>,
+    send_channel: UnboundedSender<Event>,
+    recv_data_channel: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl ChannelMuxStream {
-    pub fn new(id: u32, s: &Sender<Event>) -> Self {
+    pub fn new(id: u32, s: &UnboundedSender<Event>) -> Self {
         let state = MuxStreamState {
             stream_id: id,
             send_buf_window: AtomicU32::new(512 * 1024),
@@ -161,7 +161,7 @@ impl ChannelMuxStream {
 
 impl MuxStream for ChannelMuxStream {
     fn split(&mut self) -> (Box<dyn AsyncRead + Send>, Box<dyn AsyncWrite + Send>) {
-        let (send, recv) = channel(1024);
+        let (send, recv) = mpsc::unbounded_channel();
         self.recv_data_channel = Some(send);
 
         let inner = MuxStreamInner {
@@ -176,8 +176,7 @@ impl MuxStream for ChannelMuxStream {
     fn close(&mut self) {
         if !self.state.closed.load(Ordering::SeqCst) {
             self.state.closed.store(true, Ordering::SeqCst);
-            self.send_channel
-                .start_send(new_fin_event(self.state.stream_id));
+            self.write_event(new_fin_event(self.state.stream_id));
             if let Some(s) = &mut self.recv_data_channel {
                 s.close();
             }
@@ -203,8 +202,8 @@ impl MuxStream for ChannelMuxStream {
             .fetch_add(data_len, Ordering::SeqCst);
         if recv_window_size >= 32 * 1024 {
             let ev = new_window_update_event(self.state.stream_id, recv_window_size);
-            self.send_channel.start_send(ev);
-            self.send_channel.poll_complete();
+            self.write_event(ev);
+            //self.send_channel.poll_complete();
             self.state
                 .recv_buf_window
                 .fetch_sub(recv_window_size, Ordering::SeqCst);
@@ -225,14 +224,14 @@ impl MuxStream for ChannelMuxStream {
 }
 
 pub struct ChannelMuxSession {
-    event_trigger_send: Sender<Event>,
+    event_trigger_send: UnboundedSender<Event>,
     streams: HashMap<u32, ChannelMuxStream>,
     next_stream_id: AtomicU32,
-    is_client: bool,
+    //is_client: bool,
 }
 
 impl ChannelMuxSession {
-    pub fn new(send: &Sender<Event>, is_client: bool) -> Self {
+    pub fn new(send: &UnboundedSender<Event>, is_client: bool) -> Self {
         let mut seed = AtomicU32::new(1);
         if !is_client {
             seed = AtomicU32::new(2);
@@ -241,7 +240,6 @@ impl ChannelMuxSession {
             event_trigger_send: send.clone(),
             streams: HashMap::new(),
             next_stream_id: seed,
-            is_client,
         }
     }
 }

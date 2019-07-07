@@ -218,8 +218,8 @@ where
 pub type SessionTaskClosure = Box<dyn FnOnce(&mut dyn MuxSession) + Send>;
 
 struct MuxConnectionProcessor<T: AsyncRead + AsyncWrite> {
-    local_ev_send: mpsc::Sender<Event>,
-    local_ev_recv: mpsc::Receiver<Event>,
+    local_ev_send: mpsc::UnboundedSender<Event>,
+    local_ev_recv: mpsc::UnboundedReceiver<Event>,
     remote_ev_send: stream::SplitSink<Framed<T, EventCodec>>,
     remote_ev_recv: stream::SplitStream<Framed<T, EventCodec>>,
     task_send: mpsc::Sender<SessionTaskClosure>,
@@ -232,7 +232,7 @@ struct MuxConnectionProcessor<T: AsyncRead + AsyncWrite> {
 impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
     fn new(ctx: CryptoContext, conn: T, is_client: bool) -> Self {
         let (atx, arx) = mpsc::channel(1024);
-        let (send, recv) = mpsc::channel(1024);
+        let (send, recv) = mpsc::unbounded_channel();
         let session = ChannelMuxSession::new(&send, is_client);
         let (writer, reader) = Framed::new(conn, EventCodec::new(ctx)).split();
         Self {
