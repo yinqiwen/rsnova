@@ -52,7 +52,7 @@ impl AsyncRead for MuxStreamInner {}
 impl Read for MuxStreamInner {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.state.closed.load(Ordering::SeqCst) {
-            return Err(Error::from(ErrorKind::ConnectionReset));
+            return Ok(0);
         }
         let n = self.recv_buf.read(buf)?;
         if n > 0 {
@@ -258,6 +258,11 @@ impl MuxSession for ChannelMuxSession {
     }
 
     fn new_stream(&mut self, sid: u32) -> &mut dyn MuxStream {
+        info!(
+            "new stream:{} with alive streams:{}",
+            sid,
+            self.streams.len()
+        );
         let s = ChannelMuxStream::new(sid, &self.event_trigger_send);
         self.streams.entry(sid).or_insert(s)
     }

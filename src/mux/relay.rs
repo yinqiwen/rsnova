@@ -179,7 +179,7 @@ where
             TcpStream::connect(&addr)
                 .and_then(move |socket| {
                     debug!(
-                        "Connected tcp socket {}  {}",
+                        "Connected tcp socket {} {}",
                         socket.local_addr().unwrap(),
                         socket.peer_addr().unwrap()
                     );
@@ -196,12 +196,11 @@ where
                     )
                 })
                 .map(move |(from_client, from_server)| {
-                    //self.close_stream(sid, true);
+                    GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
                     info!(
                         "[{}]proxy to {} wrote {} bytes and received {} bytes",
                         relay_id, oaddr, from_client, from_server
                     );
-                    GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
                 })
                 .map_err(move |e| {
                     GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
@@ -226,8 +225,13 @@ where
     W: AsyncWrite + Send + 'static,
 {
     let relay_id = GLOBAL_RELAY_ID_SEED.fetch_add(1, Ordering::SeqCst);
-    info!("[{}]Relay connection to {}", relay_id, addr);
     if let Some(mut session_task) = select_session() {
+        info!(
+            "[{}]Relay connection to {} with alive counter:{}",
+            relay_id,
+            addr,
+            GLOBAL_ALIVE_RELAY_COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
         let proto_str = String::from(proto);
         let addr_str = String::from(addr);
         let t = move |session: &mut dyn MuxSession| {
@@ -244,9 +248,11 @@ where
             )
             .map(|_| {
                 //
+                GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
             })
             .map_err(|e| {
-                //
+                //error!("relay error: {}", e);
+                GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
             });
             tokio::spawn(relay);
         };
