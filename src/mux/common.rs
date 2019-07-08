@@ -48,6 +48,15 @@ impl MuxStreamInner {
     }
 }
 
+impl Drop for MuxStreamInner {
+    fn drop(&mut self) {
+        info!("Dropping stream:{}", self.state.stream_id);
+        self.send_channel
+            .start_send(new_fin_event(self.state.stream_id));
+        self.send_channel.poll_complete();
+    }
+}
+
 impl AsyncRead for MuxStreamInner {}
 impl Read for MuxStreamInner {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -249,9 +258,9 @@ impl MuxSession for ChannelMuxSession {
         self.streams.len()
     }
 
-    fn get_local_event_sender(&self) -> UnboundedSender<Event> {
-        self.event_trigger_send.clone()
-    }
+    // fn get_local_event_sender(&self) -> UnboundedSender<Event> {
+    //     self.event_trigger_send.clone()
+    // }
 
     fn close(&mut self) {
         self.event_trigger_send.start_send(new_shutdown_event(0));

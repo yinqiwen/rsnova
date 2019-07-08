@@ -46,7 +46,7 @@ pub trait MuxSession: Send {
     fn close(&mut self);
     fn ping(&mut self);
     fn num_of_streams(&self) -> usize;
-    fn get_local_event_sender(&self) -> mpsc::UnboundedSender<Event>;
+    //fn get_local_event_sender(&self) -> mpsc::UnboundedSender<Event>;
 
     fn open_stream(&mut self, proto: &str, addr: &str) -> &mut dyn MuxStream {
         let next_id = self.next_stream_id();
@@ -100,7 +100,7 @@ pub trait MuxSession: Send {
             }
         };
         let sid = s.id();
-        let mut esender = self.get_local_event_sender();
+        //let mut esender = self.get_local_event_sender();
         let relay = relay_connection(
             sid,
             local_reader,
@@ -113,8 +113,8 @@ pub trait MuxSession: Send {
         .then(move |_| {
             //
             //self.close_stream(sid, true);
-            esender.start_send(new_fin_event(sid));
-            esender.poll_complete();
+            //esender.start_send(new_fin_event(sid));
+            //esender.poll_complete();
             Ok(())
         });
 

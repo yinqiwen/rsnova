@@ -254,8 +254,8 @@ where
         let proto_str = String::from(proto);
         let addr_str = String::from(addr);
 
-        let s1 = session_task.clone();
-        let s2 = session_task.clone();
+        // let s1 = session_task.clone();
+        // let s2 = session_task.clone();
         let t = move |session: &mut dyn MuxSession| {
             let remote = session.open_stream(proto_str.as_str(), addr_str.as_str());
             let sid = remote.id();
@@ -272,12 +272,12 @@ where
             .map(move |_| {
                 //
                 GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                close_session_stream(s1, sid);
+                //close_session_stream(s1, sid);
             })
             .map_err(move |e| {
                 //error!("relay error: {}", e);
                 GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                close_session_stream(s2, sid);
+                //close_session_stream(s2, sid);
             });
             tokio::spawn(relay);
         };
