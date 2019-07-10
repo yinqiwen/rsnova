@@ -220,6 +220,12 @@ impl MuxStream for ChannelMuxStream {
     }
     fn handle_window_update(&mut self, len: u32) {
         self.state.send_buf_window.fetch_add(len, Ordering::SeqCst);
+        info!(
+            "[{}Add window:{} while permits:{}",
+            self.id(),
+            len,
+            self.state.window_sem.available_permits()
+        );
         if self.state.window_sem.available_permits() == 0 {
             self.state.window_sem.add_permits(1);
         }
