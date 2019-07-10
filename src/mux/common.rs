@@ -134,7 +134,10 @@ impl Write for MuxStreamInner {
                 self.send_channel.poll_complete();
                 Ok(send_len)
             }
-            Ok(AsyncSink::NotReady(_)) => Err(Error::from(ErrorKind::WouldBlock)),
+            Ok(AsyncSink::NotReady(_)) => {
+                send_permit.release(&self.state.window_sem);
+                Err(Error::from(ErrorKind::WouldBlock))
+            }
             Err(_) => Err(Error::from(ErrorKind::Other)),
         }
     }
