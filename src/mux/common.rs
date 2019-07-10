@@ -236,6 +236,12 @@ impl MuxStream for ChannelMuxStream {
         );
         if self.state.window_sem.available_permits() == 0 {
             self.state.window_sem.add_permits(1);
+            info!(
+                "[{}]After add window:{} while permits:{}",
+                self.id(),
+                len,
+                self.state.window_sem.available_permits()
+            );
         }
     }
     fn id(&self) -> u32 {
