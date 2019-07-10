@@ -20,7 +20,7 @@ struct MuxStreamState {
     stream_id: u32,
     send_buf_window: AtomicU32,
     recv_buf_window: AtomicU32,
-    window_sem: Semaphore,
+    //window_sem: Semaphore,
     closed: AtomicBool,
 }
 
@@ -43,7 +43,7 @@ impl MuxStreamInner {
             self.send_channel
                 .start_send(new_fin_event(self.state.stream_id));
             self.send_channel.poll_complete();
-            self.state.window_sem.close();
+            //self.state.window_sem.close();
         }
     }
 }
@@ -97,25 +97,33 @@ impl Write for MuxStreamInner {
         if self.state.closed.load(Ordering::SeqCst) {
             return Err(Error::from(ErrorKind::ConnectionReset));
         }
-
-        let mut send_permit = Permit::new();
-        let acuire = send_permit.poll_acquire(&self.state.window_sem);
-        match acuire {
-            Err(e) => {
-                error!("failed to acuire:{}", e);
-                return Err(Error::from(ErrorKind::Other));
-            }
-            Ok(Async::NotReady) => {
-                warn!(
-                    "[{}]failed to acuire send window buf:{} {}",
-                    self.state.stream_id,
-                    self.state.send_buf_window.load(Ordering::SeqCst),
-                    self.state.window_sem.available_permits()
-                );
-                return Err(Error::from(ErrorKind::WouldBlock));
-            }
-            _ => {}
+        if self.state.send_buf_window.load(Ordering::SeqCst) == 0 {
+            warn!(
+                "[{}]failed to acuire send window buf:{}",
+                self.state.stream_id,
+                self.state.send_buf_window.load(Ordering::SeqCst),
+                //self.state.window_sem.available_permits()
+            );
+            return Err(Error::from(ErrorKind::WouldBlock));
         }
+        // let mut send_permit = Permit::new();
+        // let acuire = send_permit.poll_acquire(&self.state.window_sem);
+        // match acuire {
+        //     Err(e) => {
+        //         error!("failed to acuire:{}", e);
+        //         return Err(Error::from(ErrorKind::Other));
+        //     }
+        //     Ok(Async::NotReady) => {
+        //         warn!(
+        //             "[{}]failed to acuire send window buf:{}",
+        //             self.state.stream_id,
+        //             self.state.send_buf_window.load(Ordering::SeqCst),
+        //             //self.state.window_sem.available_permits()
+        //         );
+        //         return Err(Error::from(ErrorKind::WouldBlock));
+        //     }
+        //     _ => {}
+        // }
         let mut send_len = buf.len();
         if send_len > self.state.send_buf_window.load(Ordering::SeqCst) as usize {
             send_len = self.state.send_buf_window.load(Ordering::SeqCst) as usize;
@@ -133,14 +141,14 @@ impl Write for MuxStreamInner {
                 self.state
                     .send_buf_window
                     .fetch_sub(send_len as u32, Ordering::SeqCst);
-                if self.state.send_buf_window.load(Ordering::SeqCst) > 0 {
-                    send_permit.release(&self.state.window_sem);
-                }
+                // if self.state.send_buf_window.load(Ordering::SeqCst) > 0 {
+                //     send_permit.release(&self.state.window_sem);
+                // }
                 self.send_channel.poll_complete();
                 Ok(send_len)
             }
             Ok(AsyncSink::NotReady(_)) => {
-                send_permit.release(&self.state.window_sem);
+                //send_permit.release(&self.state.window_sem);
                 Err(Error::from(ErrorKind::WouldBlock))
             }
             Err(_) => Err(Error::from(ErrorKind::Other)),
@@ -165,7 +173,7 @@ impl ChannelMuxStream {
             stream_id: id,
             send_buf_window: AtomicU32::new(512 * 1024),
             recv_buf_window: AtomicU32::new(0),
-            window_sem: Semaphore::new(1),
+            //window_sem: Semaphore::new(1),
             closed: AtomicBool::new(false),
         };
         Self {
@@ -228,21 +236,16 @@ impl MuxStream for ChannelMuxStream {
     }
     fn handle_window_update(&mut self, len: u32) {
         self.state.send_buf_window.fetch_add(len, Ordering::SeqCst);
-        info!(
-            "[{}]Add window:{} while permits:{}",
-            self.id(),
-            len,
-            self.state.window_sem.available_permits()
-        );
-        if self.state.window_sem.available_permits() == 0 {
-            self.state.window_sem.add_permits(1);
-            info!(
-                "[{}]After add window:{} while permits:{}",
-                self.id(),
-                len,
-                self.state.window_sem.available_permits()
-            );
-        }
+        info!("[{}]Add window:{} ", self.id(), len);
+        // if self.state.window_sem.available_permits() == 0 {
+        //     self.state.window_sem.add_permits(1);
+        //     info!(
+        //         "[{}]After add window:{} while permits:{}",
+        //         self.id(),
+        //         len,
+        //         self.state.window_sem.available_permits()
+        //     );
+        // }
     }
     fn id(&self) -> u32 {
         self.state.stream_id
