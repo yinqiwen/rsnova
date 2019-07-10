@@ -107,9 +107,10 @@ impl Write for MuxStreamInner {
             }
             Ok(Async::NotReady) => {
                 warn!(
-                    "[{}]failed to acuire send window buf:{}",
+                    "[{}]failed to acuire send window buf:{} {}",
                     self.state.stream_id,
-                    self.state.send_buf_window.load(Ordering::SeqCst)
+                    self.state.send_buf_window.load(Ordering::SeqCst),
+                    self.state.window_sem.available_permits()
                 );
                 return Err(Error::from(ErrorKind::WouldBlock));
             }
