@@ -106,7 +106,11 @@ impl Write for MuxStreamInner {
                 return Err(Error::from(ErrorKind::Other));
             }
             Ok(Async::NotReady) => {
-                warn!("failed to acuire send window buf.");
+                warn!(
+                    "[{}]failed to acuire send window buf:{}",
+                    self.state.stream_id,
+                    self.state.send_buf_window.load(Ordering::SeqCst)
+                );
                 return Err(Error::from(ErrorKind::WouldBlock));
             }
             _ => {}
@@ -224,7 +228,7 @@ impl MuxStream for ChannelMuxStream {
     fn handle_window_update(&mut self, len: u32) {
         self.state.send_buf_window.fetch_add(len, Ordering::SeqCst);
         info!(
-            "[{}Add window:{} while permits:{}",
+            "[{}]Add window:{} while permits:{}",
             self.id(),
             len,
             self.state.window_sem.available_permits()
