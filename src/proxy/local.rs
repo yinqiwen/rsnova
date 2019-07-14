@@ -82,10 +82,13 @@ fn handle_local_connection(socket: TcpStream) -> impl Future<Item = (), Error = 
                     }
                 };
             }
-            warn!("unknnow tcp traffic");
+            warn!(
+                "unknnow tcp traffic to {:?} with first byte:{}",
+                origin_dst, _data[0]
+            );
             if let Some(dst) = origin_dst {
                 let s = format!("{}:{}", dst.ip().to_string(), dst.port());
-                warn!("unknown tcp traffict to {}", s);
+                //warn!("unknown tcp traffict to {}", s);
                 let relay =
                     mux_relay_connection(_reader, local_writer, "tcp", s.as_str(), 30, None, true);
                 tokio::spawn(relay);

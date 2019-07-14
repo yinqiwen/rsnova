@@ -32,7 +32,7 @@ use url::Url;
 
 pub trait MuxStream: Sync + Send {
     fn split(&mut self) -> (Box<dyn AsyncRead + Send>, Box<dyn AsyncWrite + Send>);
-    fn close(&mut self);
+    fn close(&mut self, initial: bool);
     fn handle_recv_data(&mut self, data: Vec<u8>);
     fn handle_window_update(&mut self, len: u32);
     fn write_event(&mut self, ev: Event);
@@ -336,6 +336,7 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                             return Err(Error::from(ErrorKind::ConnectionReset));
                         }
                         if FLAG_FIN == ev.header.flags() {
+                            info!("Close stream:{}", ev.header.stream_id);
                             self.session.close_stream(ev.header.stream_id, true);
                         }
                         if let Err(e) = self.try_send_event(ev) {

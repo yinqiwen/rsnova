@@ -202,10 +202,12 @@ impl MuxStream for ChannelMuxStream {
         let (r, w) = inner.split();
         (Box::new(r), Box::new(w))
     }
-    fn close(&mut self) {
+    fn close(&mut self, initial: bool) {
         if !self.state.closed.load(Ordering::SeqCst) {
             self.state.closed.store(true, Ordering::SeqCst);
-            self.write_event(new_fin_event(self.state.stream_id));
+            if initial {
+                self.write_event(new_fin_event(self.state.stream_id));
+            }
             if let Some(s) = &mut self.recv_data_channel {
                 s.close();
             }
@@ -318,13 +320,11 @@ impl MuxSession for ChannelMuxSession {
     }
     fn close_stream(&mut self, sid: u32, initial: bool) {
         let s = self.streams.remove(&sid);
-        if initial {
-            match s {
-                Some(mut stream) => {
-                    stream.close();
-                }
-                None => {}
+        match s {
+            Some(mut stream) => {
+                stream.close(initial);
             }
+            None => {}
         }
     }
 }
