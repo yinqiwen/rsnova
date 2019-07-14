@@ -89,7 +89,7 @@ impl MuxSessionManager {
                 if s.task_sender.poll_ready().is_err() {
                     true
                 } else {
-                    //let _ = s.task_sender.start_send(Box::new(ping_session));
+                    let _ = s.task_sender.start_send(Box::new(ping_session));
                     if 0 == s.max_alive_secs {
                         return false;
                     }
@@ -147,8 +147,10 @@ impl MuxSessionManager {
         let c = self.cursor + 1;
         self.cursor = c;
         let idx = c as usize % self.all_sessions.len();
+        //info!("all session:{}", self.all_sessions.len());
         if let Some(data) = self.all_sessions.get_mut(idx) {
             if data.task_sender.poll_ready().is_err() {
+                //error!(" session error");
                 let _ = data.channel.conns.fetch_sub(1, Ordering::SeqCst);
                 self.all_sessions.remove(idx as usize);
                 return None;
