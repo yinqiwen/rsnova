@@ -131,6 +131,16 @@ impl Write for MuxStreamInner {
         if send_len > blen {
             send_len = blen;
         }
+        if 0 == send_len {
+            warn!(
+                "[{}]zero send window buf:{} {}",
+                self.state.stream_id,
+                self.state.send_buf_window.load(Ordering::SeqCst),
+                self.state.window_sem.available_permits()
+            );
+            self.window_permit.forget();
+            return Err(Error::from(ErrorKind::WouldBlock));
+        }
         let ev = new_data_event(self.state.stream_id, &buf[0..send_len]);
         // info!(
         //     "[{}]new data ev with len:{} {}",
