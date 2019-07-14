@@ -1,5 +1,5 @@
 use crate::common::{other_error, peek_exact2, PeekableReader};
-use crate::mux::relay::mux_relay_connection;
+use crate::mux::mux_relay_connection;
 use crate::proxy::local::*;
 
 use tokio_io::{AsyncRead, AsyncWrite};

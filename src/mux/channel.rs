@@ -1,6 +1,7 @@
+use super::multiplex::*;
+use super::tcp::*;
 use crate::config::*;
-use crate::mux::mux::*;
-use crate::mux::tcp::*;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -88,7 +89,7 @@ impl MuxSessionManager {
                 if s.task_sender.poll_ready().is_err() {
                     true
                 } else {
-                    let _ = s.task_sender.start_send(Box::new(ping_session));
+                    //let _ = s.task_sender.start_send(Box::new(ping_session));
                     if 0 == s.max_alive_secs {
                         return false;
                     }

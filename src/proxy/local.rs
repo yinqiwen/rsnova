@@ -2,9 +2,9 @@ use super::http::handle_http_connection;
 use super::socks5::handle_socks5_connection;
 use super::tls::handle_tls_connection;
 use super::tls::valid_tls_version;
-use crate::common::io::*;
-use crate::common::tcp_split;
+use crate::common::{peek_exact, tcp_split};
 use crate::config::*;
+use crate::mux::mux_relay_connection;
 use crate::proxy::misc::*;
 
 use std::net::SocketAddr;
@@ -82,7 +82,19 @@ fn handle_local_connection(socket: TcpStream) -> impl Future<Item = (), Error = 
                     }
                 };
             }
-            future::err(other("unsupported traffic"))
+            warn!("unknnow tcp traffic");
+            if let Some(dst) = origin_dst {
+                let s = format!("{}:{}", dst.ip().to_string(), dst.port());
+                warn!("unknown tcp traffict to {}", s);
+                let relay =
+                    mux_relay_connection(_reader, local_writer, "tcp", s.as_str(), 30, None, true);
+                tokio::spawn(relay);
+                return future::ok(());
+            } else {
+                future::err(other("unsupported traffic"))
+            }
+
+            //future::err(other("unsupported traffic"))
         })
 }
 

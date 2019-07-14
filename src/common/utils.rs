@@ -60,8 +60,8 @@ pub fn get_available_udp_port() -> u16 {
     }
 }
 
-pub fn http_proxy_connect(
-    proxy: &str,
+fn http_proxy_connect(
+    proxy: &Url,
     remote: &str,
 ) -> impl Future<Item = TcpStream, Error = std_io::Error> {
     let connect_str = format!(
@@ -92,4 +92,39 @@ pub fn http_proxy_connect(
                 }
             })
     }))
+}
+
+pub fn proxy_connect(
+    proxy: &str,
+    remote: &str,
+) -> impl Future<Item = TcpStream, Error = std_io::Error> {
+    let mut pstr = String::from(proxy);
+    if pstr.find("://").is_none() {
+        pstr = String::from("http://");
+        pstr.push_str(proxy);
+    }
+    match Url::parse(pstr.as_str()) {
+        Ok(u) => {
+            //
+            match u.scheme() {
+                "http" | "" => {
+                    //
+                    Either::A(http_proxy_connect(&u, remote))
+                }
+                _ => {
+                    error!("unsupported url:{} with scheme:{}", proxy, u.scheme());
+                    Either::B(futures::future::err(std_io::Error::from(
+                        ErrorKind::PermissionDenied,
+                    )))
+                }
+            }
+        }
+        Err(e) => {
+            error!("invalid url:{} with reason:{}", proxy, e);
+            Either::B(futures::future::err(std_io::Error::from(
+                ErrorKind::ConnectionRefused,
+            )))
+            //futures::future::err(std_io::Error::from(ErrorKind::ConnectionRefused))
+        }
+    }
 }

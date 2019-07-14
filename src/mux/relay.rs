@@ -1,13 +1,11 @@
-use crate::common::buf_copy;
-use crate::common::future::FourEither;
 use crate::common::tcp_split;
-use crate::common::udp::*;
-use crate::common::utils::*;
+use crate::common::FourEither;
+use crate::common::{buf_copy, get_available_udp_port, UdpConnection};
 use crate::common::{RelayTimeoutReader, SharedTimeoutState};
 
 use super::channel::select_session;
-use super::mux::MuxSession;
-use super::mux::SessionTaskClosure;
+use super::multiplex::MuxSession;
+use super::multiplex::SessionTaskClosure;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -55,7 +53,9 @@ where
     // let mut local_reader = TimeoutReader::new(local_reader);
     let timeout = Duration::from_secs(u64::from(timeout_secs));
     let ts = Arc::new(Mutex::new(SharedTimeoutState::new()));
-    ts.lock().unwrap().set_timeout(Some(timeout));
+    if timeout_secs > 0 {
+        ts.lock().unwrap().set_timeout(Some(timeout));
+    }
     let remote_reader = RelayTimeoutReader::new(remote_reader, &ts);
     let local_reader = RelayTimeoutReader::new(local_reader, &ts);
     // remote_reader.set_timeout(Some(timeout));
@@ -74,7 +74,7 @@ where
         let copy_to_remote = buf_copy(local_reader, _remote_writer, Box::new([0; 32 * 1024]))
             .and_then(move |(n, _, server_writer)| {
                 //
-                info!("###local read done!");
+                //info!("###local read done!");
                 // if !should_close_on_local_eof.as_ref() {
                 //     close_local2.store(false, Ordering::SeqCst);
                 // }
@@ -86,7 +86,7 @@ where
         let copy_to_local = buf_copy(remote_reader, local_writer, Box::new([0; 32 * 1024]))
             .and_then(move |(n, _, client_writer)| {
                 //
-                info!("####remote read done");
+                //info!("####remote read done");
                 // if !close_local.load(Ordering::SeqCst) {
                 //     future::Either::A(future::ok::<u64, std::io::Error>(n))
                 // } else {
@@ -202,7 +202,7 @@ where
                         local_writer,
                         conn_r,
                         conn_w,
-                        timeout_secs,
+                        0,
                         initial_data,
                     )
                 })

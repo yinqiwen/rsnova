@@ -1,7 +1,5 @@
-use crate::common::io::*;
-use crate::common::utils::*;
-use crate::common::HttpProxyReader;
-use crate::mux::relay::mux_relay_connection;
+use crate::common::{get_hostport_from_url, read_until_separator, HttpProxyReader};
+use crate::mux::mux_relay_connection;
 use crate::proxy::local::*;
 
 use httparse::Status;

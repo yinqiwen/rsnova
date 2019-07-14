@@ -212,7 +212,7 @@ fn main() {
             for l in &listens {
                 let laddr = String::from(*l);
                 rt.spawn(future::lazy(move || {
-                    mux::channel::init_remote_mux_server(&laddr);
+                    mux::init_remote_mux_server(&laddr);
                     Ok(())
                 }));
             }
@@ -230,9 +230,7 @@ fn main() {
                 config::add_channel_config(*s, proxy.as_str());
             }
             rt.spawn(future::lazy(|| {
-                mux::channel::init_local_mux_channels(
-                    &config::get_config().lock().unwrap().local.channels,
-                );
+                mux::init_local_mux_channels(&config::get_config().lock().unwrap().local.channels);
                 Ok(())
             }));
         }

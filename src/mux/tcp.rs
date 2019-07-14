@@ -1,6 +1,6 @@
 use super::channel::ChannelState;
-use crate::common::http_proxy_connect;
-use crate::mux::mux::*;
+use super::multiplex::*;
+use crate::common::proxy_connect;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
@@ -8,7 +8,7 @@ use tokio::prelude::*;
 use url::Url;
 
 pub fn init_local_tcp_channel(channel: Arc<ChannelState>) {
-    let remote = ::common::utils::get_hostport_from_url(&channel.url).unwrap();
+    let remote = ::common::get_hostport_from_url(&channel.url).unwrap();
     let remote_addr = remote.parse().unwrap();
     let channel_str = String::from(&channel.channel);
     let url_str = String::from(channel.url.as_str());
@@ -27,7 +27,7 @@ pub fn init_local_tcp_channel(channel: Arc<ChannelState>) {
             .map_err(|e| error!("tcp connect error:{}", e));
         tokio::spawn(f);
     } else {
-        let f = http_proxy_connect(proxy_str.as_str(), remote.as_str())
+        let f = proxy_connect(proxy_str.as_str(), remote.as_str())
             .and_then(move |socket| {
                 process_client_connection(channel_str.as_str(), url_str.as_str(), socket).then(
                     |_| {
@@ -42,8 +42,8 @@ pub fn init_local_tcp_channel(channel: Arc<ChannelState>) {
 }
 
 pub fn init_remote_tcp_channel(url: &Url) {
-    let remote = ::common::utils::get_hostport_from_url(url).unwrap();
-    let remote_addr = ::common::utils::get_listen_addr(remote.as_str());
+    let remote = ::common::get_hostport_from_url(url).unwrap();
+    let remote_addr = ::common::get_listen_addr(remote.as_str());
     if let Err(e) = remote_addr {
         error!("invalid listen addr:{} with error:{}", remote, e);
         return;

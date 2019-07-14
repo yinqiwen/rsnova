@@ -1,7 +1,6 @@
-use crate::common::future::FourEither;
-use crate::common::{other_error, PeekableReader};
-use crate::proxy::local::*;
-use crate::mux::relay::mux_relay_connection;
+use crate::common::{PeekableReader,FourEither};
+use crate::mux::mux_relay_connection;
+use super::local::*;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

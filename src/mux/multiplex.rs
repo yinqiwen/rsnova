@@ -8,6 +8,9 @@ use crate::mux::event::*;
 use crate::mux::message::*;
 use std::io::{Error, ErrorKind};
 
+use std::time::{Duration, Instant};
+
+use tokio::timer::Interval;
 use tokio_io::io::shutdown;
 use tokio_io::io::write_all;
 use tokio_io::{AsyncRead, AsyncWrite};
@@ -138,6 +141,10 @@ pub trait MuxSession: Send {
                 //self.handle_window_update(ev);
                 //info!("Recv ping.");
                 //self.ping();
+                Some(new_pong_event(ev.header.stream_id))
+            }
+            FLAG_PONG => {
+                //
                 None
             }
             FLAG_WIN_UPDATE => {
@@ -237,6 +244,8 @@ struct MuxConnectionProcessor<T: AsyncRead + AsyncWrite> {
     session: ChannelMuxSession,
     last_unsent_event: Event,
     closed: bool,
+    last_recv_time: Instant,
+    routine_interval: Interval,
 }
 
 impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
@@ -255,8 +264,24 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
             session,
             last_unsent_event: new_empty_event(),
             closed: false,
+            last_recv_time: Instant::now(),
+            routine_interval: Interval::new_interval(Duration::from_secs(10)),
         }
     }
+
+    fn routine(&mut self) -> bool {
+        let v1 = self.last_recv_time.elapsed();
+        let timeout_secs = 60;
+        if v1.as_secs() > timeout_secs {
+            error!(
+                "Connection have not recv any data {} secs ago.",
+                v1.as_secs()
+            );
+            return false;
+        }
+        self.try_send_event(new_ping_event(0)).is_ok()
+    }
+
     fn close(&mut self) {
         if !self.closed {
             self.closed = true;
@@ -379,7 +404,10 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                     //     ev.header.flags(),
                     //     ev.body.len(),
                     // );
-                    self.session.handle_mux_event(ev);
+                    self.last_recv_time = Instant::now();
+                    if let Some(eev) = self.session.handle_mux_event(ev) {
+                        self.try_send_event(eev)?;
+                    }
                     not_ready = false;
                 }
             },
@@ -463,6 +491,19 @@ impl<T: AsyncRead + AsyncWrite> Stream for MuxConnectionProcessor<T> {
         if self.closed {
             return Err(Error::from(ErrorKind::ConnectionReset));
         }
+
+        match self.routine_interval.poll() {
+            Ok(Async::Ready(Some(_))) => {
+                if !self.routine() {
+                    self.close();
+                    return Err(Error::from(ErrorKind::ConnectionReset));
+                }
+            }
+            _ => {
+                //
+            }
+        }
+
         let mut all_not_ready = true;
         match self.poll_local_event() {
             Err(e) => {

@@ -1,5 +1,6 @@
-use crate::mux::event::*;
-use crate::mux::mux::*;
+use super::event::*;
+use super::multiplex::*;
+
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -115,12 +116,12 @@ impl Write for MuxStreamInner {
                 return Err(Error::from(ErrorKind::Other));
             }
             Ok(Async::NotReady) => {
-                warn!(
-                    "[{}]failed to acuire send window buf:{} {}",
-                    self.state.stream_id,
-                    self.state.send_buf_window.load(Ordering::SeqCst),
-                    self.state.window_sem.available_permits()
-                );
+                // warn!(
+                //     "[{}]failed to acuire send window buf:{} {}",
+                //     self.state.stream_id,
+                //     self.state.send_buf_window.load(Ordering::SeqCst),
+                //     self.state.window_sem.available_permits()
+                // );
                 return Err(Error::from(ErrorKind::WouldBlock));
             }
             _ => {}
@@ -239,15 +240,15 @@ impl MuxStream for ChannelMuxStream {
     }
     fn handle_window_update(&mut self, len: u32) {
         self.state.send_buf_window.fetch_add(len, Ordering::SeqCst);
-        info!("[{}]Add window:{} ", self.id(), len);
+        //info!("[{}]Add window:{} ", self.id(), len);
         if self.state.window_sem.available_permits() == 0 {
             self.state.window_sem.add_permits(1);
-            info!(
-                "[{}]After add window:{} while permits:{}",
-                self.id(),
-                len,
-                self.state.window_sem.available_permits()
-            );
+            // info!(
+            //     "[{}]After add window:{} while permits:{}",
+            //     self.id(),
+            //     len,
+            //     self.state.window_sem.available_permits()
+            // );
         }
     }
     fn id(&self) -> u32 {

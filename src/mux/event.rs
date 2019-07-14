@@ -11,6 +11,8 @@ pub const FLAG_WIN_UPDATE: u8 = 4;
 pub const FLAG_PING: u8 = 5;
 pub const FLAG_AUTH: u8 = 6;
 pub const FLAG_SHUTDOWN: u8 = 7;
+pub const FLAG_PONG: u8 = 8;
+pub const FLAG_LZ4_DATA: u8 = 9;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 
@@ -104,6 +106,15 @@ pub fn new_ping_event(sid: u32) -> Event {
     Event {
         header: Header {
             flag_len: get_flag_len(0, FLAG_PING),
+            stream_id: sid,
+        },
+        body: Vec::new(),
+    }
+}
+pub fn new_pong_event(sid: u32) -> Event {
+    Event {
+        header: Header {
+            flag_len: get_flag_len(0, FLAG_PONG),
             stream_id: sid,
         },
         body: Vec::new(),

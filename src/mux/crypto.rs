@@ -5,7 +5,7 @@ use tokio_io::io::read_exact;
 use ring::aead::*;
 use std::io::{Error, ErrorKind};
 
-use crc::{crc32, Hasher32};
+use crc::crc32;
 
 use crate::mux::event::*;
 

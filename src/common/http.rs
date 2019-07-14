@@ -379,7 +379,7 @@ pub fn is_ok_response(buf: &[u8]) -> bool {
     let mut res = httparse::Response::new(&mut headers);
     match res.parse(buf) {
         Ok(Status::Complete(_)) => {
-            info!("code is {}", res.code.unwrap());
+            //info!("code is {}", res.code.unwrap());
             res.code.unwrap() < 300
         }
         _ => false,
