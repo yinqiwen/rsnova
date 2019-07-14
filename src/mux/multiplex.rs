@@ -325,24 +325,38 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                     }
                     Some(ev) => {
                         not_ready = false;
+                        let mut ignore_event = false;
                         // info!(
                         //     "[{}]recv local event:{} {}",
                         //     ev.header.stream_id,
                         //     ev.header.flags(),
                         //     ev.body.len(),
                         // );
-                        if FLAG_SHUTDOWN == ev.header.flags() {
-                            self.close();
-                            return Err(Error::from(ErrorKind::ConnectionReset));
+                        match ev.header.flags() {
+                            FLAG_SHUTDOWN => {
+                                self.close();
+                                return Err(Error::from(ErrorKind::ConnectionReset));
+                            }
+                            FLAG_FIN => {
+                                info!("Close stream:{}", ev.header.stream_id);
+                                self.session.close_stream(ev.header.stream_id, true);
+                            }
+                            FLAG_DATA => {
+                                if self.session.get_stream(ev.header.stream_id).is_none() {
+                                    warn!("[{}]stream already closed", ev.header.stream_id);
+                                    ignore_event = true;
+                                }
+                            }
+                            _ => {
+                                //
+                            }
                         }
-                        if FLAG_FIN == ev.header.flags() {
-                            info!("Close stream:{}", ev.header.stream_id);
-                            self.session.close_stream(ev.header.stream_id, true);
-                        }
-                        if let Err(e) = self.try_send_event(ev) {
-                            error!("Remote event send error:{}", e);
-                            self.close();
-                            return Err(Error::from(ErrorKind::ConnectionReset));
+                        if !ignore_event {
+                            if let Err(e) = self.try_send_event(ev) {
+                                error!("Remote event send error:{}", e);
+                                self.close();
+                                return Err(Error::from(ErrorKind::ConnectionReset));
+                            }
                         }
                         //return Ok(Async::Ready(Some(())));
                     }
