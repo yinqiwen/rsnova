@@ -37,4 +37,5 @@ unicase = "2.4"
 trust-dns = "0.16"
 ring = "0.14"
 crc = "^1.0.0"
+#lz4-compress="0.1"
 
