@@ -6,6 +6,7 @@ use crate::mux::common::*;
 use crate::mux::crypto::*;
 use crate::mux::event::*;
 use crate::mux::message::*;
+use crate::stat::*;
 use std::io::{Error, ErrorKind};
 
 use std::time::{Duration, Instant};
@@ -42,6 +43,7 @@ pub trait MuxStream: Sync + Send {
 //pub type MuxStreamRef = Box<dyn MuxStream>;
 
 pub trait MuxSession: Send {
+    fn id(&self) -> u32;
     fn new_stream(&mut self, sid: u32) -> &mut dyn MuxStream;
     fn get_stream(&mut self, sid: u32) -> Option<&mut dyn MuxStream>;
     fn next_stream_id(&mut self) -> u32;
@@ -83,7 +85,11 @@ pub trait MuxSession: Send {
                 s.handle_recv_data(ev.body);
             }
             None => {
-                error!("No stream found for data event:{}", ev.header.stream_id);
+                error!(
+                    "[{}]No stream found for data event:{}",
+                    self.id(),
+                    ev.header.stream_id
+                );
             }
         }
     }
@@ -235,8 +241,8 @@ where
 pub type SessionTaskClosure = Box<dyn FnOnce(&mut dyn MuxSession) + Send>;
 
 struct MuxConnectionProcessor<T: AsyncRead + AsyncWrite> {
-    local_ev_send: mpsc::UnboundedSender<Event>,
-    local_ev_recv: mpsc::UnboundedReceiver<Event>,
+    local_ev_send: mpsc::Sender<Event>,
+    local_ev_recv: mpsc::Receiver<Event>,
     remote_ev_send: stream::SplitSink<Framed<T, EventCodec>>,
     remote_ev_recv: stream::SplitStream<Framed<T, EventCodec>>,
     task_send: mpsc::Sender<SessionTaskClosure>,
@@ -250,9 +256,9 @@ struct MuxConnectionProcessor<T: AsyncRead + AsyncWrite> {
 
 impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
     fn new(ctx: CryptoContext, conn: T, is_client: bool) -> Self {
-        let (atx, arx) = mpsc::channel(1024);
-        let (send, recv) = mpsc::unbounded_channel();
-        let session = ChannelMuxSession::new(&send, is_client);
+        let (atx, arx) = mpsc::channel(32);
+        let (send, recv) = mpsc::channel(32);
+        let session = ChannelMuxSession::new(&send, is_client, next_connection_id());
         let (writer, reader) = Framed::new(conn, EventCodec::new(ctx)).split();
         Self {
             local_ev_send: send,
@@ -338,7 +344,7 @@ impl<T: AsyncRead + AsyncWrite> MuxConnectionProcessor<T> {
                                 return Err(Error::from(ErrorKind::ConnectionReset));
                             }
                             FLAG_FIN => {
-                                info!("Close stream:{}", ev.header.stream_id);
+                                //info!("Close stream:{}", ev.header.stream_id);
                                 self.session.close_stream(ev.header.stream_id, true);
                             }
                             FLAG_DATA => {
@@ -525,7 +531,7 @@ impl<T: AsyncRead + AsyncWrite> Stream for MuxConnectionProcessor<T> {
                 return Err(e);
             }
             Ok(Async::Ready(_)) => {
-                debug!("1 return with {}", all_not_ready);
+                //debug!("1 return with {}", all_not_ready);
                 all_not_ready = false;
             }
             Ok(Async::NotReady) => {
@@ -537,7 +543,7 @@ impl<T: AsyncRead + AsyncWrite> Stream for MuxConnectionProcessor<T> {
                 return Err(e);
             }
             Ok(Async::Ready(_)) => {
-                debug!("0 return with {}", all_not_ready);
+                //debug!("0 return with {}", all_not_ready);
                 all_not_ready = false;
             }
             Ok(Async::NotReady) => {
@@ -550,7 +556,7 @@ impl<T: AsyncRead + AsyncWrite> Stream for MuxConnectionProcessor<T> {
                 return Err(e);
             }
             Ok(Async::Ready(_)) => {
-                debug!("2 return with {}", all_not_ready);
+                //debug!("2 return with {}", all_not_ready);
                 all_not_ready = false;
             }
             Ok(Async::NotReady) => {

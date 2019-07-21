@@ -1,10 +1,10 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{Async, Poll, Stream};
+use futures::Async;
 use httparse::Status;
 use std::collections::vec_deque::VecDeque;
 use std::fmt::Write as fmt_write;
-use std::io::{Cursor, Error, ErrorKind};
-use std::io::{Read, Write};
+use std::io::Read;
+use std::io::{Error, ErrorKind};
 use tokio_io::AsyncRead;
 use unicase::Ascii;
 

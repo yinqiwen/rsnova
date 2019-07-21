@@ -14,7 +14,6 @@ use tokio_io::{AsyncRead, AsyncWrite};
 
 use tokio::prelude::*;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use tokio_sync::semaphore::{Permit, Semaphore};
 
 struct MuxStreamState {
@@ -28,8 +27,8 @@ struct MuxStreamState {
 struct MuxStreamInner {
     state: Arc<MuxStreamState>,
     recv_buf: Cursor<Bytes>,
-    send_channel: mpsc::UnboundedSender<Event>,
-    recv_channel: mpsc::UnboundedReceiver<Vec<u8>>,
+    send_channel: mpsc::Sender<Event>,
+    recv_data_channel: mpsc::Receiver<Vec<u8>>,
     window_permit: Permit,
 }
 
@@ -42,20 +41,44 @@ impl MuxStreamInner {
         // );
         if !self.state.closed.load(Ordering::SeqCst) {
             self.state.closed.store(true, Ordering::SeqCst);
-            self.send_channel
-                .start_send(new_fin_event(self.state.stream_id));
-            self.send_channel.poll_complete();
+            self.write_event(new_fin_event(self.state.stream_id));
             //self.state.window_sem.close();
+        }
+    }
+
+    fn write_event(&mut self, ev: Event) -> io::Result<()> {
+        match self.send_channel.start_send(ev) {
+            Ok(AsyncSink::Ready) => {
+                self.send_channel.poll_complete();
+                Ok(())
+            }
+            Ok(AsyncSink::NotReady(_)) => {
+                warn!("[{}]Not ready to write local event.", self.state.stream_id);
+                self.send_channel.poll_complete();
+                Err(Error::from(ErrorKind::WouldBlock))
+            }
+            Err(_) => Err(Error::from(ErrorKind::Other)),
+        }
+    }
+
+    fn inc_recv_window(&mut self, data_len: usize) {
+        let n = data_len as u32;
+        let recv_window_size = self.state.recv_buf_window.fetch_add(n, Ordering::SeqCst);
+        if recv_window_size >= 32 * 1024 {
+            let ev = new_window_update_event(self.state.stream_id, recv_window_size);
+            if self.write_event(ev).is_ok() {
+                self.state
+                    .recv_buf_window
+                    .fetch_sub(recv_window_size, Ordering::SeqCst);
+            }
         }
     }
 }
 
 impl Drop for MuxStreamInner {
     fn drop(&mut self) {
-        info!("Dropping stream:{}", self.state.stream_id);
-        self.send_channel
-            .start_send(new_fin_event(self.state.stream_id));
-        self.send_channel.poll_complete();
+        //info!("Dropping stream:{}", self.state.stream_id);
+        self.write_event(new_fin_event(self.state.stream_id));
     }
 }
 
@@ -67,9 +90,10 @@ impl Read for MuxStreamInner {
         }
         let n = self.recv_buf.read(buf)?;
         if n > 0 {
+            self.inc_recv_window(n);
             return Ok(n);
         } else {
-            let r = self.recv_channel.poll();
+            let r = self.recv_data_channel.poll();
             //info!("recn poll {:?}", r);
             match r {
                 Ok(Async::NotReady) => Err(Error::from(ErrorKind::WouldBlock)),
@@ -81,7 +105,9 @@ impl Read for MuxStreamInner {
                     //     b.len()
                     // );
                     self.recv_buf = Cursor::new(Bytes::from(b));
-                    self.recv_buf.read(buf)
+                    let n = self.recv_buf.read(buf)?;
+                    self.inc_recv_window(n);
+                    Ok(n)
                 }
                 Err(_) => Err(Error::from(ErrorKind::Other)),
             }
@@ -148,23 +174,19 @@ impl Write for MuxStreamInner {
         //     ev.header.len(),
         //     ev.body.len()
         // );
-        let r = self.send_channel.start_send(ev);
+
+        let r = self.write_event(ev);
         match r {
-            Ok(AsyncSink::Ready) => {
+            Ok(()) => {
                 let slen = send_len as u32;
                 if self.state.send_buf_window.fetch_sub(slen, Ordering::SeqCst) > slen {
                     self.window_permit.release(&self.state.window_sem);
                 } else {
                     self.window_permit.forget();
                 }
-                self.send_channel.poll_complete();
                 Ok(send_len)
             }
-            Ok(AsyncSink::NotReady(_)) => {
-                self.window_permit.release(&self.state.window_sem);
-                Err(Error::from(ErrorKind::WouldBlock))
-            }
-            Err(_) => Err(Error::from(ErrorKind::Other)),
+            Err(e) => Err(e),
         }
     }
 
@@ -176,15 +198,15 @@ impl Write for MuxStreamInner {
 
 pub struct ChannelMuxStream {
     state: Arc<MuxStreamState>,
-    send_channel: UnboundedSender<Event>,
-    recv_data_channel: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    send_channel: mpsc::Sender<Event>,
+    send_data_channel: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl ChannelMuxStream {
-    pub fn new(id: u32, s: &UnboundedSender<Event>) -> Self {
+    pub fn new(id: u32, s: &mpsc::Sender<Event>) -> Self {
         let state = MuxStreamState {
             stream_id: id,
-            send_buf_window: AtomicU32::new(512 * 1024),
+            send_buf_window: AtomicU32::new(128 * 1024),
             recv_buf_window: AtomicU32::new(0),
             window_sem: Semaphore::new(1),
             closed: AtomicBool::new(false),
@@ -192,21 +214,21 @@ impl ChannelMuxStream {
         Self {
             state: Arc::new(state),
             send_channel: s.clone(),
-            recv_data_channel: None,
+            send_data_channel: None,
         }
     }
 }
 
 impl MuxStream for ChannelMuxStream {
     fn split(&mut self) -> (Box<dyn AsyncRead + Send>, Box<dyn AsyncWrite + Send>) {
-        let (send, recv) = mpsc::unbounded_channel();
-        self.recv_data_channel = Some(send);
+        let (send, recv) = mpsc::channel(128);
+        self.send_data_channel = Some(send);
 
         let inner = MuxStreamInner {
             state: self.state.clone(),
             recv_buf: Cursor::new(Bytes::with_capacity(0)),
             send_channel: self.send_channel.clone(),
-            recv_channel: recv,
+            recv_data_channel: recv,
             window_permit: Permit::new(),
         };
         let (r, w) = inner.split();
@@ -218,36 +240,35 @@ impl MuxStream for ChannelMuxStream {
             if initial {
                 self.write_event(new_fin_event(self.state.stream_id));
             }
-            if let Some(s) = &mut self.recv_data_channel {
+            if let Some(s) = &mut self.send_data_channel {
                 s.close();
             }
         }
     }
     fn handle_recv_data(&mut self, data: Vec<u8>) {
-        let data_len = data.len() as u32;
-        match &mut self.recv_data_channel {
+        //let data_len = data.len() as u32;
+        let sid = self.id();
+        match &mut self.send_data_channel {
             Some(tx) => {
                 //info!("handle recv data with len:{}", data.len());
-                tx.start_send(data);
-                tx.poll_complete();
+                match tx.start_send(data) {
+                    Ok(AsyncSink::Ready) => {
+                        //
+                        tx.poll_complete();
+                    }
+                    Ok(AsyncSink::NotReady(_)) => {
+                        warn!("[{}]Not ready to handle recv data", sid);
+                        tx.poll_complete();
+                    }
+                    Err(e) => {
+                        error!("[{}]Failed to handle recv data:{}", sid, e);
+                    }
+                }
             }
             None => {
-                error!("No stream data sender for {}", self.id());
+                error!("No stream data sender for {}", sid);
                 return;
             }
-        }
-        //info!("[{}]Recv data with len:{}", self.state.stream_id, data_len);
-        let recv_window_size = self
-            .state
-            .recv_buf_window
-            .fetch_add(data_len, Ordering::SeqCst);
-        if recv_window_size >= 32 * 1024 {
-            let ev = new_window_update_event(self.state.stream_id, recv_window_size);
-            self.write_event(ev);
-            //self.send_channel.poll_complete();
-            self.state
-                .recv_buf_window
-                .fetch_sub(recv_window_size, Ordering::SeqCst);
         }
     }
     fn handle_window_update(&mut self, len: u32) {
@@ -272,14 +293,14 @@ impl MuxStream for ChannelMuxStream {
 }
 
 pub struct ChannelMuxSession {
-    event_trigger_send: UnboundedSender<Event>,
+    event_trigger_send: mpsc::Sender<Event>,
     streams: HashMap<u32, ChannelMuxStream>,
     next_stream_id: AtomicU32,
-    //is_client: bool,
+    id: u32,
 }
 
 impl ChannelMuxSession {
-    pub fn new(send: &UnboundedSender<Event>, is_client: bool) -> Self {
+    pub fn new(send: &mpsc::Sender<Event>, is_client: bool, id: u32) -> Self {
         let mut seed = AtomicU32::new(1);
         if !is_client {
             seed = AtomicU32::new(2);
@@ -288,19 +309,18 @@ impl ChannelMuxSession {
             event_trigger_send: send.clone(),
             streams: HashMap::new(),
             next_stream_id: seed,
+            id,
         }
     }
 }
 
 impl MuxSession for ChannelMuxSession {
+    fn id(&self) -> u32 {
+        self.id
+    }
     fn num_of_streams(&self) -> usize {
         self.streams.len()
     }
-
-    // fn get_local_event_sender(&self) -> UnboundedSender<Event> {
-    //     self.event_trigger_send.clone()
-    // }
-
     fn close(&mut self) {
         self.event_trigger_send.start_send(new_shutdown_event(0));
         self.event_trigger_send.poll_complete();
@@ -312,7 +332,8 @@ impl MuxSession for ChannelMuxSession {
 
     fn new_stream(&mut self, sid: u32) -> &mut dyn MuxStream {
         info!(
-            "new stream:{} with alive streams:{}",
+            "[{}]new stream:{} with alive streams:{}",
+            self.id(),
             sid,
             self.streams.len()
         );
@@ -329,6 +350,13 @@ impl MuxSession for ChannelMuxSession {
         self.next_stream_id.fetch_add(2, Ordering::SeqCst)
     }
     fn close_stream(&mut self, sid: u32, initial: bool) {
+        info!(
+            "[{}]close stream:{} initial:{} with alive streams:{}",
+            self.id(),
+            sid,
+            initial,
+            self.streams.len()
+        );
         let s = self.streams.remove(&sid);
         match s {
             Some(mut stream) => {

@@ -2,22 +2,22 @@ use crate::common::tcp_split;
 use crate::common::FourEither;
 use crate::common::{buf_copy, get_available_udp_port, UdpConnection};
 use crate::common::{RelayTimeoutReader, SharedTimeoutState};
+use crate::stat::*;
 
 use super::channel::select_session;
 use super::multiplex::MuxSession;
 use super::multiplex::SessionTaskClosure;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_io::io::shutdown;
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-use tokio_timer::Delay;
+//use tokio_timer::Delay;
 
 use bytes::Bytes;
 
@@ -26,12 +26,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use tokio_io::io::write_all;
 
 use tokio::prelude::*;
-use tokio_io_timeout::TimeoutReader;
-
-lazy_static! {
-    static ref GLOBAL_RELAY_ID_SEED: AtomicU32 = AtomicU32::new(0);
-    static ref GLOBAL_ALIVE_RELAY_COUNTER: AtomicU32 = AtomicU32::new(0);
-}
+//use tokio_io_timeout::TimeoutReader;
 
 fn proxy_stream<R, W, A, B>(
     relay_id: u32,
@@ -135,7 +130,7 @@ where
     info!(
         "[{}]Relay connection with alive counter:{}",
         relay_id,
-        GLOBAL_ALIVE_RELAY_COUNTER.fetch_add(1, Ordering::SeqCst)
+        inc_alive_relay_sessions()
     );
     if proto == "udp" {
         let lport = get_available_udp_port();
@@ -173,14 +168,14 @@ where
             )
             .map_err(move |e| {
                 error!("[{}]udp proxy error: {}", relay_id2, e);
-                GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                dec_alive_relay_sessions();
             })
             .map(move |(from_client, from_server)| {
                 info!(
                     "[{}]client at {} wrote {} bytes and received {} bytes",
                     relay_id1, addr, from_client, from_server
                 );
-                GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                dec_alive_relay_sessions();
             }),
         )
     } else {
@@ -207,14 +202,14 @@ where
                     )
                 })
                 .map(move |(from_client, from_server)| {
-                    GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                    dec_alive_relay_sessions();
                     info!(
                         "[{}]proxy to {} wrote {} bytes and received {} bytes",
                         relay_id, oaddr, from_client, from_server
                     );
                 })
                 .map_err(move |e| {
-                    GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                    dec_alive_relay_sessions();
                     error!("[{}]proxy to {} error: {}", relay_id1, eaddr, e);
                     //local_writer.shutdown();
                 }),
@@ -243,13 +238,13 @@ where
     R: AsyncRead + Send + 'static,
     W: AsyncWrite + Send + 'static,
 {
-    let relay_id = GLOBAL_RELAY_ID_SEED.fetch_add(1, Ordering::SeqCst);
+    let relay_id = next_relay_id();
     if let Some(mut session_task) = select_session() {
         info!(
             "[{}]Relay connection to {} with alive counter:{}",
             relay_id,
             addr,
-            GLOBAL_ALIVE_RELAY_COUNTER.fetch_add(1, Ordering::SeqCst)
+            inc_alive_relay_sessions()
         );
         let proto_str = String::from(proto);
         let addr_str = String::from(addr);
@@ -266,17 +261,17 @@ where
                 local_writer,
                 remote_r,
                 remote_w,
-                timeout_secs,
+                0,
                 initial_data,
             )
             .map(move |_| {
                 //
-                GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                dec_alive_relay_sessions();
                 //close_session_stream(s1, sid);
             })
-            .map_err(move |e| {
+            .map_err(move |_| {
                 //error!("relay error: {}", e);
-                GLOBAL_ALIVE_RELAY_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                dec_alive_relay_sessions();
                 //close_session_stream(s2, sid);
             });
             tokio::spawn(relay);

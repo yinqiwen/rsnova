@@ -1,6 +1,7 @@
 use super::multiplex::*;
 use super::tcp::*;
 use crate::config::*;
+use crate::stat::*;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -53,6 +54,7 @@ fn channel_url_key(n: &str, u: &str) -> String {
 
 fn ping_session(session: &mut dyn MuxSession) {
     session.ping();
+    inc_alive_streams(session.num_of_streams());
 }
 
 fn try_close_session(session: &mut dyn MuxSession) {
@@ -60,7 +62,8 @@ fn try_close_session(session: &mut dyn MuxSession) {
         info!("Close retired session.");
         session.close();
     } else {
-        info!("{} streams left", session.num_of_streams());
+        inc_retired_streams(session.num_of_streams());
+        //info!("{} streams left", session.num_of_streams());
     }
 }
 
@@ -83,6 +86,7 @@ impl MuxSessionManager {
                 }
             }
         }
+        set_alive_streams(0);
         let mut retired = self
             .all_sessions
             .drain_filter(|s| {
@@ -97,12 +101,12 @@ impl MuxSessionManager {
                 }
             })
             .collect::<Vec<_>>();
+        set_alive_conns(self.all_sessions.len());
         for s in &retired {
             s.channel.conns.fetch_sub(1, Ordering::SeqCst);
         }
-
+        set_retired_streams(0);
         self.retire_sessions.append(&mut retired);
-
         self.retire_sessions.drain_filter(|s| {
             if s.task_sender.poll_ready().is_err() {
                 true
@@ -111,6 +115,7 @@ impl MuxSessionManager {
                 false
             }
         });
+        set_retired_conns(self.retire_sessions.len());
     }
 
     fn add_channel_url(&mut self, key: String, state: Arc<ChannelState>) {
@@ -136,6 +141,7 @@ impl MuxSessionManager {
                 task_sender: task_sender.clone(),
             };
             self.all_sessions.push(data);
+            set_alive_conns(self.all_sessions.len());
             true
         } else {
             error!("No channel config found for {}", k);
@@ -153,6 +159,7 @@ impl MuxSessionManager {
                 //error!(" session error");
                 let _ = data.channel.conns.fetch_sub(1, Ordering::SeqCst);
                 self.all_sessions.remove(idx as usize);
+                set_alive_conns(self.all_sessions.len());
                 return None;
             }
             if ch.is_empty() || data.channel.channel == ch {
@@ -247,7 +254,7 @@ pub fn init_local_mux_channels(cs: &[ChannelConfig]) {
         }
     }
 
-    let interval = Interval::new_interval(Duration::from_secs(3));
+    let interval = Interval::new_interval(Duration::from_secs(10));
     let routine = interval
         .for_each(|_| {
             SESSIONS_HOLDER.lock().unwrap().routine();

@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::Mutex;
+
+use url::Url;
 
 lazy_static! {
     static ref GLOBAL_CONFIG: Mutex<Config> = Mutex::new(Config::new());
@@ -61,6 +64,26 @@ pub fn add_channel_config(url: &str, proxy: &str) {
     ch.urls.push(String::from(url));
     ch.conns_per_host = 5;
     ch.max_alive_mins = 30;
+    if let Ok(u) = Url::parse(url) {
+        for (k, v) in u.query_pairs() {
+            match k {
+                Cow::Borrowed("conns_per_host") => {
+                    if let Ok(vv) = v.parse::<u32>() {
+                        ch.conns_per_host = vv;
+                    }
+                }
+                Cow::Borrowed("age_secs") => {
+                    if let Ok(vv) = v.parse::<u32>() {
+                        ch.max_alive_mins = vv;
+                    }
+                }
+                _ => {
+                    warn!("unknown url parameters");
+                }
+            }
+        }
+    }
+
     ch.name = String::from("default");
     ch.proxy = String::from(proxy);
     get_config().lock().unwrap().local.channels.push(ch);

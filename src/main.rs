@@ -7,6 +7,7 @@ extern crate log;
 extern crate bincode;
 extern crate byteorder;
 extern crate bytes;
+#[macro_use]
 extern crate clap;
 extern crate crc;
 #[macro_use]
@@ -41,14 +42,16 @@ mod common;
 mod config;
 mod mux;
 mod proxy;
-mod test;
+mod stat;
 
 use clap::{App, Arg};
 use futures::future::{self};
 use futures::prelude::*;
 use std::fs::File;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
+use tokio::timer::Interval;
 
 use simplelog::Config as LogConfig;
 use simplelog::{CombinedLogger, LevelFilter, TermLogger, TerminalMode, WriteLogger};
@@ -143,6 +146,13 @@ fn main() {
                 .default_value("chacha20poly1305")
                 .multiple(false),
         )
+        .arg(
+            Arg::with_name("period_dump")
+                .long("period_dump")
+                .help("Period dump log secs")
+                .default_value("30")
+                .multiple(false),
+        )
         .get_matches();
 
     let logs: Vec<_> = matches.values_of("log").unwrap().collect();
@@ -165,8 +175,10 @@ fn main() {
         }
     }
     CombinedLogger::init(loggers).unwrap();
-
     config::set_local_transparent(matches.is_present("transparent"));
+
+    let period_dump_secs =
+        value_t!(matches.value_of("period_dump"), u64).unwrap_or_else(|e| e.exit());
 
     let mut proxy = String::new();
     if let Some(v) = matches.value_of("proxy") {
@@ -235,6 +247,17 @@ fn main() {
             }));
         }
     }
+
+    let interval = Interval::new_interval(Duration::from_secs(period_dump_secs));
+    let routine = interval
+        .for_each(|_| {
+            stat::dump_stat();
+            Ok(())
+        })
+        .map_err(|e| {
+            error!("routine task error:{}", e);
+        });
+    rt.spawn(routine);
 
     // let data = r#"
     //     {
