@@ -12,6 +12,7 @@ extern crate clap;
 extern crate crc;
 #[macro_use]
 extern crate futures;
+extern crate flexi_logger;
 extern crate httparse;
 extern crate serde;
 
@@ -20,7 +21,7 @@ extern crate nom;
 //extern crate orion;
 extern crate rand;
 extern crate ring;
-extern crate simplelog;
+
 extern crate skip32;
 
 extern crate tokio;
@@ -48,13 +49,14 @@ use clap::{App, Arg};
 use futures::future::{self};
 use futures::prelude::*;
 use std::fs::File;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::runtime::Runtime;
 use tokio::timer::Interval;
 
-use simplelog::Config as LogConfig;
-use simplelog::{CombinedLogger, LevelFilter, TermLogger, TerminalMode, WriteLogger};
+use flexi_logger::{opt_format, LogTarget, Logger};
+// use simplelog::Config as LogConfig;
+// use simplelog::{CombinedLogger, LevelFilter, TermLogger, TerminalMode, WriteLogger};
 
 fn main() {
     let matches = App::new("rsnova")
@@ -91,6 +93,7 @@ fn main() {
             Arg::with_name("local")
                 .short("L")
                 .long("local")
+                .takes_value(false)
                 .help("Launch as local mode")
                 .multiple(false)
                 .conflicts_with("remote"),
@@ -99,16 +102,24 @@ fn main() {
             Arg::with_name("remote")
                 .short("R")
                 .long("remote")
+                .takes_value(false)
                 .help("Launch as remote mode")
                 .multiple(false)
                 .conflicts_with("local"),
         )
         .arg(
-            Arg::with_name("log")
-                .long("log")
-                .help("Log destination")
-                .default_value("console")
-                .multiple(true),
+            Arg::with_name("logdir")
+                .long("logdir")
+                .takes_value(true)
+                .help("log dir destination")
+                .multiple(false),
+        )
+        .arg(
+            Arg::with_name("logtostderr")
+                .long("logtostderr")
+                .help("log to stderr")
+                .takes_value(false)
+                .multiple(false),
         )
         .arg(
             Arg::with_name("proxy")
@@ -155,26 +166,38 @@ fn main() {
         )
         .get_matches();
 
-    let logs: Vec<_> = matches.values_of("log").unwrap().collect();
-    let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = Vec::new();
-    let mut log_level = LevelFilter::Info;
+    //let logs: Vec<_> = matches.values_of("log").unwrap().collect();
+
+    //let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = Vec::new();
+    let mut log_level = String::from("info");
     if matches.occurrences_of("debug") == 1 {
-        log_level = LevelFilter::Debug;
+        log_level = String::from("debug");
     }
-    for log in logs.iter() {
-        if log.to_lowercase() == "console" {
-            loggers.push(
-                TermLogger::new(log_level, LogConfig::default(), TerminalMode::Mixed).unwrap(),
-            );
-        } else {
-            loggers.push(WriteLogger::new(
-                log_level,
-                LogConfig::default(),
-                File::create(log).unwrap(),
-            ));
+    let mut logger = flexi_logger::Logger::with_str(log_level.as_str());
+    match matches.value_of("logdir") {
+        None => {
+            logger = logger.log_target(LogTarget::DevNull);
+        }
+        Some(dir) => {
+            logger = logger
+                .log_to_file()
+                .rotate(
+                    flexi_logger::Criterion::Size(1024 * 1024),
+                    flexi_logger::Naming::Numbers,
+                    flexi_logger::Cleanup::KeepLogFiles(10),
+                )
+                .directory(dir)
+                .format(opt_format);
         }
     }
-    CombinedLogger::init(loggers).unwrap();
+    if matches.occurrences_of("logtostderr") == 1 {
+        logger = logger
+            .duplicate_to_stderr(flexi_logger::Duplicate::Info)
+            .format_for_stderr(flexi_logger::colored_opt_format);
+    }
+
+    logger.start().unwrap();
+    //CombinedLogger::init(loggers).unwrap();
     config::set_local_transparent(matches.is_present("transparent"));
 
     let period_dump_secs =
