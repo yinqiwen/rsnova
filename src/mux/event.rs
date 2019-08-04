@@ -12,7 +12,6 @@ pub const FLAG_PING: u8 = 5;
 pub const FLAG_AUTH: u8 = 6;
 pub const FLAG_SHUTDOWN: u8 = 7;
 pub const FLAG_PONG: u8 = 8;
-pub const FLAG_LZ4_DATA: u8 = 9;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 

@@ -1,10 +1,10 @@
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
 use futures::{Async, Future, Poll};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_io::AsyncRead;
 use tokio_timer::Delay;
 
 #[derive(Debug)]

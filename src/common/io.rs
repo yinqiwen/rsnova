@@ -13,7 +13,7 @@ use std::mem;
 
 use futures::{Future, Poll};
 
-use std::net::SocketAddr;
+//use std::net::SocketAddr;
 
 pub fn other_error(desc: &str) -> std::io::Error {
     std::io::Error::new(ErrorKind::Other, desc)
