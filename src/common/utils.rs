@@ -11,7 +11,7 @@ use futures::Future;
 use std::net::ToSocketAddrs;
 
 use super::{is_ok_response, read_until_separator};
-use tokio_io::io::write_all;
+use tokio::io::write_all;
 
 pub fn get_hostport_from_url(url: &Url) -> Option<String> {
     let mut hostport = String::new();

@@ -3,10 +3,10 @@ use crate::mux::mux_relay_connection;
 use crate::proxy::local::*;
 
 use httparse::Status;
+use tokio::io::write_all;
 use tokio::prelude::*;
-use tokio_io::io::write_all;
 
-use tokio_io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use url::Url;
 

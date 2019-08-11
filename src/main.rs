@@ -1,6 +1,8 @@
 #![feature(drain_filter)]
 #![feature(pattern)]
 #![feature(trait_alias)]
+#![feature(async_await)]
+#![warn(rust_2018_idioms)]
 
 #[macro_use]
 extern crate log;
@@ -25,11 +27,11 @@ extern crate ring;
 extern crate skip32;
 
 extern crate tokio;
-extern crate tokio_io;
+//extern crate tokio_io;
 extern crate tokio_io_timeout;
 extern crate tokio_sync;
-extern crate tokio_timer;
-extern crate tokio_udp;
+//extern crate tokio_timer;
+//extern crate tokio_udp;
 //extern crate trust_dns_server;
 extern crate twoway;
 
@@ -281,15 +283,6 @@ fn main() {
             error!("routine task error:{}", e);
         });
     rt.spawn(routine);
-
-    // let data = r#"
-    //     {
-    //         "listen": ":48100"
-    //     }"#;
-    // let p: Config = serde_json::from_str(data).unwrap();
-
-    // // Do things just like with any other Rust data structure.
-    // info!("Please call  {}", p.listen);
 
     rt.shutdown_on_idle().wait().unwrap();
 }

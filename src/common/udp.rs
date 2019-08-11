@@ -1,8 +1,8 @@
 use std::io as std_io;
 use std::io::{Error, ErrorKind, Read, Write};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UdpSocket;
 use tokio::prelude::*;
-use tokio_io::{AsyncRead, AsyncWrite};
 
 pub struct UdpConnection {
     sock: UdpSocket,

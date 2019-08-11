@@ -4,8 +4,8 @@ use std::io::{self, Read};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio_io::AsyncRead;
-use tokio_timer::Delay;
+use tokio::io::AsyncRead;
+use tokio::timer::Delay;
 
 #[derive(Debug)]
 pub struct SharedTimeoutState {

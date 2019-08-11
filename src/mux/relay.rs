@@ -10,9 +10,9 @@ use super::multiplex::SessionTaskClosure;
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio::io::shutdown;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tokio_io::io::shutdown;
-use tokio_io::{AsyncRead, AsyncWrite};
 
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -23,7 +23,7 @@ use bytes::Bytes;
 
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use tokio_io::io::write_all;
+use tokio::io::write_all;
 
 use tokio::prelude::*;
 //use tokio_io_timeout::TimeoutReader;

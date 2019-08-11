@@ -5,9 +5,9 @@ use super::local::*;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use std::io::ErrorKind;
-use tokio_io::io::{read_exact, write_all};
+use tokio::io::{read_exact, write_all};
 
-use tokio_io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use futures::{Future};
 

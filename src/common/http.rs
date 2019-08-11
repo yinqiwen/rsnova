@@ -5,7 +5,7 @@ use std::collections::vec_deque::VecDeque;
 use std::fmt::Write as fmt_write;
 use std::io::Read;
 use std::io::{Error, ErrorKind};
-use tokio_io::AsyncRead;
+use tokio::io::AsyncRead;
 use unicase::Ascii;
 
 #[derive(Clone, PartialEq, Debug, Default)]

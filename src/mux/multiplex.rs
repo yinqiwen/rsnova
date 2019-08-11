@@ -11,10 +11,10 @@ use std::io::{Error, ErrorKind};
 
 use std::time::{Duration, Instant};
 
+use tokio::io::shutdown;
+use tokio::io::write_all;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::timer::Interval;
-use tokio_io::io::shutdown;
-use tokio_io::io::write_all;
-use tokio_io::{AsyncRead, AsyncWrite};
 
 use futures::Future;
 use futures::Sink;

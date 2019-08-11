@@ -1,7 +1,7 @@
 use std::io::Error;
 use std::io::ErrorKind;
+use tokio::io::AsyncRead;
 use tokio::prelude::*;
-use tokio_io::AsyncRead;
 
 use bytes::Buf;
 use bytes::BufMut;

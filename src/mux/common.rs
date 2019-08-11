@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 
 use tokio::io;
-use tokio_io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use tokio::prelude::*;
 use tokio::sync::mpsc;

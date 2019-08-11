@@ -1,6 +1,6 @@
 use bytes::{BufMut, BytesMut};
+use tokio::io::read_exact;
 use tokio::prelude::*;
-use tokio_io::io::read_exact;
 
 use ring::aead::*;
 use std::io::{Error, ErrorKind};
@@ -563,5 +563,4 @@ mod tests {
         assert_eq!(buf.len(), 0);
         assert_eq!(str::from_utf8(&r.body[..]).unwrap(), s);
     }
-
 }
