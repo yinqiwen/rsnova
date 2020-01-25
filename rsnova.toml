@@ -1,0 +1,10 @@
+[log]
+logtostderr = true
+level = "info"
+logdir = "./"
+
+[common]
+
+[[tunnel]]
+listen = "127.0.0.1:48100"
+pac=[{host = "*", channel = "direct"}]

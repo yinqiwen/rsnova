@@ -1,66 +1,22 @@
-#![feature(drain_filter)]
-#![feature(pattern)]
-#![feature(trait_alias)]
-#![feature(async_await)]
 #![warn(rust_2018_idioms)]
 
 #[macro_use]
 extern crate log;
-extern crate bincode;
-extern crate byteorder;
-extern crate bytes;
-#[macro_use]
-extern crate clap;
-extern crate crc;
-#[macro_use]
-extern crate futures;
-extern crate flexi_logger;
-extern crate httparse;
-extern crate serde;
 
-extern crate nix;
-extern crate nom;
-//extern crate orion;
-extern crate rand;
-extern crate ring;
-
-extern crate skip32;
-
-extern crate tokio;
-//extern crate tokio_io;
-extern crate tokio_io_timeout;
-extern crate tokio_sync;
-//extern crate tokio_timer;
-//extern crate tokio_udp;
-//extern crate trust_dns_server;
-extern crate twoway;
-
-extern crate unicase;
-extern crate url;
-
-#[macro_use]
-extern crate lazy_static;
-
-mod common;
+mod channel;
 mod config;
-mod mux;
-mod proxy;
-mod stat;
+mod tunnel;
 
 use clap::{App, Arg};
-use futures::future::{self};
-use futures::prelude::*;
+use config::Config;
+use futures::FutureExt;
 use std::fs::File;
-use std::time::Duration;
+use std::io::Read;
 
-use tokio::runtime::Runtime;
-use tokio::timer::Interval;
+use std::error::Error;
 
-use flexi_logger::{opt_format, LogTarget, Logger};
-// use simplelog::Config as LogConfig;
-// use simplelog::{CombinedLogger, LevelFilter, TermLogger, TerminalMode, WriteLogger};
-
-fn main() {
+#[tokio::main]
+pub async fn main() -> Result<(), Box<dyn Error>> {
     let matches = App::new("rsnova")
         .version("0.1.0")
         .author("yinqiwen<yinqiwen@gmail.com>")
@@ -69,220 +25,81 @@ fn main() {
             Arg::with_name("config")
                 .short("c")
                 .long("config")
+                .default_value("./rsnova.toml")
                 .value_name("FILE")
                 .help("Sets a custom config file")
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("listen")
-                .short("l")
-                .long("listen")
-                .value_name("ADDRESS")
-                .help("Listen address")
-                .multiple(true)
-                .takes_value(true),
+            Arg::with_name("client")
+                .long("client")
+                .help("Launch as client mode")
+                .takes_value(false)
+                .multiple(false)
+                .conflicts_with("server"),
         )
         .arg(
             Arg::with_name("server")
-                .short("s")
                 .long("server")
-                .value_name("ADDRESS")
-                .help("Server address")
-                .multiple(true)
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("local")
-                .short("L")
-                .long("local")
+                .help("Launch as server mode")
                 .takes_value(false)
-                .help("Launch as local mode")
                 .multiple(false)
-                .conflicts_with("remote"),
-        )
-        .arg(
-            Arg::with_name("remote")
-                .short("R")
-                .long("remote")
-                .takes_value(false)
-                .help("Launch as remote mode")
-                .multiple(false)
-                .conflicts_with("local"),
-        )
-        .arg(
-            Arg::with_name("logdir")
-                .long("logdir")
-                .takes_value(true)
-                .help("log dir destination")
-                .multiple(false),
-        )
-        .arg(
-            Arg::with_name("logtostderr")
-                .long("logtostderr")
-                .help("log to stderr")
-                .takes_value(false)
-                .multiple(false),
-        )
-        .arg(
-            Arg::with_name("proxy")
-                .long("proxy")
-                .help("Proxy setting")
-                .default_value("")
-                .multiple(false),
-        )
-        .arg(
-            Arg::with_name("transparent")
-                .long("transparent")
-                .help("Serving as transparent tcp proxy.")
-                .multiple(false),
-        )
-        .arg(
-            Arg::with_name("debug")
-                .short("d")
-                .long("debug")
-                .help("Enable debug mode")
-                .multiple(false),
-        )
-        .arg(
-            Arg::with_name("key")
-                .short("k")
-                .long("key")
-                .help("Default cipher key")
-                .default_value("a3ac5c834538c8ee421610ab78f2f4c2")
-                .multiple(false),
-        )
-        .arg(
-            Arg::with_name("method")
-                .short("m")
-                .long("method")
-                .help("Default cipher method")
-                .default_value("chacha20poly1305")
-                .multiple(false),
-        )
-        .arg(
-            Arg::with_name("period_dump")
-                .long("period_dump")
-                .help("Period dump log secs")
-                .default_value("30")
-                .multiple(false),
+                .conflicts_with("client"),
         )
         .get_matches();
-
-    //let logs: Vec<_> = matches.values_of("log").unwrap().collect();
-
-    //let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = Vec::new();
-    let mut log_level = String::from("info");
-    if matches.occurrences_of("debug") == 1 {
-        log_level = String::from("debug");
-    }
-    let mut logger = flexi_logger::Logger::with_str(log_level.as_str());
-    match matches.value_of("logdir") {
-        None => {
-            logger = logger.log_target(LogTarget::DevNull);
-        }
-        Some(dir) => {
-            logger = logger
-                .log_to_file()
-                .rotate(
-                    flexi_logger::Criterion::Size(1024 * 1024),
-                    flexi_logger::Naming::Numbers,
-                    flexi_logger::Cleanup::KeepLogFiles(10),
-                )
-                .directory(dir)
-                .format(opt_format);
-        }
-    }
-    if matches.occurrences_of("logtostderr") == 1 {
+    let confile_name = matches.value_of("config").unwrap();
+    let mut confile = match File::open(matches.value_of("config").unwrap()) {
+        Ok(f) => f,
+        Err(e) => panic!("Error occurred opening file: {} - Err: {}", confile_name, e),
+    };
+    let mut confstr = String::new();
+    match confile.read_to_string(&mut confstr) {
+        Ok(s) => s,
+        Err(e) => panic!("Error Reading file: {}", e),
+    };
+    let cfg: Config = toml::from_str(confstr.as_str()).unwrap();
+    let mut logger = flexi_logger::Logger::with_str(cfg.log.level.as_str());
+    if !cfg.log.logdir.is_empty() {
         logger = logger
-            .duplicate_to_stderr(flexi_logger::Duplicate::Info)
-            .format_for_stderr(flexi_logger::colored_opt_format);
+            .log_to_file()
+            .rotate(
+                flexi_logger::Criterion::Size(1024 * 1024),
+                flexi_logger::Naming::Numbers,
+                flexi_logger::Cleanup::KeepLogFiles(10),
+            )
+            .directory(cfg.log.logdir)
+            .format(flexi_logger::colored_opt_format);
     }
-
+    if cfg.log.logtostderr {
+        logger = logger.duplicate_to_stderr(flexi_logger::Duplicate::Info);
+    }
     logger.start().unwrap();
-    //CombinedLogger::init(loggers).unwrap();
-    config::set_local_transparent(matches.is_present("transparent"));
-
-    let period_dump_secs =
-        value_t!(matches.value_of("period_dump"), u64).unwrap_or_else(|e| e.exit());
-
-    let mut proxy = String::new();
-    if let Some(v) = matches.value_of("proxy") {
-        proxy = String::from(v);
+    let client_mode = matches.is_present("client");
+    let server_mode = matches.is_present("server");
+    if !client_mode && !server_mode {
+        //return Err(std::io::Error::new(ErrorKind::Other, "Need specify 'client' or 'server'."))
+        panic!("Need specify 'client' or 'server'.");
     }
-
-    if let Some(v) = matches.value_of("key") {
-        config::set_default_cipher_key(v);
-    }
-    if let Some(v) = matches.value_of("method") {
-        config::set_default_cipher_method(v);
-    }
-
-    // Create the runtime
-    let mut rt = Runtime::new().unwrap();
-    // You can see how many times a particular flag or argument occurred
-    // Note, only flags can have multiple occurrences
-    let listens: Vec<_> = matches.values_of("listen").unwrap().collect();
-
-    match matches.occurrences_of("local") {
-        0 => {
-            info!("local mode is off");
-        }
-        1 => {
-            info!("local mode is on");
-            for l in &listens {
-                let laddr = String::from(*l);
-                rt.spawn(future::lazy(move || {
-                    proxy::local::start_local_server(laddr.as_str());
-                    Ok(())
-                }));
+    for c in cfg.tunnel {
+        info!("Start rsnova client at {} ", c.listen);
+        let handle = tunnel::start_local_server(c).map(|r| {
+            if let Err(e) = r {
+                error!("Failed to start server; error={}", e);
             }
-        }
-        _ => info!("Don't be crazy"),
-    }
-
-    match matches.occurrences_of("remote") {
-        0 => {
-            info!("remote mode is off");
-        }
-        1 => {
-            info!("remote mode is on");
-            for l in &listens {
-                let laddr = String::from(*l);
-                rt.spawn(future::lazy(move || {
-                    mux::init_remote_mux_server(&laddr);
-                    Ok(())
-                }));
-            }
-        }
-        _ => info!("Don't be crazy"),
-    }
-
-    match matches.values_of("server") {
-        None => {
-            warn!("no remote server configured.");
-        }
-        Some(ss) => {
-            let servers: Vec<_> = ss.collect();
-            for s in &servers {
-                config::add_channel_config(*s, proxy.as_str());
-            }
-            rt.spawn(future::lazy(|| {
-                mux::init_local_mux_channels(&config::get_config().lock().unwrap().local.channels);
-                Ok(())
-            }));
-        }
-    }
-
-    let interval = Interval::new_interval(Duration::from_secs(period_dump_secs));
-    let routine = interval
-        .for_each(|_| {
-            stat::dump_stat();
-            Ok(())
-        })
-        .map_err(|e| {
-            error!("routine task error:{}", e);
         });
-    rt.spawn(routine);
+        tokio::spawn(handle);
+    }
 
-    rt.shutdown_on_idle().wait().unwrap();
+    // Open a TCP stream to the socket address.
+    //
+    // Note that this is the Tokio TcpStream, which is fully async.
+    // let mut stream = TcpStream::connect("127.0.0.1:6142").await?;
+    // println!("created stream");
+
+    // let result = stream.write(b"hello world\n").await;
+    // println!("wrote to stream; success={:?}", result.is_ok());
+    let wait = std::time::Duration::from_secs(10_000_000);
+    std::thread::sleep(wait);
+
+    Ok(())
 }
