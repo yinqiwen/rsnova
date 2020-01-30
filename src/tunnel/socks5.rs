@@ -1,15 +1,12 @@
-use super::local::make_error;
-use super::relay::relay;
+use super::relay::relay_connection;
+use crate::utils::make_error;
 
+use crate::config::TunnelConfig;
 use std::error::Error;
-use std::io::Read;
-use std::net::Shutdown;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-
-use crate::channel::get_channel_stream;
 
 mod v5 {
     pub const VERSION: u8 = 5;
@@ -49,7 +46,11 @@ fn name_port(addr_buf: &[u8]) -> Option<String> {
     Some(format!("{}:{}", hostname, port))
 }
 
-pub async fn handle_socks5(tunnel_id: u32, mut inbound: TcpStream) -> Result<(), Box<dyn Error>> {
+pub async fn handle_socks5(
+    tunnel_id: u32,
+    mut inbound: TcpStream,
+    cfg: &TunnelConfig,
+) -> Result<(), Box<dyn Error>> {
     //let mut peek_buf = Vec::new();
     let mut num_methods_buf = [0u8; 2];
     inbound.read_exact(&mut num_methods_buf).await?;
@@ -133,13 +134,6 @@ pub async fn handle_socks5(tunnel_id: u32, mut inbound: TcpStream) -> Result<(),
         inbound.local_addr().unwrap(),
         inbound.peer_addr().unwrap()
     );
-    let (mut ri, mut wi) = inbound.split();
-    let mut remote = get_channel_stream(String::from("direct"), target_addr).await?;
-    {
-        let (mut ro, mut wo) = remote.split();
-        relay(tunnel_id, &mut ri, &mut wi, &mut ro, &mut wo).await?;
-    }
-    inbound.shutdown(Shutdown::Both);
-    remote.close();
+    relay_connection(tunnel_id, inbound, cfg, target_addr, Vec::new()).await?;
     Ok(())
 }

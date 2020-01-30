@@ -1,11 +1,9 @@
 use super::ChannelStream;
 
-use futures::future::select;
-use std::error::Error;
 use std::net::Shutdown;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 struct DirectChannelStream {
     pub conn: TcpStream,
@@ -27,20 +25,20 @@ impl ChannelStream for DirectChannelStream {
         let (r, w) = self.conn.split();
         (Box::new(r), Box::new(w))
     }
-    fn close(&self) -> std::io::Result<()> {
+    fn close(&mut self) -> std::io::Result<()> {
         self.conn.shutdown(Shutdown::Both)
     }
 }
 
 pub async fn get_direct_stream(
     addr: String,
-) -> Result<Box<dyn ChannelStream + Send>, Box<dyn Error>> {
+) -> Result<Box<dyn ChannelStream + Send>, std::io::Error> {
     let conn = TcpStream::connect(&addr);
     let dur = std::time::Duration::from_secs(3);
     let s = tokio::time::timeout(dur, conn).await?;
 
     match s {
         Ok(c) => Ok(Box::new(DirectChannelStream::new(c))),
-        Err(e) => Err(Box::new(e)),
+        Err(e) => Err(e),
     }
 }

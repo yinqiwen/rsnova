@@ -3,9 +3,17 @@
 #[macro_use]
 extern crate log;
 
+#[macro_use]
+extern crate lazy_static;
+
+#[macro_use]
+extern crate futures;
+
 mod channel;
 mod config;
+mod rmux;
 mod tunnel;
+mod utils;
 
 use clap::{App, Arg};
 use config::Config;
@@ -29,22 +37,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 .value_name("FILE")
                 .help("Sets a custom config file")
                 .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("client")
-                .long("client")
-                .help("Launch as client mode")
-                .takes_value(false)
-                .multiple(false)
-                .conflicts_with("server"),
-        )
-        .arg(
-            Arg::with_name("server")
-                .long("server")
-                .help("Launch as server mode")
-                .takes_value(false)
-                .multiple(false)
-                .conflicts_with("client"),
         )
         .get_matches();
     let confile_name = matches.value_of("config").unwrap();
@@ -74,15 +66,16 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         logger = logger.duplicate_to_stderr(flexi_logger::Duplicate::Info);
     }
     logger.start().unwrap();
-    let client_mode = matches.is_present("client");
-    let server_mode = matches.is_present("server");
-    if !client_mode && !server_mode {
-        //return Err(std::io::Error::new(ErrorKind::Other, "Need specify 'client' or 'server'."))
-        panic!("Need specify 'client' or 'server'.");
-    }
+    // let client_mode = matches.is_present("client");
+    // let server_mode = matches.is_present("server");
+    // if !client_mode && !server_mode {
+    //     //return Err(std::io::Error::new(ErrorKind::Other, "Need specify 'client' or 'server'."))
+    //     panic!("Need specify 'client' or 'server'.");
+    // }
+
     for c in cfg.tunnel {
         info!("Start rsnova client at {} ", c.listen);
-        let handle = tunnel::start_local_server(c).map(|r| {
+        let handle = tunnel::start_tunnel_server(c).map(|r| {
             if let Err(e) = r {
                 error!("Failed to start server; error={}", e);
             }
@@ -98,8 +91,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 
     // let result = stream.write(b"hello world\n").await;
     // println!("wrote to stream; success={:?}", result.is_ok());
-    let wait = std::time::Duration::from_secs(10_000_000);
-    std::thread::sleep(wait);
+    channel::routine_channels(cfg.channel).await;
 
     Ok(())
 }

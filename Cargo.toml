@@ -21,7 +21,7 @@ tokio = { version = "0.2.0",  features = ["full"] }
 tokio-io-timeout = "0.3.1"
 #tokio-sync="0.1"
 #tokio-sync="0.1"
-bytes = "0.4"
+bytes = "0.5"
 futures = "0.3"
 #futures-preview = "=0.3.0-alpha.17"
 httparse = "1.0"
@@ -39,5 +39,8 @@ unicase = "2.4"
 #trust-dns = "0.16"
 ring = "0.14"
 crc = "^1.0.0"
+regex = "1"
 #lz4-compress="0.1"
+
+
 

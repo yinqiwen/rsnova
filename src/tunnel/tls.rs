@@ -1,14 +1,13 @@
-use super::local::make_error;
-use super::relay::relay;
+use super::relay::relay_connection;
+use crate::utils::make_error;
 
 use std::error::Error;
-use std::io::Read;
-use std::net::Shutdown;
+
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+
 use tokio::net::TcpStream;
 
-use crate::channel::get_channel_stream;
+use crate::config::TunnelConfig;
 
 pub fn valid_tls_version(buf: &[u8]) -> bool {
     if buf.len() < 3 {
@@ -118,20 +117,16 @@ pub async fn peek_sni(inbound: &mut TcpStream) -> Result<(String, Vec<u8>), Box<
     }
 }
 
-pub async fn handle_tls(tunnel_id: u32, mut inbound: TcpStream) -> Result<(), Box<dyn Error>> {
+pub async fn handle_tls(
+    tunnel_id: u32,
+    mut inbound: TcpStream,
+    cfg: &TunnelConfig,
+) -> Result<(), Box<dyn Error>> {
     let (sni, peek_buf) = peek_sni(&mut inbound).await?;
     let mut target = sni;
     target.push_str(":443");
 
     info!("[{}]Handle TLS proxy to {}", tunnel_id, target);
-    let (mut ri, mut wi) = inbound.split();
-    let mut remote = get_channel_stream(String::from("direct"), target).await?;
-    {
-        let (mut ro, mut wo) = remote.split();
-        wo.write_all(&peek_buf).await?;
-        relay(tunnel_id, &mut ri, &mut wi, &mut ro, &mut wo).await?;
-    }
-    inbound.shutdown(Shutdown::Both);
-    remote.close();
+    relay_connection(tunnel_id, inbound, cfg, target, peek_buf).await?;
     Ok(())
 }
