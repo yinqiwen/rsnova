@@ -23,7 +23,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 lazy_static! {
     static ref CHANNEL_SESSIONS: Mutex<ChannelSessionManager> =
@@ -51,8 +51,8 @@ struct ChannelMuxSession {
 }
 
 pub struct MuxSessionState {
-    last_ping_send_time: AtomicI64,
-    last_pong_recv_time: AtomicI64,
+    last_ping_send_time: AtomicU32,
+    last_pong_recv_time: AtomicU32,
     pub born_time: Instant,
     retired: AtomicBool,
 }
@@ -62,12 +62,12 @@ impl MuxSessionState {
         let t1 = self.last_ping_send_time.load(Ordering::SeqCst);
         let t2 = self.last_pong_recv_time.load(Ordering::SeqCst);
         if t1 > 0 && t2 > 0 {
-            return t2 - t1;
+            return t2 as i64 - t1 as i64;
         }
         0
     }
     fn is_retired(&self) -> bool {
-        return self.retired.load(Ordering::SeqCst);
+        self.retired.load(Ordering::SeqCst)
     }
 }
 
@@ -192,7 +192,7 @@ pub async fn routine_all_sessions() {
                             SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
-                                .as_secs() as i64,
+                                .as_secs() as u32,
                             Ordering::SeqCst,
                         );
                         if s.max_alive_secs > 0 {
@@ -382,8 +382,8 @@ pub async fn handle_rmux_session(
 
     let seed = if channel.is_empty() { 2 } else { 1 };
     let session_state = MuxSessionState {
-        last_ping_send_time: AtomicI64::new(0),
-        last_pong_recv_time: AtomicI64::new(0),
+        last_ping_send_time: AtomicU32::new(0),
+        last_pong_recv_time: AtomicU32::new(0),
         born_time: Instant::now(),
         retired: AtomicBool::new(false),
     };
@@ -522,7 +522,7 @@ pub async fn handle_rmux_session(
                             SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
-                                .as_secs() as i64,
+                                .as_secs() as u32,
                             Ordering::SeqCst,
                         );
                     }

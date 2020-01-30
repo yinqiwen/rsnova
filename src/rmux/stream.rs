@@ -5,7 +5,7 @@ use super::session::report_update_window;
 use bytes::BytesMut;
 use std::error::Error;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
@@ -24,8 +24,8 @@ pub struct MuxStreamState {
     pub send_buf_window: AtomicI32,
     pub recv_buf_size: AtomicI32,
     pub closed: AtomicBool,
-    pub total_recv_bytes: AtomicI64,
-    pub total_send_bytes: AtomicI64,
+    pub total_recv_bytes: AtomicU32,
+    pub total_send_bytes: AtomicU32,
     pub born_time: Instant,
 }
 
@@ -54,7 +54,7 @@ fn inc_recv_buf_window(state: &MuxStreamState, inc: usize, cx: &mut Context<'_>)
     state.recv_buf_size.fetch_add(inc as i32, Ordering::SeqCst);
     state
         .total_recv_bytes
-        .fetch_add(inc as i64, Ordering::SeqCst);
+        .fetch_add(inc as u32, Ordering::SeqCst);
     let min_report_window: i32 = 32 * 1024;
     let current_recv_buf_size = state.recv_buf_size.load(Ordering::SeqCst);
     if current_recv_buf_size >= min_report_window
@@ -175,7 +175,7 @@ impl AsyncWrite for MuxStreamWriter {
                 // );
                 state
                     .total_send_bytes
-                    .fetch_add(buf.len() as i64, Ordering::SeqCst);
+                    .fetch_add(buf.len() as u32, Ordering::SeqCst);
                 Poll::Ready(Ok(buf.len()))
             }
         }
@@ -216,8 +216,8 @@ impl MuxStream {
             send_buf_window: AtomicI32::new(128 * 1024),
             recv_buf_size: AtomicI32::new(0),
             closed: AtomicBool::new(false),
-            total_recv_bytes: AtomicI64::new(0),
-            total_send_bytes: AtomicI64::new(0),
+            total_recv_bytes: AtomicU32::new(0),
+            total_send_bytes: AtomicU32::new(0),
             born_time: Instant::now(),
         };
         let (dtx, drx) = mpsc::channel(16);
