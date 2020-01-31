@@ -1,0 +1,16 @@
+[log]
+logtostderr = true
+level = "info"
+logdir = "./"
+
+[[tunnel]]
+listen = "127.0.0.1:48100"
+pac=[{host = ".*", channel = "rmux"}]
+
+[[channel]]
+name = "rmux"
+url = "127.0.0.1:48101"
+ping_interval_sec = 10
+conns_per_host = 5
+max_alive_mins = 40
+cipher = {key="abcdefg", method = "chacha20poly1305"}

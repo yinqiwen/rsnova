@@ -3,7 +3,6 @@ logtostderr = true
 level = "info"
 logdir = "./"
 
-[common]
 
 [[tunnel]]
 listen = "rmux://127.0.0.1:48100"
