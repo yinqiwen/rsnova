@@ -8,9 +8,12 @@ listen = "127.0.0.1:48100"
 pac=[{host = ".*", channel = "rmux"}]
 
 [[channel]]
+# name of current channel
 name = "rmux"
+# host & port of server
 url = "127.0.0.1:48101"
 ping_interval_sec = 10
 conns_per_host = 5
 max_alive_mins = 40
+# cipher to communicate with server
 cipher = {key="abcdefg", method = "chacha20poly1305"}

@@ -3,9 +3,10 @@ logtostderr = true
 level = "info"
 logdir = "./"
 
-[common]
 
 [[tunnel]]
+# listen address of tunnel server
 listen = "rmux://127.0.0.1:48101"
+# pac rule to relay traffic, 'direct' is special channel which relay direct to remote target server
 pac=[{host = ".*", channel = "direct"}]
 cipher = {key="abcdefg", method = "chacha20poly1305"}
