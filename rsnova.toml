@@ -1,9 +1,0 @@
-[log]
-logtostderr = true
-level = "info"
-logdir = "./"
-
-
-[[tunnel]]
-listen = "rmux://127.0.0.1:48100"
-pac=[{host = "*", channel = "direct"}]
