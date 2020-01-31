@@ -1,9 +1,12 @@
+use bytes::Bytes;
+use bytes::BytesMut;
 use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::TcpStream;
 
 pub fn make_error(desc: &str) -> Box<dyn Error> {
     Box::new(std::io::Error::new(std::io::ErrorKind::Other, desc))
@@ -83,6 +86,23 @@ where
                 ready!(Pin::new(&mut *me.writer).poll_flush(cx))?;
                 return Poll::Ready(Ok(self.amt));
             }
+        }
+    }
+}
+
+pub async fn read_until_separator(
+    stream: &mut TcpStream,
+    separator: &str,
+) -> Result<(Bytes, Bytes), std::io::Error> {
+    let mut buf = BytesMut::with_capacity(1024);
+
+    loop {
+        buf.reserve(1024);
+        stream.read_buf(&mut buf).await?;
+        if let Some(pos) = twoway::find_bytes(&buf, separator.as_bytes()) {
+            let wsize = separator.len();
+            let body = buf.split_off(pos + wsize);
+            return Ok((buf.freeze(), body.freeze()));
         }
     }
 }

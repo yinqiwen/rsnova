@@ -1,6 +1,5 @@
-use super::io::read_until_separator;
 use super::relay::{relay_connection, relay_stream};
-use crate::utils::make_error;
+use crate::utils::{make_error, read_until_separator};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use httparse::Status;
@@ -372,18 +371,6 @@ impl<T: AsyncRead + ?Sized + Unpin> AsyncRead for HttpReader<'_, T> {
     }
 }
 
-pub fn is_ok_response(buf: &[u8]) -> bool {
-    let mut headers = [httparse::EMPTY_HEADER; 32];
-    let mut res = httparse::Response::new(&mut headers);
-    match res.parse(buf) {
-        Ok(Status::Complete(_)) => {
-            //info!("code is {}", res.code.unwrap());
-            res.code.unwrap() < 300
-        }
-        _ => false,
-    }
-}
-
 pub async fn handle_http(
     tunnel_id: u32,
     mut inbound: TcpStream,
@@ -407,9 +394,12 @@ pub async fn handle_http(
             target = remote;
         }
     }
+    if target.find(':').is_none() {
+        target.push_str(":80");
+    }
     info!("[{}]Handle HTTP proxy to {} ", tunnel_id, target);
     relay_stream(tunnel_id, &mut hreader, &mut wi, target, cfg, Vec::new()).await?;
-    inbound.shutdown(Shutdown::Both);
+    let _ = inbound.shutdown(Shutdown::Both);
     Ok(())
 }
 

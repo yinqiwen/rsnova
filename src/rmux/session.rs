@@ -200,10 +200,12 @@ pub async fn routine_all_sessions() {
                                 let mut rng = rand::thread_rng();
                                 rng.gen_range(-60, 60)
                             };
+                            let session_id = s.id;
                             let cmp_secs = s.max_alive_secs as i64 + rand_inc;
                             if s.state.born_time.elapsed().as_secs() > cmp_secs as u64 {
                                 s.state.retired.store(true, Ordering::SeqCst);
                                 retired.push(session.take().unwrap());
+                                csession.session_ids.remove(&session_id);
                             }
                         }
                     }
@@ -252,6 +254,7 @@ pub async fn create_stream(
                     stream = Some(pendding_stream);
                     ev = Some(cev);
                     ev_sender = Some(session.event_tx.clone());
+                    break;
                 }
             }
         }
@@ -261,7 +264,7 @@ pub async fn create_stream(
         let _ = ev_sender.unwrap().send(ev.unwrap()).await;
         return Ok(stream.unwrap());
     }
-    Err(make_io_error("not channel found."))
+    Err(make_io_error("no channel found."))
 }
 
 pub fn report_update_window(

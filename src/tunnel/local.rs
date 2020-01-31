@@ -1,10 +1,11 @@
 use super::http::handle_http;
 use super::http::handle_https;
+use super::relay::relay_connection;
 use super::rmux::handle_rmux;
 use super::socks5::handle_socks5;
 use super::tls::handle_tls;
 use super::tls::valid_tls_version;
-use crate::utils::make_error;
+use crate::utils::{get_origin_dst, make_error};
 
 use futures::FutureExt;
 use std::error::Error;
@@ -64,7 +65,14 @@ async fn handle_inbound(
             }
         };
     }
-
+    if let Some(dst) = get_origin_dst(&inbound) {
+        let target = format!("{}:{}", dst.ip().to_string(), dst.port());
+        let relay = async move {
+            let _ = relay_connection(tunnel_id, inbound, &cfg, target, Vec::new()).await;
+        };
+        tokio::spawn(relay);
+        return Ok(());
+    }
     Ok(())
 }
 

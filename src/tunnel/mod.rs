@@ -1,5 +1,4 @@
 mod http;
-mod io;
 mod local;
 mod relay;
 mod rmux;

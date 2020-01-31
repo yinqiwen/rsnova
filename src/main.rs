@@ -66,12 +66,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         logger = logger.duplicate_to_stderr(flexi_logger::Duplicate::Info);
     }
     logger.start().unwrap();
-    // let client_mode = matches.is_present("client");
-    // let server_mode = matches.is_present("server");
-    // if !client_mode && !server_mode {
-    //     //return Err(std::io::Error::new(ErrorKind::Other, "Need specify 'client' or 'server'."))
-    //     panic!("Need specify 'client' or 'server'.");
-    // }
 
     for c in cfg.tunnel {
         info!("Start rsnova client at {} ", c.listen);
@@ -83,14 +77,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(handle);
     }
 
-    // Open a TCP stream to the socket address.
-    //
-    // Note that this is the Tokio TcpStream, which is fully async.
-    // let mut stream = TcpStream::connect("127.0.0.1:6142").await?;
-    // println!("created stream");
-
-    // let result = stream.write(b"hello world\n").await;
-    // println!("wrote to stream; success={:?}", result.is_ok());
     channel::routine_channels(cfg.channel).await;
 
     Ok(())
