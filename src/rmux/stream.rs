@@ -141,13 +141,6 @@ impl AsyncWrite for MuxStreamWriter {
             state,
             io_state,
         } = &mut *self;
-        // error!(
-        //     "[{}]################send window {} {} {}",
-        //     state.stream_id,
-        //     state.send_buf_window.load(Ordering::SeqCst),
-        //     buf.len(),
-        //     state.closed.load(Ordering::SeqCst),
-        // );
         if state.closed.load(Ordering::SeqCst) {
             return Poll::Ready(Err(make_io_error("closed")));
         }
@@ -167,12 +160,6 @@ impl AsyncWrite for MuxStreamWriter {
                 state
                     .send_buf_window
                     .fetch_sub(buf.len() as i32, Ordering::SeqCst);
-                // error!(
-                //     "[{}]################after write {} byte, window {}",
-                //     state.stream_id,
-                //     buf.len(),
-                //     n,
-                // );
                 state
                     .total_send_bytes
                     .fetch_add(buf.len() as u32, Ordering::SeqCst);
@@ -187,7 +174,6 @@ impl AsyncWrite for MuxStreamWriter {
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        //error!("[{}]################shutdown", self.state.stream_id);
         self.state.closed.store(true, Ordering::SeqCst);
         Poll::Ready(Ok(()))
     }

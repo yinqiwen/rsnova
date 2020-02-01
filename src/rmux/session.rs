@@ -18,10 +18,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -45,7 +46,7 @@ impl ChannelSessionManager {
 }
 
 struct ChannelMuxSession {
-    session_ids: HashMap<u32, usize>,
+    //session_ids: HashMap<u32, usize>,
     sessions: Vec<Option<MuxSession>>,
     cursor: AtomicU32,
 }
@@ -55,6 +56,8 @@ pub struct MuxSessionState {
     last_pong_recv_time: AtomicU32,
     pub born_time: Instant,
     retired: AtomicBool,
+    io_active_unix_secs: AtomicU32,
+    closed: AtomicBool,
 }
 
 impl MuxSessionState {
@@ -69,6 +72,16 @@ impl MuxSessionState {
     fn is_retired(&self) -> bool {
         self.retired.load(Ordering::SeqCst)
     }
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+    fn get_io_idle_secs(&self, now_unix_secs: u32) -> u32 {
+        let secs = self.io_active_unix_secs.load(Ordering::SeqCst);
+        if secs == 0 {
+            return 0;
+        }
+        now_unix_secs - secs
+    }
 }
 
 pub struct MuxSession {
@@ -81,12 +94,12 @@ pub struct MuxSession {
     //streams: HashMap<u32, MuxStream>,
 }
 
-fn store_mux_session(channel: &str, sid: u32, session: MuxSession) {
+fn store_mux_session(channel: &str, session: MuxSession) {
     let cmap = &mut CHANNEL_SESSIONS.lock().unwrap().channels;
     //info!("{}0 store cmap size:{}", channel, cmap.len());
     if cmap.get_mut(channel).is_none() {
         let csession = ChannelMuxSession {
-            session_ids: HashMap::new(),
+            //session_ids: HashMap::new(),
             sessions: Vec::new(),
             cursor: AtomicU32::new(0),
         };
@@ -94,35 +107,34 @@ fn store_mux_session(channel: &str, sid: u32, session: MuxSession) {
     }
     //info!("{}1 store cmap size:{}", channel, cmap.len());
     if let Some(csession) = cmap.get_mut(channel) {
-        // info!(
-        //     "{}2 store cession size:{}",
-        //     channel,
-        //     csession.session_ids.len()
-        // );
-        for (idx, s) in csession.sessions.iter_mut().enumerate() {
+        for s in csession.sessions.iter_mut() {
             if s.is_none() {
                 *s = Some(session);
-                csession.session_ids.insert(sid, idx);
+                //csession.session_ids.insert(sid, idx);
                 return;
             }
         }
         csession.sessions.push(Some(session));
-        csession
-            .session_ids
-            .insert(sid, csession.sessions.len() - 1);
-        // info!(
-        //     "{}3 store cession size:{}",
-        //     channel,
-        //     csession.session_ids.len()
-        // );
     }
 }
 
 fn erase_mux_session(channel: &str, sid: u32) {
-    let cmap = &mut CHANNEL_SESSIONS.lock().unwrap().channels;
+    let mut holder = CHANNEL_SESSIONS.lock().unwrap();
+    let cmap = &mut holder.channels;
     if let Some(csession) = cmap.get_mut(channel) {
-        if let Some(idx) = csession.session_ids.remove(&sid) {
-            csession.sessions[idx] = None;
+        for s in csession.sessions.iter_mut() {
+            if let Some(ss) = s {
+                if ss.id == sid {
+                    let _ = s.take();
+                    return;
+                }
+            }
+        }
+    }
+    for i in 0..holder.retired.len() {
+        if holder.retired[i].id == sid {
+            holder.retired.remove(i);
+            return;
         }
     }
 }
@@ -130,14 +142,16 @@ fn erase_mux_session(channel: &str, sid: u32) {
 fn hanle_pendding_mux_streams(channel: &str, sid: u32, streams: &mut HashMap<u32, MuxStream>) {
     let cmap = &mut CHANNEL_SESSIONS.lock().unwrap().channels;
     if let Some(csession) = cmap.get_mut(channel) {
-        if let Some(idx) = csession.session_ids.get(&sid) {
-            let tmp = csession.sessions.as_mut_slice();
-            let session = tmp[*idx].as_mut().unwrap();
-            loop {
-                if let Some(s) = session.pendding_streams.pop() {
-                    streams.insert(s.id(), s);
-                } else {
-                    return;
+        for cs in csession.sessions.iter_mut() {
+            if let Some(ss) = cs {
+                if ss.id == sid {
+                    loop {
+                        if let Some(s) = ss.pendding_streams.pop() {
+                            streams.insert(s.id(), s);
+                        } else {
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -147,9 +161,14 @@ fn hanle_pendding_mux_streams(channel: &str, sid: u32, streams: &mut HashMap<u32
 pub fn get_channel_session_size(channel: &str) -> usize {
     let cmap = &mut CHANNEL_SESSIONS.lock().unwrap().channels;
     //info!("{}1 cmap size:{}", channel, cmap.len());
+    let mut len: usize = 0;
     if let Some(csession) = cmap.get_mut(channel) {
-        //info!("{}2 csession size:{}", channel, csession.session_ids.len());
-        return csession.session_ids.len();
+        for s in csession.sessions.iter() {
+            if let Some(_ss) = s {
+                len += 1;
+            }
+        }
+        return len;
     }
     0
 }
@@ -188,31 +207,28 @@ pub async fn routine_all_sessions() {
                     } else {
                         let ping = new_ping_event(0, false);
                         actions.push(RoutineAction::new(ping, s.event_tx.clone()));
-                        s.state.last_ping_send_time.store(
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs() as u32,
-                            Ordering::SeqCst,
-                        );
                         if s.max_alive_secs > 0 {
                             let rand_inc: i64 = {
                                 let mut rng = rand::thread_rng();
                                 rng.gen_range(-60, 60)
                             };
-                            let session_id = s.id;
+                            //let session_id = s.id;
                             let cmp_secs = s.max_alive_secs as i64 + rand_inc;
                             if s.state.born_time.elapsed().as_secs() > cmp_secs as u64 {
                                 s.state.retired.store(true, Ordering::SeqCst);
                                 retired.push(session.take().unwrap());
-                                csession.session_ids.remove(&session_id);
+                                //csession.session_ids.remove(&session_id);
                             }
                         }
                     }
                 }
             }
         }
-        retired.clear();
+        holder.retired.append(&mut retired);
+        for s in holder.retired.iter_mut() {
+            let ping = new_ping_event(0, false);
+            actions.push(RoutineAction::new(ping, s.event_tx.clone()));
+        }
     }
     for action in actions.iter_mut() {
         let ev = action.ev.take().unwrap();
@@ -276,17 +292,19 @@ pub fn report_update_window(
 ) -> bool {
     let cmap = &mut CHANNEL_SESSIONS.lock().unwrap().channels;
     if let Some(csession) = cmap.get_mut(channel) {
-        if let Some(idx) = csession.session_ids.get(&session_id) {
-            if let Some(session) = csession.sessions[*idx].as_mut() {
-                let ev = new_window_update_event(stream_id, window, false);
-                match session.event_tx.poll_ready(cx) {
-                    Poll::Ready(Ok(())) => {}
-                    _ => {
-                        return false;
+        for cs in csession.sessions.iter_mut() {
+            if let Some(ss) = cs {
+                if ss.id == session_id {
+                    let ev = new_window_update_event(stream_id, window, false);
+                    match ss.event_tx.poll_ready(cx) {
+                        Poll::Ready(Ok(())) => {}
+                        _ => {
+                            return false;
+                        }
                     }
-                }
-                if let Ok(()) = session.event_tx.try_send(ev) {
-                    return true;
+                    if let Ok(()) = ss.event_tx.try_send(ev) {
+                        return true;
+                    }
                 }
             }
         }
@@ -369,6 +387,57 @@ fn get_streams_stat_info(streams: &mut HashMap<u32, MuxStream>) -> String {
     info
 }
 
+fn log_session_state(
+    sid: u32,
+    streams: &mut HashMap<u32, MuxStream>,
+    now_unix_secs: u32,
+    session_state: &Arc<MuxSessionState>,
+) -> u32 {
+    let mut stat_info = format!(
+        "\n========================Session:{}====================\n",
+        sid
+    );
+    stat_info.push_str(format!("Streams:{}\n", streams.len()).as_str());
+    stat_info.push_str(format!("Age:{:?}\n", session_state.born_time.elapsed()).as_str());
+    stat_info.push_str(format!("PingPongGap:{}\n", session_state.ping_pong_gap()).as_str());
+    let idle_secs = session_state.get_io_idle_secs(now_unix_secs);
+    stat_info.push_str(format!("IOIdleSecs:{}\n", idle_secs).as_str());
+    stat_info.push_str(format!("Retired:{}\n", session_state.is_retired()).as_str());
+    stat_info.push_str(format!("Closed:{}\n", session_state.is_closed()).as_str());
+    stat_info.push_str(get_streams_stat_info(streams).as_str());
+    warn!("{}", stat_info);
+    idle_secs
+}
+
+fn handle_ping_event(
+    sid: u32,
+    streams: &mut HashMap<u32, MuxStream>,
+    session_state: &Arc<MuxSessionState>,
+    is_remote: bool,
+) -> bool {
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let idle_io_secs = log_session_state(sid, streams, now_unix_secs, &session_state);
+    if session_state.is_retired() {
+        if idle_io_secs >= 300 || streams.is_empty() {
+            error!(
+                "[{}]Close session since no data send/recv {} secs ago.",
+                sid, idle_io_secs
+            );
+            session_state.closed.store(true, Ordering::SeqCst);
+        }
+        return false;
+    }
+    if !is_remote {
+        session_state
+            .last_ping_send_time
+            .store(now_unix_secs, Ordering::SeqCst);
+    }
+    true
+}
+
 pub async fn handle_rmux_session(
     channel: &str,
     tunnel_id: u32,
@@ -389,8 +458,12 @@ pub async fn handle_rmux_session(
         last_pong_recv_time: AtomicU32::new(0),
         born_time: Instant::now(),
         retired: AtomicBool::new(false),
+        io_active_unix_secs: AtomicU32::new(0),
+        closed: AtomicBool::new(false),
     };
     let session_state = Arc::new(session_state);
+    let send_session_state = session_state.clone();
+    let recv_session_state = session_state.clone();
     let mux_session = MuxSession {
         id: tunnel_id,
         event_tx: event_tx.clone(),
@@ -404,7 +477,7 @@ pub async fn handle_rmux_session(
         "[{}][{}]Start tunnel session with crypto {} {}",
         channel, tunnel_id, rctx.nonce, rctx.key
     );
-    store_mux_session(channel, tunnel_id, mux_session);
+    store_mux_session(channel, mux_session);
 
     let mut handle_recv_event_tx = event_tx.clone();
     let mut handle_recv_send_tx = send_tx.clone();
@@ -413,15 +486,24 @@ pub async fn handle_rmux_session(
             let recv_event = read_encrypt_event(&mut rctx, &mut ri, recv_buf).await;
             match recv_event {
                 Ok(Some(mut ev)) => {
-                    ev.remote = true;
-                    info!(
-                        "[{}][{}][{}]remote recv event type:{}, len:{}",
-                        channel,
-                        tunnel_id,
-                        ev.header.stream_id,
-                        get_event_type_str(ev.header.flags()),
-                        ev.header.len(),
+                    recv_session_state.io_active_unix_secs.store(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as u32,
+                        Ordering::SeqCst,
                     );
+                    ev.remote = true;
+                    if FLAG_DATA != ev.header.flags() {
+                        info!(
+                            "[{}][{}][{}]remote recv event type:{}, len:{}",
+                            channel,
+                            tunnel_id,
+                            ev.header.stream_id,
+                            get_event_type_str(ev.header.flags()),
+                            ev.header.len(),
+                        );
+                    }
                     let _ = handle_recv_event_tx.send(ev).await;
                 }
                 Ok(None) => {
@@ -443,27 +525,14 @@ pub async fn handle_rmux_session(
     let mut handle_event_send_tx = send_tx.clone();
     let handle_event = async move {
         let mut streams = HashMap::new();
-        loop {
+        while !session_state.closed.load(Ordering::SeqCst) {
             let rev = event_rx.recv().await;
             if let Some(ev) = rev {
-                if FLAG_PING == ev.header.flags() {
-                    let mut stat_info = format!(
-                        "\n========================Session:{}====================\n",
-                        tunnel_id
-                    );
-                    stat_info.push_str(format!("Streams:{}\n", streams.len()).as_str());
-                    stat_info.push_str(
-                        format!("Age:{:?}\n", session_state.born_time.elapsed()).as_str(),
-                    );
-                    stat_info.push_str(
-                        format!("PingPongGap:{}\n", session_state.ping_pong_gap()).as_str(),
-                    );
-                    stat_info
-                        .push_str(format!("Retired:{}\n", session_state.is_retired()).as_str());
-                    stat_info.push_str(get_streams_stat_info(&mut streams).as_str());
-                    warn!("{}", stat_info);
+                if FLAG_PING == ev.header.flags()
+                    && !handle_ping_event(tunnel_id, &mut streams, &session_state, ev.remote)
+                {
+                    continue;
                 }
-
                 if !ev.remote {
                     if FLAG_SHUTDOWN == ev.header.flags() {
                         break;
@@ -476,10 +545,11 @@ pub async fn handle_rmux_session(
                             let _ = stream.close();
                         }
                         if session_state.is_retired() && streams.is_empty() {
+                            session_state.closed.store(true, Ordering::SeqCst);
                             break;
                         }
                     }
-                    let mut buf = BytesMut::new();
+                    let mut buf = BytesMut::with_capacity(ev.body.len() + 64);
                     wctx.encrypt(&ev, &mut buf);
                     let evbuf = buf.to_vec();
                     let _ = send_tx.send(evbuf).await;
@@ -499,6 +569,7 @@ pub async fn handle_rmux_session(
                             let _ = stream.close();
                         }
                         if session_state.is_retired() && streams.is_empty() {
+                            session_state.closed.store(true, Ordering::SeqCst);
                             break;
                         }
                     }
@@ -545,26 +616,31 @@ pub async fn handle_rmux_session(
             }
         }
         error!("[{}][{}]handle_event done", channel, tunnel_id);
+        for (_, stream) in streams.iter_mut() {
+            let _ = stream.close();
+        }
         event_rx.close();
         let _ = handle_event_send_tx.send(Vec::new()).await;
     };
 
-    //let handle_send_event_tx = event_tx.clone();
     let handle_send = async {
         while let Some(data) = send_rx.recv().await {
             if data.is_empty() {
                 break;
             }
-            //error!("Write 1 bytes {}", data.len());
-            //error!("write data:{}", data.len());
             if let Err(e) = wi.write_all(&data[..]).await {
                 error!("Failed to write data with err:{}", e);
                 break;
             }
-            //error!("Write 2 bytes {}", data.len());
+            send_session_state.io_active_unix_secs.store(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as u32,
+                Ordering::SeqCst,
+            );
         }
         error!("[{}][{}]handle_send done", channel, tunnel_id);
-        //t1.unfuse();
         send_rx.close();
         let _ = wi.shutdown().await;
         let shutdown_ev = new_shutdown_event(0, false);
