@@ -46,7 +46,6 @@ impl ChannelSessionManager {
 }
 
 struct ChannelMuxSession {
-    //session_ids: HashMap<u32, usize>,
     sessions: Vec<Option<MuxSession>>,
     cursor: AtomicU32,
 }
@@ -91,7 +90,6 @@ pub struct MuxSession {
     stream_id_seed: AtomicU32,
     state: Arc<MuxSessionState>,
     max_alive_secs: u64,
-    //streams: HashMap<u32, MuxStream>,
 }
 
 fn store_mux_session(channel: &str, session: MuxSession) {
@@ -99,18 +97,15 @@ fn store_mux_session(channel: &str, session: MuxSession) {
     //info!("{}0 store cmap size:{}", channel, cmap.len());
     if cmap.get_mut(channel).is_none() {
         let csession = ChannelMuxSession {
-            //session_ids: HashMap::new(),
             sessions: Vec::new(),
             cursor: AtomicU32::new(0),
         };
         cmap.insert(String::from(channel), csession);
     }
-    //info!("{}1 store cmap size:{}", channel, cmap.len());
     if let Some(csession) = cmap.get_mut(channel) {
         for s in csession.sessions.iter_mut() {
             if s.is_none() {
                 *s = Some(session);
-                //csession.session_ids.insert(sid, idx);
                 return;
             }
         }
@@ -160,7 +155,6 @@ fn hanle_pendding_mux_streams(channel: &str, sid: u32, streams: &mut HashMap<u32
 
 pub fn get_channel_session_size(channel: &str) -> usize {
     let cmap = &mut CHANNEL_SESSIONS.lock().unwrap().channels;
-    //info!("{}1 cmap size:{}", channel, cmap.len());
     let mut len: usize = 0;
     if let Some(csession) = cmap.get_mut(channel) {
         for s in csession.sessions.iter() {
@@ -194,9 +188,6 @@ pub async fn routine_all_sessions() {
         let cmap = &mut holder.channels;
         let mut retired = Vec::new();
         for (channel, csession) in cmap.iter_mut() {
-            if channel.is_empty() {
-                continue;
-            }
             for session in csession.sessions.iter_mut() {
                 if let Some(s) = session {
                     if s.state.ping_pong_gap() < -60 {
@@ -207,7 +198,7 @@ pub async fn routine_all_sessions() {
                     } else {
                         let ping = new_ping_event(0, false);
                         actions.push(RoutineAction::new(ping, s.event_tx.clone()));
-                        if s.max_alive_secs > 0 {
+                        if s.max_alive_secs > 0 && !channel.is_empty() {
                             let rand_inc: i64 = {
                                 let mut rng = rand::thread_rng();
                                 rng.gen_range(-60, 60)
@@ -224,11 +215,11 @@ pub async fn routine_all_sessions() {
                 }
             }
         }
-        holder.retired.append(&mut retired);
         for s in holder.retired.iter_mut() {
             let ping = new_ping_event(0, false);
             actions.push(RoutineAction::new(ping, s.event_tx.clone()));
         }
+        holder.retired.append(&mut retired);
     }
     for action in actions.iter_mut() {
         let ev = action.ev.take().unwrap();
@@ -410,6 +401,7 @@ fn log_session_state(
 }
 
 fn handle_ping_event(
+    is_server: bool,
     sid: u32,
     streams: &mut HashMap<u32, MuxStream>,
     session_state: &Arc<MuxSessionState>,
@@ -420,7 +412,7 @@ fn handle_ping_event(
         .unwrap()
         .as_secs() as u32;
     let idle_io_secs = log_session_state(sid, streams, now_unix_secs, &session_state);
-    if session_state.is_retired() {
+    if session_state.is_retired() || is_server {
         if idle_io_secs >= 300 || streams.is_empty() {
             error!(
                 "[{}]Close session since no data send/recv {} secs ago.",
@@ -451,6 +443,8 @@ pub async fn handle_rmux_session(
     let (mut ri, mut wi) = inbound.split();
     let (mut event_tx, mut event_rx) = mpsc::channel::<Event>(16);
     let (mut send_tx, mut send_rx) = mpsc::channel(16);
+
+    let is_server = channel.is_empty();
 
     let seed = if channel.is_empty() { 2 } else { 1 };
     let session_state = MuxSessionState {
@@ -529,7 +523,13 @@ pub async fn handle_rmux_session(
             let rev = event_rx.recv().await;
             if let Some(ev) = rev {
                 if FLAG_PING == ev.header.flags()
-                    && !handle_ping_event(tunnel_id, &mut streams, &session_state, ev.remote)
+                    && !handle_ping_event(
+                        is_server,
+                        tunnel_id,
+                        &mut streams,
+                        &session_state,
+                        ev.remote,
+                    )
                 {
                     continue;
                 }
@@ -591,7 +591,6 @@ pub async fn handle_rmux_session(
                         let _ = send_tx.send(evbuf).await;
                     }
                     FLAG_PONG => {
-                        //
                         session_state.last_pong_recv_time.store(
                             SystemTime::now()
                                 .duration_since(UNIX_EPOCH)

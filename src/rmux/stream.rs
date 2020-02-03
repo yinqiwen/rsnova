@@ -3,6 +3,7 @@ use super::message::ConnectRequest;
 use super::session::report_update_window;
 
 use bytes::BytesMut;
+use futures::Future;
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -37,7 +38,6 @@ struct SharedIOState {
 
 impl MuxStreamState {
     fn close(&self) {
-        //error!("[{}]####Close", self.stream_id);
         self.closed.store(true, Ordering::SeqCst);
     }
 }
@@ -149,6 +149,22 @@ impl AsyncWrite for MuxStreamWriter {
             return Poll::Pending;
         }
         let ev = new_data_event(state.stream_id, buf, false);
+
+        // let future = tx.send(ev);
+        // pin_mut!(future);
+        // match future.as_mut().poll(cx) {
+        //     Poll::Pending => Poll::Pending,
+        //     Poll::Ready(Err(e)) => Poll::Ready(Err(make_io_error(e.description()))),
+        //     Poll::Ready(Ok(())) => {
+        //         state
+        //             .send_buf_window
+        //             .fetch_sub(buf.len() as i32, Ordering::SeqCst);
+        //         state
+        //             .total_send_bytes
+        //             .fetch_add(buf.len() as u32, Ordering::SeqCst);
+        //         Poll::Ready(Ok(buf.len()))
+        //     }
+        // }
         match tx.poll_ready(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(make_io_error(e.description()))),
