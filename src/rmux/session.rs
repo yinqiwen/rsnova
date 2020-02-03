@@ -411,18 +411,24 @@ fn handle_ping_event(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as u32;
-    let idle_io_secs = log_session_state(sid, streams, now_unix_secs, &session_state);
+    let idle_io_secs = if !is_server {
+        log_session_state(sid, streams, now_unix_secs, &session_state)
+    } else {
+        0
+    };
     if session_state.is_retired() || is_server {
         if idle_io_secs >= 300 || streams.is_empty() {
             error!(
-                "[{}]Close session since no data send/recv {} secs ago.",
-                sid, idle_io_secs
+                "[{}]Close session since no data send/recv {} secs ago, stream count:{}",
+                sid,
+                idle_io_secs,
+                streams.len()
             );
             session_state.closed.store(true, Ordering::SeqCst);
         }
         return false;
     }
-    if !is_remote {
+    if !is_remote && !is_server {
         session_state
             .last_ping_send_time
             .store(now_unix_secs, Ordering::SeqCst);
