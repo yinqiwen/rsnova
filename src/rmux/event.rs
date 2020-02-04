@@ -8,6 +8,7 @@ pub const FLAG_PING: u8 = 5;
 pub const FLAG_AUTH: u8 = 6;
 pub const FLAG_SHUTDOWN: u8 = 7;
 pub const FLAG_PONG: u8 = 8;
+pub const FLAG_ROUTINE: u8 = 9;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 
@@ -115,6 +116,17 @@ pub fn new_shutdown_event(sid: u32, remote: bool) -> Event {
         },
         body: Vec::new(),
         remote,
+    }
+}
+
+pub fn new_routine_event(sid: u32) -> Event {
+    Event {
+        header: Header {
+            flag_len: get_flag_len(0, FLAG_ROUTINE),
+            stream_id: sid,
+        },
+        body: Vec::new(),
+        remote: false,
     }
 }
 

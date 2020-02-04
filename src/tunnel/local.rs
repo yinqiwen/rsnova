@@ -5,6 +5,7 @@ use super::rmux::handle_rmux;
 use super::socks5::handle_socks5;
 use super::tls::handle_tls;
 use super::tls::valid_tls_version;
+use super::ws::handle_websocket;
 use crate::utils::{get_origin_dst, make_error};
 
 use futures::FutureExt;
@@ -116,20 +117,14 @@ pub async fn start_tunnel_server(mut cfg: TunnelConfig) -> Result<(), Box<dyn Er
                 }
             });
             tokio::spawn(handle);
+        } else if listen_url.scheme() == "ws" {
+            let handle = handle_websocket(tunnel_id, inbound, cfg.clone()).map(move |r| {
+                if let Err(e) = r {
+                    error!("[{}]Failed to handle; error={}", tunnel_id, e);
+                }
+            });
+            tokio::spawn(handle);
         }
-    }
-    let listen_url = Url::parse(listen_str.as_str());
-    match listen_url {
-        Err(e) => {
-            error!("invalid remote url:{} with error:{}", listen_str, e);
-        }
-        Ok(u) => match u.scheme() {
-            "rmux" => {}
-            "local" => {}
-            _ => {
-                error!("unknown scheme:{}", u.scheme());
-            }
-        },
     }
 
     Ok(())
