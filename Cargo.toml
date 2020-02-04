@@ -37,8 +37,8 @@ unicase = "2.4"
 ring = "0.14"
 crc = "^1.0.0"
 regex = "1"
-tungstenite = "0.10.1"
-tokio-tungstenite = "*"
+# tungstenite = "0.10.1"
+# tokio-tungstenite = { version = "*",  features = ["stream"] }
 
 
 

@@ -5,10 +5,9 @@ use crate::rmux::{
     create_stream, new_auth_event, process_rmux_session, read_encrypt_event, write_encrypt_event,
     AuthRequest, AuthResponse, CryptoContext,
 };
-use crate::utils::{make_io_error, WebsocketReader, WebsocketWriter};
+//use crate::utils::{make_io_error, WebsocketReader, WebsocketWriter};
+use crate::utils::make_io_error;
 use bytes::BytesMut;
-use futures::StreamExt;
-use std::error::Error;
 use std::io::ErrorKind;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -95,17 +94,17 @@ pub async fn init_rmux_client(
             init_client(config, session_id, &mut read, &mut write).await?;
             let _ = conn.shutdown(std::net::Shutdown::Both);
         }
-        "ws" => {
-            let ws = match tokio_tungstenite::client_async_tls(url, conn).await {
-                Err(e) => return Err(make_io_error(e.description())),
-                Ok((s, _)) => s,
-            };
-            let (write, read) = ws.split();
-            let mut reader = WebsocketReader::new(read);
-            let mut writer = WebsocketWriter::new(write);
-            init_client(config, session_id, &mut reader, &mut writer).await?;
-            writer.shutdown().await?;
-        }
+        // "ws" => {
+        //     let ws = match tokio_tungstenite::client_async_tls(url, conn).await {
+        //         Err(e) => return Err(make_io_error(e.description())),
+        //         Ok((s, _)) => s,
+        //     };
+        //     let (write, read) = ws.split();
+        //     let mut reader = WebsocketReader::new(read);
+        //     let mut writer = WebsocketWriter::new(write);
+        //     init_client(config, session_id, &mut reader, &mut writer).await?;
+        //     writer.shutdown().await?;
+        // }
         _ => {
             let _ = conn.shutdown(std::net::Shutdown::Both);
             error!("unknown schema:{}", conn_url.scheme());
