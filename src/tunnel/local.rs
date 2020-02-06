@@ -9,6 +9,7 @@ use super::ws::handle_websocket;
 use crate::utils::{get_origin_dst, make_error};
 
 use futures::FutureExt;
+use std::env;
 use std::error::Error;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -79,9 +80,12 @@ async fn handle_inbound(
 
 pub async fn start_tunnel_server(mut cfg: TunnelConfig) -> Result<(), Box<dyn Error>> {
     let mut listen_str = String::from(cfg.listen.as_str());
+    if cfg.listen.find(':').is_none() {
+        let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+        listen_str.push_str(port.as_str());
+    }
     if cfg.listen.find("://").is_none() {
-        listen_str = String::from("local://");
-        listen_str.push_str(cfg.listen.as_str());
+        listen_str.insert_str(0, "local://");
     }
     for pac in cfg.pac.iter_mut() {
         pac.init();

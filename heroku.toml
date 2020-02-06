@@ -1,0 +1,13 @@
+[log]
+logtostderr = false
+level = "info"
+logdir = ""
+
+
+[[tunnel]]
+# listen address of tunnel server
+listen = "ws://0.0.0.0"
+# pac rule to relay traffic, 'direct' is special channel which relay direct to remote target server
+pac=[{host = ".*", channel = "direct"}]
+cipher = {key="abcdefg", method = "chacha20poly1305"}
+
