@@ -49,7 +49,7 @@ async fn handle_inbound(
     if let Ok(prefix_str) = std::str::from_utf8(&peek_buf) {
         let prefix_str = prefix_str.to_uppercase();
         match prefix_str.as_str() {
-            "GET" | "PUT" | "POS" | "DEL" | "OPT" | "TRA" | "PAT" | "HEA" | "CON" => {
+            "GET" | "PUT" | "POS" | "DEL" | "OPT" | "TRA" | "PAT" | "HEA" | "CON" | "UPG" => {
                 info!(
                     "[{}]Accept client as HTTP proxy with method:{}",
                     tunnel_id, prefix_str
@@ -80,13 +80,15 @@ async fn handle_inbound(
 
 pub async fn start_tunnel_server(mut cfg: TunnelConfig) -> Result<(), Box<dyn Error>> {
     let mut listen_str = String::from(cfg.listen.as_str());
-    if cfg.listen.find(':').is_none() {
-        let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
-        listen_str.push_str(port.as_str());
-    }
     if cfg.listen.find("://").is_none() {
         listen_str.insert_str(0, "local://");
     }
+    if listen_str.rfind(':') == listen_str.find(':') {
+        let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+        listen_str.push(':');
+        listen_str.push_str(port.as_str());
+    }
+
     for pac in cfg.pac.iter_mut() {
         pac.init();
     }
@@ -103,6 +105,7 @@ pub async fn start_tunnel_server(mut cfg: TunnelConfig) -> Result<(), Box<dyn Er
         listen_url.host().unwrap(),
         listen_url.port().unwrap()
     );
+
     let mut listener = TcpListener::bind(addr).await?;
     let tunnel_id_seed = AtomicU32::new(0);
     while let Ok((inbound, _)) = listener.accept().await {

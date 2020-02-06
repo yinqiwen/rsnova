@@ -41,8 +41,8 @@ pub async fn http_proxy_connect(proxy: &Url, remote: &str) -> Result<TcpStream, 
         "CONNECT {} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n",
         remote, remote
     ).into_bytes();
-    let raddr: Vec<SocketAddr> = match proxy.to_socket_addrs() {
-        Ok(m) => m.collect(),
+    let raddr: Vec<SocketAddr> = match proxy.socket_addrs(|| None) {
+        Ok(m) => m,
         Err(err) => {
             error!(
                 "Failed to parse addr with error:{} from connect request:{}",

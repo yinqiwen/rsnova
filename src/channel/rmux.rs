@@ -80,11 +80,15 @@ pub async fn init_rmux_client(
         }
         Ok(u) => u,
     };
-    let addr = format!("{}:{}", conn_url.host().unwrap(), conn_url.port().unwrap());
+    info!("connect rmux:{}", url,);
+    let addr = format!(
+        "{}:{}",
+        conn_url.host().unwrap(),
+        conn_url.port_or_known_default().unwrap()
+    );
 
     let conn = TcpStream::connect(&addr);
     let dur = std::time::Duration::from_secs(3);
-    info!("connect rmux:{}", url);
     let s = tokio::time::timeout(dur, conn).await?;
     let mut conn = match s {
         Err(e) => return Err(e),
@@ -97,7 +101,7 @@ pub async fn init_rmux_client(
             let _ = conn.shutdown(std::net::Shutdown::Both);
         }
         "ws" => {
-            let ws = match tokio_tungstenite::client_async_tls(url, conn).await {
+            let ws = match tokio_tungstenite::client_async(url, conn).await {
                 Err(e) => return Err(make_io_error(e.description())),
                 Ok((s, _)) => s,
             };
