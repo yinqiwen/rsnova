@@ -10,12 +10,15 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::protocol::Message;
 
-pub struct WebsocketReader {
-    stream: SplitStream<WebSocketStream<TcpStream>>,
+pub struct WebsocketReader<S> {
+    stream: SplitStream<WebSocketStream<S>>,
     recv_buf: BytesMut,
 }
 
-impl AsyncRead for WebsocketReader {
+impl<S> AsyncRead for WebsocketReader<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -65,8 +68,11 @@ impl AsyncRead for WebsocketReader {
     }
 }
 
-impl WebsocketReader {
-    pub fn new(stream: SplitStream<WebSocketStream<TcpStream>>) -> Self {
+impl<S> WebsocketReader<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn new(stream: SplitStream<WebSocketStream<S>>) -> Self {
         Self {
             stream,
             recv_buf: BytesMut::new(),
@@ -74,11 +80,14 @@ impl WebsocketReader {
     }
 }
 
-pub struct WebsocketWriter {
-    sink: SplitSink<WebSocketStream<TcpStream>, Message>,
+pub struct WebsocketWriter<S> {
+    sink: SplitSink<WebSocketStream<S>, Message>,
 }
 
-impl AsyncWrite for WebsocketWriter {
+impl<S> AsyncWrite for WebsocketWriter<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -113,8 +122,11 @@ impl AsyncWrite for WebsocketWriter {
     }
 }
 
-impl WebsocketWriter {
-    pub fn new(sink: SplitSink<WebSocketStream<TcpStream>, Message>) -> Self {
+impl<S> WebsocketWriter<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn new(sink: SplitSink<WebSocketStream<S>, Message>) -> Self {
         Self { sink }
     }
 }

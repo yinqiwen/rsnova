@@ -32,7 +32,7 @@ pub async fn handle_websocket(
     //1. auth connection
     let mut recv_buf = BytesMut::new();
     let recv_ev = match read_encrypt_event(&mut rctx, &mut reader, &mut recv_buf).await {
-        Err(_) => return Err(make_io_error("can NOT read first auth envent.")),
+        Err(e) => return Err(make_io_error(e.description())),
         Ok(Some(ev)) => ev,
         Ok(None) => {
             return Err(make_io_error("can NOT read first auth envent."));

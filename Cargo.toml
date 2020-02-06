@@ -37,12 +37,13 @@ unicase = "2.4"
 ring = "0.14"
 crc = "^1.0.0"
 regex = "1"
-tokio-tungstenite = "*"
+tokio-tungstenite = { version = "*",  features = ["tls"] }
+tungstenite="0.10.1"
 
-[dependencies.tungstenite]
-version = "0.10.1"
-default-features = false 
-features = []
+# [dependencies.tungstenite]
+# version = "0.10.1"
+# default-features = true 
+# features = ["tls"]
 
 
 

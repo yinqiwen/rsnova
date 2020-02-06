@@ -38,7 +38,7 @@ where
     write_encrypt_event(&mut wctx, wi, ev).await?;
     let mut recv_buf = BytesMut::new();
     let recv_ev = match read_encrypt_event(&mut rctx, ri, &mut recv_buf).await {
-        Err(_) => return Err(make_io_error("can NOT read first auth envent.")),
+        Err(e) => return Err(make_io_error(e.description())),
         Ok(None) => return Err(make_io_error("can NOT read first auth envent.")),
         Ok(Some(ev)) => ev,
     };
@@ -80,7 +80,7 @@ pub async fn init_rmux_client(
         }
         Ok(u) => u,
     };
-    info!("connect rmux:{}", url,);
+    info!("connect rmux:{}", url);
     let addr = format!(
         "{}:{}",
         conn_url.host().unwrap(),
@@ -100,8 +100,8 @@ pub async fn init_rmux_client(
             init_client(config, session_id, &mut read, &mut write).await?;
             let _ = conn.shutdown(std::net::Shutdown::Both);
         }
-        "ws" => {
-            let ws = match tokio_tungstenite::client_async(url, conn).await {
+        "ws" | "wss" => {
+            let ws = match tokio_tungstenite::client_async_tls(url, conn).await {
                 Err(e) => return Err(make_io_error(e.description())),
                 Ok((s, _)) => s,
             };
