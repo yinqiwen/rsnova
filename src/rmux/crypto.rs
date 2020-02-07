@@ -4,30 +4,53 @@ use tokio::prelude::*;
 
 use ring::aead::*;
 
-use crc::crc32;
-
 use super::event::*;
 
 pub const METHOD_AES128_GCM: &str = "aes128gcm";
 pub const METHOD_CHACHA20_POLY1305: &str = "chacha20poly1305";
 pub const METHOD_NONE: &str = "none";
 
+struct CryptoNonceSequence {
+    nonce: u64,
+}
+
+impl CryptoNonceSequence {
+    fn new(nonce: u64) -> Self {
+        Self { nonce }
+    }
+}
+
+impl NonceSequence for CryptoNonceSequence {
+    fn advance(&mut self) -> Result<Nonce, ring::error::Unspecified> {
+        self.nonce += 1;
+        let mut d = [0u8; NONCE_LEN];
+        let v = self.nonce.to_le_bytes();
+        d[0..8].copy_from_slice(&v[..]);
+        Ok(Nonce::assume_unique_for_key(d))
+    }
+}
+
 pub struct CryptoContext {
     pub key: String,
-    // pub encrypt_nonce: u64,
-    // pub decrypt_nonce: u64,
     pub nonce: u64,
-    pub encrypter: EncryptFunc,
-    pub decrypter: DecryptFunc,
-
-    sealing_key: Option<SealingKey>,
-    opening_key: Option<OpeningKey>,
+    sealing_key: Option<SealingKey<CryptoNonceSequence>>,
+    opening_key: Option<OpeningKey<CryptoNonceSequence>>,
 }
 
 type DecryptError = (u32, &'static str);
 
-type EncryptFunc = fn(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut);
-type DecryptFunc = fn(ctx: &CryptoContext, buf: &mut BytesMut) -> Result<Event, DecryptError>;
+// type EncryptFunc = fn(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut);
+// type DecryptFunc = fn(ctx: &CryptoContext, buf: &mut BytesMut) -> Result<Event, DecryptError>;
+
+fn make_key<K: BoundKey<CryptoNonceSequence>>(
+    algorithm: &'static Algorithm,
+    key: &[u8],
+    nonce: u64,
+) -> K {
+    let key = UnboundKey::new(algorithm, key).unwrap();
+    let nonce_sequence = CryptoNonceSequence::new(nonce);
+    K::new(key, nonce_sequence)
+}
 
 impl CryptoContext {
     pub fn new(method: &str, k: &str, nonce: u64) -> Self {
@@ -38,60 +61,48 @@ impl CryptoContext {
         let aes_key = key.clone();
         match method {
             METHOD_CHACHA20_POLY1305 => CryptoContext {
-                // encrypt_nonce: nonce,
-                // decrypt_nonce: nonce,
                 nonce,
-                encrypter: chacha20poly1305_encrypt_event,
-                decrypter: chacha20poly1305_decrypt_event,
-                sealing_key: Some(
-                    SealingKey::new(&CHACHA20_POLY1305, &key.as_bytes()[0..32]).unwrap(),
-                ),
-                opening_key: Some(
-                    OpeningKey::new(&CHACHA20_POLY1305, &key.as_bytes()[0..32]).unwrap(),
-                ),
+                sealing_key: Some(make_key(
+                    &CHACHA20_POLY1305,
+                    &aes_key.as_bytes()[0..32],
+                    nonce,
+                )),
+                opening_key: Some(make_key(
+                    &CHACHA20_POLY1305,
+                    &aes_key.as_bytes()[0..32],
+                    nonce,
+                )),
                 key,
             },
             METHOD_NONE => CryptoContext {
                 key,
-                // encrypt_nonce: nonce,
-                // decrypt_nonce: nonce,
                 nonce,
-                encrypter: none_encrypt_event,
-                decrypter: none_decrypt_event,
                 sealing_key: None,
                 opening_key: None,
             },
             METHOD_AES128_GCM => CryptoContext {
                 key,
-                // encrypt_nonce: nonce,
-                // decrypt_nonce: nonce,
                 nonce,
-                encrypter: aes128gcm_encrypt_event,
-                decrypter: aes128gcm_decrypt_event,
-                sealing_key: Some(
-                    SealingKey::new(&AES_128_GCM, &aes_key.as_bytes()[0..16]).unwrap(),
-                ),
-                opening_key: Some(
-                    OpeningKey::new(&AES_128_GCM, &aes_key.as_bytes()[0..16]).unwrap(),
-                ),
+                sealing_key: Some(make_key(&AES_128_GCM, &aes_key.as_bytes()[0..16], nonce)),
+                opening_key: Some(make_key(&AES_128_GCM, &aes_key.as_bytes()[0..16], nonce)),
             },
             _ => panic!("not supported crypto method."),
         }
     }
 
-    fn get_decrypt_nonce(&self) -> Nonce {
-        let mut d = [0u8; NONCE_LEN];
-        let v = self.nonce.to_le_bytes();
-        d[0..8].copy_from_slice(&v[..]);
-        Nonce::assume_unique_for_key(d)
-    }
+    // fn get_decrypt_nonce(&self) -> Nonce {
+    //     let mut d = [0u8; NONCE_LEN];
+    //     let v = self.nonce.to_le_bytes();
+    //     d[0..8].copy_from_slice(&v[..]);
+    //     Nonce::assume_unique_for_key(d)
+    // }
 
-    fn get_encrypt_nonce(&self) -> Nonce {
-        let mut d = [0u8; NONCE_LEN];
-        let v = self.nonce.to_le_bytes();
-        d[0..8].copy_from_slice(&v[..]);
-        Nonce::assume_unique_for_key(d)
-    }
+    // fn get_encrypt_nonce(&self) -> Nonce {
+    //     let mut d = [0u8; NONCE_LEN];
+    //     let v = self.nonce.to_le_bytes();
+    //     d[0..8].copy_from_slice(&v[..]);
+    //     Nonce::assume_unique_for_key(d)
+    // }
 
     fn skip32_decrypt_key(&self) -> [u8; 10] {
         let mut sk: [u8; 10] = Default::default();
@@ -103,6 +114,7 @@ impl CryptoContext {
         sk
     }
     fn skip32_encrypt_key(&self) -> [u8; 10] {
+        //let mut key = [0; 32];
         let mut sk: [u8; 10] = Default::default();
         sk[0..10].copy_from_slice(&self.key.as_bytes()[0..10]);
         let dk = self.nonce.to_le_bytes();
@@ -111,20 +123,161 @@ impl CryptoContext {
         }
         sk
     }
-    pub fn encrypt(&mut self, ev: &Event, out: &mut BytesMut) {
-        (self.encrypter)(&self, ev, out);
-        self.nonce += 1;
-    }
-    pub fn decrypt(&mut self, buf: &mut BytesMut) -> Result<Event, DecryptError> {
-        let r = (self.decrypter)(&self, buf);
-        if r.is_ok() {
+    pub fn encrypt(&mut self, ev: &mut Event, out: &mut BytesMut) {
+        if self.sealing_key.is_none() {
+            out.reserve(EVENT_HEADER_LEN + ev.body.len());
+            out.put_u32_le(ev.header.flag_len);
+            out.put_u32_le(ev.header.stream_id);
+            if !ev.body.is_empty() {
+                out.put_slice(&ev.body[..]);
+            }
+        } else {
+            let sk = self.skip32_encrypt_key();
+            let e1 = skip32::encode(&sk, ev.header.flag_len);
+            let e2 = skip32::encode(&sk, ev.header.stream_id);
+            out.reserve(EVENT_HEADER_LEN);
+            out.put_u32_le(e1);
+            out.put_u32_le(e2);
+            if !ev.body.is_empty() {
+                match self
+                    .sealing_key
+                    .as_mut()
+                    .unwrap()
+                    .seal_in_place_append_tag(Aad::empty(), &mut ev.body)
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("encrypt error:{} {}", e, out.len());
+                    }
+                }
+            }
+            out.put_slice(&ev.body[..]);
+            //warn!("[{}]send bytes {}", self.nonce, out.len());
             self.nonce += 1;
         }
-        r
+        //self.nonce += 1;
     }
-    #[allow(dead_code)]
-    pub fn reset(&mut self, nonce: u64) {
-        self.nonce = nonce;
+    pub fn decrypt(&mut self, buf: &mut BytesMut) -> Result<Event, DecryptError> {
+        if self.opening_key.is_none() {
+            if buf.len() < EVENT_HEADER_LEN {
+                return Err((EVENT_HEADER_LEN as u32 - buf.len() as u32, ""));
+            }
+            let mut xbuf: [u8; 4] = Default::default();
+            xbuf.copy_from_slice(&buf[0..4]);
+            let e1 = u32::from_le_bytes(xbuf);
+            xbuf.copy_from_slice(&buf[4..8]);
+            let e2 = u32::from_le_bytes(xbuf);
+            let header = Header {
+                flag_len: e1,
+                stream_id: e2,
+            };
+            let flags = header.flags();
+            if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
+                buf.advance(EVENT_HEADER_LEN);
+                return Ok(Event {
+                    header,
+                    body: vec![],
+                    remote: true,
+                });
+            }
+            if buf.len() - EVENT_HEADER_LEN < header.len() as usize {
+                return Err((
+                    header.len() + EVENT_HEADER_LEN as u32 - buf.len() as u32,
+                    "",
+                ));
+            }
+            buf.advance(EVENT_HEADER_LEN);
+            let dlen = header.len() as usize;
+            let mut out = Vec::with_capacity(dlen);
+            out.put_slice(&buf[0..dlen]);
+            buf.advance(dlen);
+            Ok(Event {
+                header,
+                body: out,
+                remote: true,
+            })
+        } else {
+            if buf.len() < EVENT_HEADER_LEN {
+                return Err((EVENT_HEADER_LEN as u32 - buf.len() as u32, ""));
+            }
+            //info!("decrypt ev with counter:{}", ctx.decrypt_nonce);
+            let sk = self.skip32_decrypt_key();
+            let mut xbuf: [u8; 4] = Default::default();
+            xbuf.copy_from_slice(&buf[0..4]);
+            let e1 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
+            xbuf.copy_from_slice(&buf[4..8]);
+            let e2 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
+            let header = Header {
+                flag_len: e1,
+                stream_id: e2,
+            };
+            let flags = header.flags();
+            if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
+                buf.advance(EVENT_HEADER_LEN);
+                self.nonce += 1;
+                return Ok(Event {
+                    header,
+                    body: vec![],
+                    remote: true,
+                });
+            }
+            let opening_key = self.opening_key.as_mut().unwrap();
+            let expected_len = header.len() as usize + opening_key.algorithm().tag_len();
+            // error!(
+            //     "[{}]expected len:{} {} {} {} {}",
+            //     self.nonce,
+            //     buf.len(),
+            //     header.len(),
+            //     expected_len,
+            //     opening_key.algorithm().tag_len(),
+            //     buf.len() - EVENT_HEADER_LEN < expected_len
+            // );
+            if buf.len() - EVENT_HEADER_LEN < expected_len {
+                let missing = expected_len + EVENT_HEADER_LEN - buf.len();
+                return Err((missing as u32, ""));
+            }
+            buf.advance(EVENT_HEADER_LEN);
+            let dlen = header.len() as usize;
+            // info!(
+            //     "decrypt event:{} {} {} {} {}",
+            //     header.stream_id,
+            //     header.flags(),
+            //     header.len(),
+            //     buf.len(),
+            //     ctx.decrypt_nonce,
+            // );
+            //let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
+            //let xnonce: u128 = ctx.decrypt_nonce as u128;
+            // let nonce = chacha20poly1305::Nonce::from_slice(&xnonce.to_le_bytes()[0..12]).unwrap();
+            //let additional_data: [u8; 0] = [];
+            //match chacha20poly1305::open(&key, &nonce, &buf[0..dlen + 16], None, &mut out) {
+            match opening_key.open_in_place(
+                Aad::empty(),
+                &mut buf[0..(dlen + opening_key.algorithm().tag_len())],
+            ) {
+                Ok(_) => {}
+                Err(e) => {
+                    error!(
+                        "decrypt error:{} for event:{} {} {} {} {}",
+                        e,
+                        header.stream_id,
+                        header.flags(),
+                        header.len(),
+                        buf.len(),
+                        self.nonce,
+                    );
+                    return Err((0, "Decrypt error"));
+                }
+            }
+            let out = Vec::from(&buf[0..dlen]);
+            buf.advance(dlen + opening_key.algorithm().tag_len());
+            self.nonce += 1;
+            Ok(Event {
+                header,
+                body: out,
+                remote: true,
+            })
+        }
     }
 }
 
@@ -180,307 +333,16 @@ where
 pub async fn write_encrypt_event<'a, T>(
     ctx: &'a mut CryptoContext,
     writer: &'a mut T,
-    ev: Event,
+    mut ev: Event,
 ) -> Result<(), std::io::Error>
 where
     T: AsyncWrite + Unpin + ?Sized,
 {
     let mut buf = BytesMut::new();
-    ctx.encrypt(&ev, &mut buf);
+    ctx.encrypt(&mut ev, &mut buf);
     let evbuf = buf.to_vec();
     writer.write_all(&evbuf[..]).await?;
     Ok(())
-}
-
-#[allow(unused_variables)]
-pub fn none_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut) {
-    out.reserve(EVENT_HEADER_LEN + ev.body.len());
-    out.put_u32_le(ev.header.flag_len);
-    out.put_u32_le(ev.header.stream_id);
-
-    if !ev.body.is_empty() {
-        out.put_slice(&ev.body[..]);
-    }
-}
-
-#[allow(unused_variables)]
-pub fn none_decrypt_event(ctx: &CryptoContext, buf: &mut BytesMut) -> Result<Event, DecryptError> {
-    if buf.len() < EVENT_HEADER_LEN {
-        //println!("decrypt error0:{}", buf.len());
-        return Err((EVENT_HEADER_LEN as u32 - buf.len() as u32, ""));
-    }
-    let mut xbuf: [u8; 4] = Default::default();
-    xbuf.copy_from_slice(&buf[0..4]);
-    let e1 = u32::from_le_bytes(xbuf);
-    xbuf.copy_from_slice(&buf[4..8]);
-    let e2 = u32::from_le_bytes(xbuf);
-
-    let header = Header {
-        flag_len: e1,
-        stream_id: e2,
-    };
-    let flags = header.flags();
-    if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
-        buf.advance(EVENT_HEADER_LEN);
-        return Ok(Event {
-            header,
-            body: vec![],
-            remote: true,
-        });
-    }
-    if buf.len() - EVENT_HEADER_LEN < header.len() as usize {
-        return Err((
-            header.len() + EVENT_HEADER_LEN as u32 - buf.len() as u32,
-            "",
-        ));
-    }
-    buf.advance(EVENT_HEADER_LEN);
-    let dlen = header.len() as usize;
-    let mut out = Vec::with_capacity(dlen);
-    out.put_slice(&buf[0..dlen]);
-    buf.advance(dlen);
-    Ok(Event {
-        header,
-        body: out,
-        remote: true,
-    })
-}
-
-pub fn chacha20poly1305_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut) {
-    let sk = ctx.skip32_encrypt_key();
-    let e1 = skip32::encode(&sk, ev.header.flag_len);
-    let e2 = skip32::encode(&sk, ev.header.stream_id);
-    out.reserve(EVENT_HEADER_LEN);
-    out.put_u32_le(e1);
-    out.put_u32_le(e2);
-
-    if !ev.body.is_empty() {
-        // info!(
-        //     "encrypt ev: {} {} {} {} {} {}",
-        //     ev.header.stream_id,
-        //     ev.header.flags(),
-        //     ev.header.len(),
-        //     ev.body.len(),
-        //     ctx.encrypt_nonce,
-        //     out.len(),
-        // );
-
-        let additional_data: [u8; 0] = [];
-        let vlen = CHACHA20_POLY1305.tag_len() + ev.body.len() as usize;
-        let dlen = EVENT_HEADER_LEN + vlen;
-
-        out.reserve(dlen);
-        out.put_slice(&ev.body[..]);
-        out.put_slice(&vec![0; CHACHA20_POLY1305.tag_len()]);
-        let tlen = out.len();
-        let data = &mut out[(tlen - vlen)..tlen];
-        match seal_in_place(
-            ctx.sealing_key.as_ref().unwrap(),
-            ctx.get_encrypt_nonce(),
-            Aad::from(&additional_data),
-            data,
-            CHACHA20_POLY1305.tag_len(),
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                error!("encrypt error:{} {}", e, out.len());
-            }
-        }
-    }
-}
-
-pub fn chacha20poly1305_decrypt_event(
-    ctx: &CryptoContext,
-    buf: &mut BytesMut,
-) -> Result<Event, DecryptError> {
-    if buf.len() < EVENT_HEADER_LEN {
-        return Err((EVENT_HEADER_LEN as u32 - buf.len() as u32, ""));
-    }
-    //info!("decrypt ev with counter:{}", ctx.decrypt_nonce);
-    let sk = ctx.skip32_decrypt_key();
-    let mut xbuf: [u8; 4] = Default::default();
-    xbuf.copy_from_slice(&buf[0..4]);
-    let e1 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
-    xbuf.copy_from_slice(&buf[4..8]);
-    let e2 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
-
-    let header = Header {
-        flag_len: e1,
-        stream_id: e2,
-    };
-    let flags = header.flags();
-    if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
-        buf.advance(EVENT_HEADER_LEN);
-        return Ok(Event {
-            header,
-            body: vec![],
-            remote: true,
-        });
-    }
-    if buf.len() - EVENT_HEADER_LEN < (header.len() as usize + CHACHA20_POLY1305.tag_len()) {
-        return Err((
-            header.len() + (EVENT_HEADER_LEN + CHACHA20_POLY1305.tag_len()) as u32
-                - buf.len() as u32,
-            "",
-        ));
-    }
-    buf.advance(EVENT_HEADER_LEN);
-    let dlen = header.len() as usize;
-    // info!(
-    //     "decrypt event:{} {} {} {} {}",
-    //     header.stream_id,
-    //     header.flags(),
-    //     header.len(),
-    //     buf.len(),
-    //     ctx.decrypt_nonce,
-    // );
-    //let key = chacha20poly1305::SecretKey::from_slice(&ctx.key.as_bytes()[0..32]).unwrap();
-    //let xnonce: u128 = ctx.decrypt_nonce as u128;
-    // let nonce = chacha20poly1305::Nonce::from_slice(&xnonce.to_le_bytes()[0..12]).unwrap();
-
-    let additional_data: [u8; 0] = [];
-    //match chacha20poly1305::open(&key, &nonce, &buf[0..dlen + 16], None, &mut out) {
-    match open_in_place(
-        ctx.opening_key.as_ref().unwrap(),
-        ctx.get_decrypt_nonce(),
-        Aad::from(&additional_data),
-        0,
-        &mut buf[0..(dlen + CHACHA20_POLY1305.tag_len())],
-    ) {
-        Ok(_) => {}
-        Err(e) => {
-            error!(
-                "decrypt error:{} for event:{} {} {} {} {}",
-                e,
-                header.stream_id,
-                header.flags(),
-                header.len(),
-                buf.len(),
-                ctx.nonce,
-            );
-            return Err((0, "Decrypt error"));
-        }
-    }
-    let out = Vec::from(&buf[0..dlen]);
-    buf.advance(dlen + CHACHA20_POLY1305.tag_len());
-    Ok(Event {
-        header,
-        body: out,
-        remote: true,
-    })
-}
-
-pub fn aes128gcm_encrypt_event(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut) {
-    let sk = ctx.skip32_encrypt_key();
-    let e1 = skip32::encode(&sk, ev.header.flag_len);
-    let e2 = skip32::encode(&sk, ev.header.stream_id);
-    out.reserve(EVENT_HEADER_LEN);
-    out.put_u32_le(e1);
-    out.put_u32_le(e2);
-
-    if !ev.body.is_empty() {
-        //let sealing_key = SealingKey::new(&CHACHA20_POLY1305, &key).unwrap();
-        let additional_data: [u8; 0] = [];
-        let vlen = AES_128_GCM.tag_len() + ev.body.len() as usize + 4;
-        let dlen = EVENT_HEADER_LEN + vlen;
-        out.reserve(dlen);
-        out.put_slice(&ev.body[..]);
-        out.put_slice(&vec![0; AES_128_GCM.tag_len()]);
-        let tlen = out.len();
-        let data = &mut out[(tlen - vlen)..(tlen - 4)];
-        match seal_in_place(
-            ctx.sealing_key.as_ref().unwrap(),
-            ctx.get_encrypt_nonce(),
-            Aad::from(&additional_data),
-            data,
-            AES_128_GCM.tag_len(),
-        ) {
-            Ok(_) => {
-                let cksm = crc32::checksum_ieee(&out[EVENT_HEADER_LEN..(dlen - 4)]).to_le_bytes();
-                out[(tlen - 4)..].copy_from_slice(&cksm);
-            }
-            Err(e) => {
-                error!("encrypt error:{} {}", e, out.len());
-            }
-        }
-    }
-}
-
-pub fn aes128gcm_decrypt_event(
-    ctx: &CryptoContext,
-    buf: &mut BytesMut,
-) -> Result<Event, DecryptError> {
-    if buf.len() < EVENT_HEADER_LEN {
-        return Err((EVENT_HEADER_LEN as u32 - buf.len() as u32, ""));
-    }
-    //info!("decrypt ev with counter:{}", ctx.decrypt_nonce);
-    let sk = ctx.skip32_decrypt_key();
-    let mut xbuf: [u8; 4] = Default::default();
-    xbuf.copy_from_slice(&buf[0..4]);
-    let e1 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
-    xbuf.copy_from_slice(&buf[4..8]);
-    let e2 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
-
-    let header = Header {
-        flag_len: e1,
-        stream_id: e2,
-    };
-    let flags = header.flags();
-    if (FLAG_WIN_UPDATE == flags) || 0 == header.len() {
-        buf.advance(EVENT_HEADER_LEN);
-        return Ok(Event {
-            header,
-            body: vec![],
-            remote: true,
-        });
-    }
-    if buf.len() - EVENT_HEADER_LEN < (header.len() as usize + AES_128_GCM.tag_len() + 4) {
-        return Err((
-            header.len() + (EVENT_HEADER_LEN + AES_128_GCM.tag_len() + 4) as u32 - buf.len() as u32,
-            "",
-        ));
-    }
-    buf.advance(EVENT_HEADER_LEN);
-    let dlen = header.len() as usize;
-    let klen = dlen + AES_128_GCM.tag_len();
-    let crc32 = crc32::checksum_ieee(&buf[0..(klen)]);
-    let mut tmpv = [0u8; 4];
-    tmpv[..].copy_from_slice(&buf[klen..(klen + 4)]);
-    let recv_crc32 = u32::from_le_bytes(tmpv);
-    if crc32 != recv_crc32 {
-        error!("invalid crc32 {}:{}", crc32, recv_crc32);
-    }
-
-    let additional_data: [u8; 0] = [];
-    //match chacha20poly1305::open(&key, &nonce, &buf[0..dlen + 16], None, &mut out) {
-    match open_in_place(
-        ctx.opening_key.as_ref().unwrap(),
-        ctx.get_decrypt_nonce(),
-        Aad::from(&additional_data),
-        0,
-        &mut buf[0..klen],
-    ) {
-        Ok(_) => {}
-        Err(e) => {
-            error!(
-                "decrypt error:{} for event:{} {} {} {} {}",
-                e,
-                header.stream_id,
-                header.flags(),
-                header.len(),
-                buf.len(),
-                ctx.nonce,
-            );
-            return Err((0, "Decrypt error"));
-        }
-    }
-    let out = Vec::from(&buf[0..dlen]);
-    buf.advance(dlen + AES_128_GCM.tag_len() + 4);
-    Ok(Event {
-        header,
-        body: out,
-        remote: true,
-    })
 }
 
 #[cfg(test)]

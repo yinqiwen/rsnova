@@ -34,11 +34,13 @@ nix = "0.14.1"
 cfg-if = "0.1"
 twoway = "0.2"
 unicase = "2.4"
-ring = "0.14"
+ring = "0.16"
 crc = "^1.0.0"
 regex = "1"
+rustls="0.16"
 tokio-tungstenite = { version = "*",  features = ["tls"] }
 tungstenite="0.10.1"
+async-tls="0.6"
 
 # [dependencies.tungstenite]
 # version = "0.10.1"

@@ -58,9 +58,9 @@ pub async fn handle_websocket(
         //rand: 1,
         method: auth_req.method,
     };
-    let res = new_auth_event(0, &auth_res);
+    let mut res = new_auth_event(0, &auth_res);
     let mut buf = BytesMut::new();
-    wctx.encrypt(&res, &mut buf);
+    wctx.encrypt(&mut res, &mut buf);
     writer.write_all(&buf[..]).await?;
     let rctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);
     let wctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);

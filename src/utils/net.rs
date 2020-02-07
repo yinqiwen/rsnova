@@ -5,7 +5,9 @@ use nix::sys::socket::{getsockopt, sockopt, InetAddr};
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::os::unix::io::AsRawFd;
-use tokio::io::AsyncWriteExt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use url::Url;
 
@@ -67,4 +69,54 @@ pub async fn http_proxy_connect(proxy: &Url, remote: &str) -> Result<TcpStream, 
         return Ok(socket);
     }
     Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted))
+}
+
+pub struct AsyncTcpStream {
+    s: TcpStream,
+}
+
+impl AsyncTcpStream {
+    pub fn new(s: TcpStream) -> Self {
+        Self { s }
+    }
+}
+
+impl futures::AsyncRead for AsyncTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<futures::io::Result<usize>> {
+        let Self { s } = &mut *self;
+        pin_mut!(s);
+        s.poll_read(cx, buf)
+    }
+}
+
+impl futures::AsyncWrite for AsyncTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<futures::io::Result<usize>> {
+        let Self { s } = &mut *self;
+        pin_mut!(s);
+        s.poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let Self { s } = &mut *self;
+        pin_mut!(s);
+        s.poll_flush(cx)
+    }
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let Self { s } = &mut *self;
+        pin_mut!(s);
+        s.poll_shutdown(cx)
+    }
 }

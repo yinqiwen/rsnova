@@ -5,8 +5,9 @@ use crate::rmux::{
     create_stream, new_auth_event, process_rmux_session, read_encrypt_event, write_encrypt_event,
     AuthRequest, AuthResponse, CryptoContext,
 };
-use crate::utils::{make_io_error, WebsocketReader, WebsocketWriter};
+use crate::utils::{make_io_error, AsyncTcpStream, AsyncTokioIO, WebsocketReader, WebsocketWriter};
 //use crate::utils::make_io_error;
+use async_tls::TlsConnector;
 use bytes::BytesMut;
 use futures::StreamExt;
 use std::error::Error;
@@ -83,7 +84,7 @@ pub async fn init_rmux_client(
     info!("connect rmux:{}", url);
     let addr = format!(
         "{}:{}",
-        conn_url.host().unwrap(),
+        conn_url.host().as_ref().unwrap(),
         conn_url.port_or_known_default().unwrap()
     );
 
@@ -100,7 +101,24 @@ pub async fn init_rmux_client(
             init_client(config, session_id, &mut read, &mut write).await?;
             let _ = conn.shutdown(std::net::Shutdown::Both);
         }
-        "ws" | "wss" => {
+        "ws" => {
+            let ws = match tokio_tungstenite::client_async(url, conn).await {
+                Err(e) => return Err(make_io_error(e.description())),
+                Ok((s, _)) => s,
+            };
+            let (write, read) = ws.split();
+            let mut reader = WebsocketReader::new(read);
+            let mut writer = WebsocketWriter::new(write);
+            init_client(config, session_id, &mut reader, &mut writer).await?;
+            writer.shutdown().await?;
+        }
+        "wss" => {
+            // let connector = TlsConnector::default();
+            // let conn = AsyncTcpStream::new(conn);
+            // let host = conn_url.host_str();
+            // info!("TLS connect {:?}", host);
+            // let tls_stream = connector.connect(host.unwrap(), conn)?.await?;
+            // let tls_stream = AsyncTokioIO::new(tls_stream);
             let ws = match tokio_tungstenite::client_async_tls(url, conn).await {
                 Err(e) => return Err(make_io_error(e.description())),
                 Ok((s, _)) => s,

@@ -580,7 +580,7 @@ where
         let mut streams = HashMap::new();
         while !session_state.closed.load(Ordering::SeqCst) {
             let rev = event_rx.recv().await;
-            if let Some(ev) = rev {
+            if let Some(mut ev) = rev {
                 if FLAG_PING == ev.header.flags() {
                     handle_ping_event(tunnel_id, &mut streams, &session_state, ev.remote);
                 }
@@ -604,7 +604,7 @@ where
                         }
                     }
                     let mut buf = BytesMut::with_capacity(ev.body.len() + 64);
-                    wctx.encrypt(&ev, &mut buf);
+                    wctx.encrypt(&mut ev, &mut buf);
                     let evbuf = buf.to_vec();
                     let _ = send_tx.send(evbuf).await;
                     continue;
@@ -635,8 +635,8 @@ where
                     }
                     FLAG_PING => {
                         let mut buf = BytesMut::new();
-                        let pong = new_pong_event(ev.header.stream_id, false);
-                        wctx.encrypt(&pong, &mut buf);
+                        let mut pong = new_pong_event(ev.header.stream_id, false);
+                        wctx.encrypt(&mut pong, &mut buf);
                         let evbuf = buf.to_vec();
                         let _ = send_tx.send(evbuf).await;
                     }
