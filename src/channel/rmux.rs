@@ -81,7 +81,7 @@ pub async fn init_rmux_client(
         }
         Ok(u) => u,
     };
-    info!("connect rmux:{}", url);
+    info!("connect rmux:{} {:?}", url, config.work_time_frame);
     let addr = format!(
         "{}:{}",
         conn_url.host().as_ref().unwrap(),
@@ -113,13 +113,13 @@ pub async fn init_rmux_client(
             writer.shutdown().await?;
         }
         "wss" => {
-            // let connector = TlsConnector::default();
-            // let conn = AsyncTcpStream::new(conn);
-            // let host = conn_url.host_str();
-            // info!("TLS connect {:?}", host);
-            // let tls_stream = connector.connect(host.unwrap(), conn)?.await?;
-            // let tls_stream = AsyncTokioIO::new(tls_stream);
-            let ws = match tokio_tungstenite::client_async_tls(url, conn).await {
+            let connector = TlsConnector::default();
+            let conn = AsyncTcpStream::new(conn);
+            let host = conn_url.host_str();
+            //info!("TLS connect {:?}", host);
+            let tls_stream = connector.connect(host.unwrap(), conn)?.await?;
+            let conn = AsyncTokioIO::new(tls_stream);
+            let ws = match tokio_tungstenite::client_async(url, conn).await {
                 Err(e) => return Err(make_io_error(e.description())),
                 Ok((s, _)) => s,
             };

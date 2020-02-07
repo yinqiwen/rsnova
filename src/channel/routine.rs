@@ -1,6 +1,7 @@
 use super::rmux::init_rmux_client;
 use crate::config::ChannelConfig;
 use crate::rmux::{get_channel_session_size, routine_all_sessions};
+use chrono::{Timelike, Utc};
 use futures::FutureExt;
 use rand::Rng;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -13,8 +14,12 @@ pub async fn routine_channels(cfgs: Option<Vec<ChannelConfig>>) {
     let mut ping_time: u64 = 0;
     loop {
         interval.tick().await;
+        let now = Utc::now();
         if let Some(ccfgs) = &cfgs {
             for channel_cfg in ccfgs.iter() {
+                if !channel_cfg.is_valid_hour(now.hour() as u8) {
+                    continue;
+                }
                 let count = get_channel_session_size(channel_cfg.name.as_str());
                 if count < channel_cfg.conns_per_host as usize {
                     let n = channel_cfg.conns_per_host as usize - count;

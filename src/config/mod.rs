@@ -46,6 +46,16 @@ pub struct ChannelConfig {
     pub conns_per_host: u32,
     pub max_alive_mins: u32,
     pub proxy: Option<String>,
+    pub work_time_frame: Option<[u8; 2]>,
+}
+
+impl ChannelConfig {
+    pub fn is_valid_hour(&self, h: u8) -> bool {
+        if let Some(frame) = self.work_time_frame {
+            return frame[0] <= h && frame[1] > h;
+        }
+        true
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
