@@ -19,6 +19,11 @@ if [ $EXITCODE -ne 0 ]; then
 fi
 
 # Package up the release binary
-tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova
+if [ "$TARGET" = "TARGET=x86_64-pc-windows-msvc" ]
+then
+    tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova.exe
+else
+    tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova
+fi
 tar uf rsnova-$TRAVIS_TAG-$TARGET.tar client.toml server.toml
 gzip rsnova-$TRAVIS_TAG-$TARGET.tar
