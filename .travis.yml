@@ -3,7 +3,7 @@ language: rust
 cache: cargo
 matrix:
   include:
-    - env: TARGET=armv5te-unknown-linux-musleabi CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_MUSLEABI_LINKER=arm-linux-musleabihf-gcc CC_armv5te_unknown_linux_musleabi=arm-linux-musleabi-gcc CXX_armv5te_unknown_linux_musleabi=arm-linux-musleabi-g++
+    - env: TARGET=armv5te-unknown-linux-musleabi CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_MUSLEABI_LINKER=arm-linux-musleabihf-gcc CC_armv5te_unknown_linux_musleabi=arm-linux-musleabihf-gcc CXX_armv5te_unknown_linux_musleabi=arm-linux-musleabihf-g++
     - env: TARGET=x86_64-unknown-linux-musl
       addons:
         apt:

@@ -14,5 +14,6 @@ fi
 cargo build --target=$TARGET --release
 
 # Package up the release binary
-tar -C target/$TARGET/release -czf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova
+tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova
 tar uf rsnova-$TRAVIS_TAG-$TARGET.tar client.toml server.toml
+gzip rsnova-$TRAVIS_TAG-$TARGET.tar
