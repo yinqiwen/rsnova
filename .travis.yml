@@ -7,6 +7,9 @@ matrix:
       addons:
         apt:
           packages:
+            - libc6-armel-cross
+            - libc6-dev-armel-cross
+            - binutils-arm-linux-gnueabi
             - gcc-arm-linux-gnueabihf
     - env: TARGET=x86_64-unknown-linux-musl
       addons:
