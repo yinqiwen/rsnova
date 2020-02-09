@@ -13,7 +13,7 @@ matrix:
       os: osx
 
 script:
-  - ci/build.sh
+  - sh ci/build.sh
 
 deploy:
   api_key:
