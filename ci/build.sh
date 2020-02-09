@@ -1,10 +1,8 @@
 #!/bin/bash
-set -euo pipefail
 
 # Install the Rust stdlib for the current target
 rustup target add $TARGET
 
-# Download the Raspberry Pi cross-compilation toolchain if needed
 if [ "$TARGET" = "armv5te-unknown-linux-musleabi" ]
 then
   wget https://musl.cc/arm-linux-musleabihf-cross.tgz
