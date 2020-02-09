@@ -11,6 +11,8 @@ matrix:
             - musl-tools
     - env: TARGET=x86_64-apple-darwin
       os: osx
+    - env: TARGET=x86_64-pc-windows-msvc
+      os: windows
 
 script:
   - sh ci/build.sh
