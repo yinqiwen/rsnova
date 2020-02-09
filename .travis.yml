@@ -17,7 +17,7 @@ script:
 
 deploy:
   api_key:
-    secure: "YngDT2JlydCG+qb8Ww9wBFyWiLRQJczybNLeoFKluBXKoh1Vu+TZeReMK+rRUjOqOmYV8sNtOnEVSg4+ICeYDNp9fRRwcNKTkp0H+8pH0OynxdH2faCjx1H5U0WQuWqMLQoMSHZ90I0tL40kEJOChLY6WGvwY47YBqi/dsvmTfg="
+    secure: "p9JvbtkiqTWzpINHyvAQi6cllq3bfuday2BSgN5J+dJ5XAOhwkSA0DDg0eTaOWFyF6QrIpaPq3AGRG2GAv5niIozGK8P5KkEVMEsBZEAzUjTA1i26lL3zFi5fKImf4Ez3yXUZYefm14yshkZ57TpT/NdP8bbhueRj/QxO1Bo5Ah+cbvdfI4tef9hLc9VnyGBWjHaL042xBUaGmE3Xtq1g2r97QrJeWkaK0XlJYR1/QAzVDw3IXpT2/Y1mrkiw36eanvPRtG1vaf2+Kz08q/gBYnLTwnEu+sFinLtdlXPVOO6I44+qtwlHqcw5RPyxcZctK8gAudO07CYT7IuLpOY+wPC9aLVMNdb9dtJZZMFcj/5f5YEi+zgzcROeTq5rvY+sTZTZgywBpMVHnEE0nCnXuFkvqsFgPEA/W9lKzNYYAfwn7rnwOsqsexZ+83uEF2jmIHhNccp2eBPBdkCVol/y9voc81BmNxD/kXS8a+/iGu69TZ52fhTJMYtV+dLNRurYI+/O7jMeS7pibp2/o9JlFSIU50rnW2LFzvKPLugAWXiJZr3n+SspB9405VXdNchnL4P5gJDN3v3ta+Gl/2rQi1TZXkseWKywjm5/cXK7b5GT0fcbdhZN/B1KWSv9PVxhNEzTQCb8tBR/euOx5l830UROJDDugs9CwnLO4tCC5k="
   file: rsnova-$TRAVIS_TAG-$TARGET.tar.gz
   on:
     tags: true
