@@ -1,0 +1,32 @@
+dist: trusty
+language: rust
+cache: cargo
+matrix:
+  include:
+    - env: TARGET=armv5te-unknown-linux-gnueabihf CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+      addons:
+        apt:
+          packages:
+            - gcc-arm-linux-gnueabihf
+    - env: TARGET=x86_64-unknown-linux-musl
+      addons:
+        apt:
+          packages:
+            - musl-tools
+    - env: TARGET=x86_64-apple-darwin
+      os: osx
+
+script:
+  - cargo build --target=$TARGET --release
+  - cp -f target/$TARGET/release/rsnova ./
+  - tar czf rsnova-$TRAVIS_TAG-$TARGET.tar.gz rsnova client.toml server.toml 
+
+deploy:
+  api_key:
+    secure: "YngDT2JlydCG+qb8Ww9wBFyWiLRQJczybNLeoFKluBXKoh1Vu+TZeReMK+rRUjOqOmYV8sNtOnEVSg4+ICeYDNp9fRRwcNKTkp0H+8pH0OynxdH2faCjx1H5U0WQuWqMLQoMSHZ90I0tL40kEJOChLY6WGvwY47YBqi/dsvmTfg="
+  file: rsnova-$TRAVIS_TAG-$TARGET.tar.gz
+  on:
+    tags: true
+  provider: releases
+  skip_cleanup: true
+  overwrite: true
