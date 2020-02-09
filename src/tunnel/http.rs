@@ -300,7 +300,7 @@ impl<T: AsyncRead + ?Sized + Unpin> AsyncRead for HttpReader<'_, T> {
             counter,
         } = &mut *self;
         let pr = Pin::new(reader);
-        let mut n = fill_read_buf(http_buf, buf);
+        let n = fill_read_buf(http_buf, buf);
         if n > 0 {
             return Poll::Ready(Ok(n));
         }
@@ -342,7 +342,7 @@ impl<T: AsyncRead + ?Sized + Unpin> AsyncRead for HttpReader<'_, T> {
         }
         if *state == HttpDecodeState::DecodingHeader {
             match parse_request(recv_buf, Some(http_buf)) {
-                Ok((success, target, blen)) => {
+                Ok((success, _target, blen)) => {
                     if success {
                         if 0 == blen {
                             *state = HttpDecodeState::DecodingHeader;
@@ -382,18 +382,18 @@ pub async fn handle_http(
     let mut hreader = newHttpReader(&mut ri);
     hreader.add_recv_content(&head);
     hreader.add_recv_content(&body);
-    let mut target = String::new();
-    match hreader.parse_request() {
-        Err(e) => {
+
+    let mut target = match hreader.parse_request() {
+        Err(_e) => {
             return Err(make_error("failed to parse http header"));
         }
         Ok((success, remote, _)) => {
             if !success {
                 return Err(make_error("failed to parse http header complete"));
             }
-            target = remote;
+            remote
         }
-    }
+    };
     if target.find(':').is_none() {
         target.push_str(":80");
     }
@@ -408,20 +408,19 @@ pub async fn handle_https(
     mut inbound: TcpStream,
     cfg: &TunnelConfig,
 ) -> Result<(), Box<dyn Error>> {
-    let mut target = String::new();
     let (head, _) = read_until_separator(&mut inbound, "\r\n\r\n").await?;
     let mut hbuf = BytesMut::from(&head[..]);
-    match parse_request(&mut hbuf, None) {
-        Err(e) => {
+    let target = match parse_request(&mut hbuf, None) {
+        Err(_e) => {
             return Err(make_error("failed to parse http header"));
         }
         Ok((success, remote, _)) => {
             if !success {
                 return Err(make_error("failed to parse http header complete"));
             }
-            target = remote;
+            remote
         }
-    }
+    };
 
     let conn_res = "HTTP/1.0 200 Connection established\r\n\r\n";
     inbound.write_all(conn_res.as_bytes()).await?;

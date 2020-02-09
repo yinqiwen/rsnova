@@ -1,12 +1,11 @@
 use crate::utils::{fill_read_buf, make_io_error};
 use bytes::BytesMut;
 use futures::stream::{SplitSink, SplitStream};
-use futures::{Future, Sink, SinkExt, Stream, StreamExt};
+use futures::{Future, SinkExt, Stream};
 use std::error::Error;
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::protocol::Message;
 

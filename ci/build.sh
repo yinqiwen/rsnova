@@ -12,6 +12,11 @@ fi
 
 # Compile the binary for the current target
 cargo build --target=$TARGET --release
+EXITCODE=$?
+if [ $EXITCODE -ne 0 ]; then
+    echo "cargo build failed"
+    exit $EXITCODE
+fi
 
 # Package up the release binary
 tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova

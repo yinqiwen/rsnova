@@ -1,5 +1,6 @@
 use crate::channel::get_channel_stream;
 use crate::config::TunnelConfig;
+use crate::rmux::get_channel_session_size;
 use crate::utils::{buf_copy, make_error};
 
 use futures::future::join;
@@ -37,11 +38,14 @@ where
     for pac in cfg.pac.iter() {
         if pac.is_match(target.as_str()) {
             channel = String::from(pac.channel.as_str());
+            if channel.as_str() != "direct" && get_channel_session_size(channel.as_str()) == 0 {
+                continue;
+            }
             break;
         }
     }
     if channel.is_empty() {
-        return Err(make_error("no channel found."));
+        return Err(make_error("no valid channel found."));
     }
 
     let remote_target = String::from(target.as_str());

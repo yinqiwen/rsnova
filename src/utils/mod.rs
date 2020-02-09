@@ -2,7 +2,6 @@ mod buf;
 mod io;
 mod net;
 mod net2;
-mod tls;
 mod ws;
 
 pub use self::buf::fill_read_buf;

@@ -37,7 +37,7 @@ fn name_port(addr_buf: &[u8]) -> Option<String> {
     let hostname = &addr_buf[..addr_buf.len() - 2];
     let hostname = match std::str::from_utf8(hostname) {
         Ok(s) => s,
-        Err(e) => {
+        Err(_e) => {
             return None;
         }
     };
@@ -68,14 +68,13 @@ pub async fn handle_socks5(
     if head[1] != v5::CMD_CONNECT {
         return Err(make_error("unsupported command"));
     }
-    let mut target_addr: String;
-    match head[3] {
+    let target_addr = match head[3] {
         v5::ATYP_IPV4 => {
             let mut addr_buf = [0u8; 6];
             inbound.read_exact(&mut addr_buf).await?;
             let addr = Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
             let port = ((addr_buf[4] as u16) << 8) | (addr_buf[5] as u16);
-            target_addr = format!("{}:{}", addr.to_string(), port);
+            format!("{}:{}", addr.to_string(), port)
         }
         v5::ATYP_IPV6 => {
             let mut addr_buf = [0u8; 18];
@@ -90,7 +89,7 @@ pub async fn handle_socks5(
             let h = ((addr_buf[14] as u16) << 8) | (addr_buf[15] as u16);
             let addr = Ipv6Addr::new(a, b, c, d, e, f, g, h);
             let port = ((addr_buf[16] as u16) << 8) | (addr_buf[17] as u16);
-            target_addr = format!("{}:{}", addr.to_string(), port);
+            format!("{}:{}", addr.to_string(), port)
         }
         v5::ATYP_DOMAIN => {
             //
@@ -99,9 +98,7 @@ pub async fn handle_socks5(
             let mut addr_buf = vec![0u8; len_buf[0] as usize + 2];
             inbound.read_exact(&mut addr_buf).await?;
             match name_port(&addr_buf) {
-                Some(addr) => {
-                    target_addr = addr;
-                }
+                Some(addr) => addr,
                 None => {
                     return Err(make_error("can not get addr with domian"));
                 }
@@ -111,7 +108,7 @@ pub async fn handle_socks5(
             let msg = format!("unknown ATYP received: {}", n);
             return Err(make_error(msg.as_str()));
         }
-    }
+    };
     let mut resp = [0u8; 10];
     // VER - protocol version
     resp[0] = 5;

@@ -1,7 +1,7 @@
 use crate::config::TunnelConfig;
 use crate::rmux::{
     new_auth_event, process_rmux_session, read_encrypt_event, AuthRequest, AuthResponse,
-    CryptoContext,
+    CryptoContext, MuxContext,
 };
 use crate::utils::{make_io_error, WebsocketReader, WebsocketWriter};
 use bytes::BytesMut;
@@ -64,15 +64,17 @@ pub async fn handle_websocket(
     writer.write_all(&buf[..]).await?;
     let rctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);
     let wctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);
+    let ctx = MuxContext::new("", tunnel_id, rctx, wctx, 0, &mut recv_buf);
     process_rmux_session(
-        "",
-        tunnel_id,
+        ctx,
+        // "",
+        // tunnel_id,
         &mut reader,
         &mut writer,
-        rctx,
-        wctx,
-        &mut recv_buf,
-        0,
+        // rctx,
+        // wctx,
+        // &mut recv_buf,
+        // 0,
     )
     .await?;
     Ok(())

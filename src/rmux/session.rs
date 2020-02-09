@@ -18,11 +18,10 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -405,8 +404,8 @@ fn log_session_state(
 }
 
 fn handle_ping_event(
-    sid: u32,
-    streams: &mut HashMap<u32, MuxStream>,
+    _sid: u32,
+    _streams: &mut HashMap<u32, MuxStream>,
     session_state: &Arc<MuxSessionState>,
     is_remote: bool,
 ) {
@@ -461,47 +460,159 @@ fn handle_fin_event(
     false
 }
 
-// pub struct MuxContext {
-//     channel: &'static str,
-//     tunnel_id: u32,
-//     rctx: CryptoContext,
-//     wctx: CryptoContext,
-//     max_alive_secs: u64,
-// }
-// impl MuxContext {
-//     pub fn new(
-//         channel: &'a str,
-//         tunnel_id: u32,
-//         rctx: CryptoContext,
-//         wctx: CryptoContext,
-//         max_alive_secs: u64,
-//     ) -> Self {
-//         Self {
-//             channel,
-//             tunnel_id,
-//             rctx,
-//             wctx,
-//             max_alive_secs,
-//         }
-//     }
-// }
+async fn process_event<'a>(
+    channel: &'a str,
+    tunnel_id: u32,
+    mut wctx: CryptoContext,
+    session_state: Arc<MuxSessionState>,
+    mut event_rx: mpsc::Receiver<Event>,
+    event_tx: mpsc::Sender<Event>,
+    mut send_tx: mpsc::Sender<Vec<u8>>,
+) {
+    let mut streams = HashMap::new();
+    while !session_state.closed.load(Ordering::SeqCst) {
+        let rev = event_rx.recv().await;
+        if let Some(mut ev) = rev {
+            if FLAG_PING == ev.header.flags() {
+                handle_ping_event(tunnel_id, &mut streams, &session_state, ev.remote);
+            }
+            if !ev.remote {
+                if FLAG_SHUTDOWN == ev.header.flags() {
+                    break;
+                }
+                if FLAG_SYN == ev.header.flags() {
+                    hanle_pendding_mux_streams(channel, tunnel_id, &mut streams);
+                }
+                if FLAG_FIN == ev.header.flags()
+                    && handle_fin_event(ev.header.stream_id, &mut streams, &session_state)
+                {
+                    break;
+                }
+                if FLAG_ROUTINE == ev.header.flags() {
+                    if handle_routine_event(tunnel_id, &mut streams, &session_state) {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+                let mut buf = BytesMut::with_capacity(ev.body.len() + 64);
+                wctx.encrypt(&mut ev, &mut buf);
+                let evbuf = buf.to_vec();
+                let _ = send_tx.send(evbuf).await;
+                continue;
+            }
+            match ev.header.flags() {
+                FLAG_SYN => {
+                    if let Some(stream) = handle_syn(channel, tunnel_id, ev, event_tx.clone()) {
+                        streams.entry(stream.state.stream_id).or_insert(stream);
+                    } else {
+                    }
+                }
+                FLAG_FIN => {
+                    if handle_fin_event(ev.header.stream_id, &mut streams, &session_state) {
+                        break;
+                    }
+                }
+                FLAG_DATA => {
+                    if let Some(stream) = streams.get_mut(&ev.header.stream_id) {
+                        stream.offer_data(ev.body).await;
+                    } else {
+                        warn!(
+                            "[{}][{}]No stream found for data event.",
+                            channel, ev.header.stream_id
+                        );
+                    }
+                }
+                FLAG_PING => {
+                    let mut buf = BytesMut::new();
+                    let mut pong = new_pong_event(ev.header.stream_id, false);
+                    wctx.encrypt(&mut pong, &mut buf);
+                    let evbuf = buf.to_vec();
+                    let _ = send_tx.send(evbuf).await;
+                }
+                FLAG_PONG => {
+                    session_state.last_pong_recv_time.store(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as u32,
+                        Ordering::SeqCst,
+                    );
+                }
+                FLAG_WIN_UPDATE => {
+                    if let Some(stream) = streams.get_mut(&ev.header.stream_id) {
+                        stream.update_send_window(ev.header.len());
+                    }
+                }
+                _ => {
+                    error!("invalid flags:{}", ev.header.flags());
+                    //None
+                }
+            }
+        } else {
+            //None
+            break;
+        }
+    }
+    error!("[{}][{}]handle_event done", channel, tunnel_id);
+    for (_, stream) in streams.iter_mut() {
+        let _ = stream.close();
+    }
+    event_rx.close();
+    let _ = send_tx.send(Vec::new()).await;
+}
+
+pub struct MuxContext<'a> {
+    channel: &'a str,
+    tunnel_id: u32,
+    rctx: CryptoContext,
+    wctx: CryptoContext,
+    max_alive_secs: u64,
+    recv_buf: &'a mut BytesMut,
+}
+impl<'a> MuxContext<'a> {
+    pub fn new(
+        channel: &'a str,
+        tunnel_id: u32,
+        rctx: CryptoContext,
+        wctx: CryptoContext,
+        max_alive_secs: u64,
+        recv_buf: &'a mut BytesMut,
+    ) -> Self {
+        Self {
+            channel,
+            tunnel_id,
+            rctx,
+            wctx,
+            max_alive_secs,
+            recv_buf,
+        }
+    }
+}
 
 pub async fn process_rmux_session<'a, R, W>(
-    channel: &str,
-    tunnel_id: u32,
+    ctx: MuxContext<'a>,
+    // channel: &str,
+    // tunnel_id: u32,
     ri: &'a mut R,
     wi: &'a mut W,
-    mut rctx: CryptoContext,
-    mut wctx: CryptoContext,
-    recv_buf: &mut BytesMut,
-    max_alive_secs: u64,
+    // mut rctx: CryptoContext,
+    // mut wctx: CryptoContext,
+    // recv_buf: &mut BytesMut,
+    // max_alive_secs: u64,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin + ?Sized,
     W: AsyncWrite + Unpin + ?Sized,
 {
-    let (mut event_tx, mut event_rx) = mpsc::channel::<Event>(16);
-    let (mut send_tx, mut send_rx) = mpsc::channel(16);
+    let channel = ctx.channel;
+    let tunnel_id = ctx.tunnel_id;
+    let mut rctx = ctx.rctx;
+    let wctx = ctx.wctx;
+    let recv_buf = ctx.recv_buf;
+    let max_alive_secs = ctx.max_alive_secs;
+    let (mut event_tx, event_rx) = mpsc::channel::<Event>(16);
+    let (send_tx, mut send_rx) = mpsc::channel(16);
 
     //let is_server = channel.is_empty();
 
@@ -574,103 +685,17 @@ where
         let _ = handle_recv_send_tx.send(Vec::new()).await;
     };
 
-    let handle_event_event_tx = event_tx.clone();
-    let mut handle_event_send_tx = send_tx.clone();
-    let handle_event = async move {
-        let mut streams = HashMap::new();
-        while !session_state.closed.load(Ordering::SeqCst) {
-            let rev = event_rx.recv().await;
-            if let Some(mut ev) = rev {
-                if FLAG_PING == ev.header.flags() {
-                    handle_ping_event(tunnel_id, &mut streams, &session_state, ev.remote);
-                }
-                if !ev.remote {
-                    if FLAG_SHUTDOWN == ev.header.flags() {
-                        break;
-                    }
-                    if FLAG_SYN == ev.header.flags() {
-                        hanle_pendding_mux_streams(channel, tunnel_id, &mut streams);
-                    }
-                    if FLAG_FIN == ev.header.flags()
-                        && handle_fin_event(ev.header.stream_id, &mut streams, &session_state)
-                    {
-                        break;
-                    }
-                    if FLAG_ROUTINE == ev.header.flags() {
-                        if handle_routine_event(tunnel_id, &mut streams, &session_state) {
-                            break;
-                        } else {
-                            continue;
-                        }
-                    }
-                    let mut buf = BytesMut::with_capacity(ev.body.len() + 64);
-                    wctx.encrypt(&mut ev, &mut buf);
-                    let evbuf = buf.to_vec();
-                    let _ = send_tx.send(evbuf).await;
-                    continue;
-                }
-                match ev.header.flags() {
-                    FLAG_SYN => {
-                        if let Some(stream) =
-                            handle_syn(channel, tunnel_id, ev, handle_event_event_tx.clone())
-                        {
-                            streams.entry(stream.state.stream_id).or_insert(stream);
-                        } else {
-                        }
-                    }
-                    FLAG_FIN => {
-                        if handle_fin_event(ev.header.stream_id, &mut streams, &session_state) {
-                            break;
-                        }
-                    }
-                    FLAG_DATA => {
-                        if let Some(stream) = streams.get_mut(&ev.header.stream_id) {
-                            stream.offer_data(ev.body).await;
-                        } else {
-                            warn!(
-                                "[{}][{}]No stream found for data event.",
-                                channel, ev.header.stream_id
-                            );
-                        }
-                    }
-                    FLAG_PING => {
-                        let mut buf = BytesMut::new();
-                        let mut pong = new_pong_event(ev.header.stream_id, false);
-                        wctx.encrypt(&mut pong, &mut buf);
-                        let evbuf = buf.to_vec();
-                        let _ = send_tx.send(evbuf).await;
-                    }
-                    FLAG_PONG => {
-                        session_state.last_pong_recv_time.store(
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs() as u32,
-                            Ordering::SeqCst,
-                        );
-                    }
-                    FLAG_WIN_UPDATE => {
-                        if let Some(stream) = streams.get_mut(&ev.header.stream_id) {
-                            stream.update_send_window(ev.header.len());
-                        }
-                    }
-                    _ => {
-                        error!("invalid flags:{}", ev.header.flags());
-                        //None
-                    }
-                }
-            } else {
-                //None
-                break;
-            }
-        }
-        error!("[{}][{}]handle_event done", channel, tunnel_id);
-        for (_, stream) in streams.iter_mut() {
-            let _ = stream.close();
-        }
-        event_rx.close();
-        let _ = handle_event_send_tx.send(Vec::new()).await;
-    };
+    // let handle_event_event_tx = event_tx.clone();
+    // let mut handle_event_send_tx = send_tx.clone();
+    let handle_event = process_event(
+        channel,
+        tunnel_id,
+        wctx,
+        session_state.clone(),
+        event_rx,
+        event_tx.clone(),
+        send_tx.clone(),
+    );
 
     let handle_send = async {
         while let Some(data) = send_rx.recv().await {
@@ -713,15 +738,16 @@ pub async fn handle_rmux_session(
     //cfg: &TunnelConfig,
 ) -> Result<(), std::io::Error> {
     let (mut ri, mut wi) = inbound.split();
+    let ctx = MuxContext::new(channel, tunnel_id, rctx, wctx, max_alive_secs, recv_buf);
     process_rmux_session(
-        channel,
-        tunnel_id,
+        ctx, // channel,
+        // tunnel_id,
         &mut ri,
         &mut wi,
-        rctx,
-        wctx,
-        recv_buf,
-        max_alive_secs,
+        // rctx,
+        // wctx,
+        // recv_buf,
+        // max_alive_secs,
     )
     .await?;
     Ok(())

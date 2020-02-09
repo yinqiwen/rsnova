@@ -3,7 +3,6 @@ use super::message::ConnectRequest;
 use super::session::report_update_window;
 
 use bytes::BytesMut;
-use futures::Future;
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};

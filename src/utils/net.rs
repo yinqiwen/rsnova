@@ -1,10 +1,8 @@
 use super::io::read_until_separator;
 
 use httparse::Status;
-use nix::sys::socket::{getsockopt, sockopt, InetAddr};
 use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
-use std::os::unix::io::AsRawFd;
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -18,6 +16,9 @@ pub fn get_origin_dst(_socket: &TcpStream) -> Option<SocketAddr> {
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 pub fn get_origin_dst(socket: &TcpStream) -> Option<SocketAddr> {
+    use nix::sys::socket::{getsockopt, sockopt, InetAddr};
+    use std::net::ToSocketAddrs;
+    use std::os::unix::io::AsRawFd;
     let fd = socket.as_raw_fd();
     let opt = sockopt::OriginalDst {};
     match getsockopt(fd, opt) {

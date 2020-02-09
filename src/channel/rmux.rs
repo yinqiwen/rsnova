@@ -3,7 +3,7 @@ use crate::config::ChannelConfig;
 
 use crate::rmux::{
     create_stream, new_auth_event, process_rmux_session, read_encrypt_event, write_encrypt_event,
-    AuthRequest, AuthResponse, CryptoContext,
+    AuthRequest, AuthResponse, CryptoContext, MuxContext,
 };
 use crate::utils::{make_io_error, AsyncTcpStream, AsyncTokioIO, WebsocketReader, WebsocketWriter};
 //use crate::utils::make_io_error;
@@ -50,15 +50,23 @@ where
     }
     let rctx = CryptoContext::new(method.as_str(), key.as_str(), decoded.rand);
     let wctx = CryptoContext::new(method.as_str(), key.as_str(), decoded.rand);
-    process_rmux_session(
+    let ctx = MuxContext::new(
         config.name.as_str(),
         session_id,
-        ri,
-        wi,
         rctx,
         wctx,
-        &mut recv_buf,
         config.max_alive_mins as u64 * 60,
+        &mut recv_buf,
+    );
+    process_rmux_session(
+        ctx, // config.name.as_str(),
+        // session_id,
+        ri,
+        wi,
+        // rctx,
+        // wctx,
+        // &mut recv_buf,
+        // config.max_alive_mins as u64 * 60,
     )
     .await?;
     Ok(())
@@ -145,18 +153,3 @@ pub async fn get_rmux_stream(
     let stream = create_stream(channel, "tcp", addr.as_str()).await?;
     Ok(Box::new(stream))
 }
-
-// pub async fn init_rmux_client(config: ChannelConfig) -> Result<(), std::io::Error> {
-//     // let conn = TcpStream::connect(&addr);
-//     // let dur = std::time::Duration::from_secs(3);
-//     // let s = tokio::time::timeout(dur, conn).await?;
-//     // match s {
-//     //     Err(e) => Err(e),
-//     //     Ok(c) => {
-//     //         //
-//     //         Ok(())
-//     //     }
-//     // }
-
-//     Ok(())
-// }
