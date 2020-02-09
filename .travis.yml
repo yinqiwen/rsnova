@@ -17,6 +17,7 @@ matrix:
       os: osx
 
 script:
+  - rustup target add $TARGET
   - cargo build --target=$TARGET --release
   - cp -f target/$TARGET/release/rsnova ./
   - tar czf rsnova-$TRAVIS_TAG-$TARGET.tar.gz rsnova client.toml server.toml 
