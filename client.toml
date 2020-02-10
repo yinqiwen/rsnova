@@ -26,3 +26,4 @@ cipher = {key="abcdefg", method = "chacha20poly1305"}
 # conns_per_host = 5
 # max_alive_mins = 70
 # cipher = {key="abcdefg", method = "chacha20poly1305"}
+# work_time_frame=[7,22]  #only work between 7am to 22pm
