@@ -14,7 +14,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             Arg::with_name("config")
                 .short("c")
                 .long("config")
-                .default_value("./rsnova.toml")
+                .default_value("./client.toml")
                 .value_name("FILE")
                 .help("Sets a custom config file")
                 .takes_value(true),

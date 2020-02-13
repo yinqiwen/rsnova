@@ -193,6 +193,8 @@ pub async fn routine_all_sessions() {
                         error!("[{}]Session heartbeat timeout.", s.id);
                         let shutdown = new_shutdown_event(0, false);
                         actions.push(RoutineAction::new(shutdown, s.event_tx.clone()));
+                        s.state.retired.store(true, Ordering::SeqCst);
+                        retired.push(session.take().unwrap());
                         continue;
                     } else {
                         if !channel.is_empty() {
