@@ -1,5 +1,6 @@
 #![crate_type = "lib"]
 #![crate_name = "rsnova"]
+#![recursion_limit = "256"]
 
 #[macro_use]
 extern crate log;

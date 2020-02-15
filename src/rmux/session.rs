@@ -22,6 +22,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -157,13 +158,12 @@ pub fn get_channel_session_size(channel: &str) -> usize {
     let mut len: usize = 0;
     if let Some(csession) = cmap.get_mut(channel) {
         for s in csession.sessions.iter() {
-            if let Some(_ss) = s {
+            if s.is_some() {
                 len += 1;
             }
         }
-        return len;
     }
-    0
+    len
 }
 
 struct RoutineAction {
@@ -645,43 +645,87 @@ where
     );
     store_mux_session(channel, mux_session);
 
+    let (close_tx, close_rx) = oneshot::channel::<()>();
+    let mut drop = close_rx.fuse();
+
     let mut handle_recv_event_tx = event_tx.clone();
     let mut handle_recv_send_tx = send_tx.clone();
+    let handle_recv_session_state = session_state.clone();
+    let handle_send_session_state = session_state.clone();
     let handle_recv = async move {
-        loop {
-            let recv_event = read_encrypt_event(&mut rctx, ri, recv_buf).await;
-            match recv_event {
-                Ok(Some(mut ev)) => {
-                    recv_session_state.io_active_unix_secs.store(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs() as u32,
-                        Ordering::SeqCst,
-                    );
-                    ev.remote = true;
-                    if FLAG_DATA != ev.header.flags() {
-                        info!(
-                            "[{}][{}][{}]remote recv event type:{}, len:{}",
-                            channel,
-                            tunnel_id,
-                            ev.header.stream_id,
-                            get_event_type_str(ev.header.flags()),
-                            ev.header.len(),
-                        );
+        while !handle_recv_session_state.closed.load(Ordering::SeqCst) {
+            select! {
+                recv_event = read_encrypt_event(&mut rctx, ri, recv_buf).fuse() => {
+                    match recv_event {
+                        Ok(Some(mut ev)) => {
+                            recv_session_state.io_active_unix_secs.store(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs() as u32,
+                                Ordering::SeqCst,
+                            );
+                            ev.remote = true;
+                            if FLAG_DATA != ev.header.flags() {
+                                info!(
+                                    "[{}][{}][{}]remote recv event type:{}, len:{}",
+                                    channel,
+                                    tunnel_id,
+                                    ev.header.stream_id,
+                                    get_event_type_str(ev.header.flags()),
+                                    ev.header.len(),
+                                );
+                            }
+                            let _ = handle_recv_event_tx.send(ev).await;
+                        }
+                        Ok(None) => {
+                            break;
+                        }
+                        Err(err) => {
+                            error!("Close remote recv since of error:{}", err);
+                            break;
+                        }
                     }
-                    let _ = handle_recv_event_tx.send(ev).await;
-                }
-                Ok(None) => {
+                },
+                _ = drop => {
+                    handle_recv_session_state.closed.store(true, Ordering::SeqCst);
                     break;
-                }
-                Err(err) => {
-                    error!("Close remote recv since of error:{}", err);
-                    break;
-                }
+                },
             }
+            // let recv_event = read_encrypt_event(&mut rctx, ri, recv_buf).await;
+            // match recv_event {
+            //     Ok(Some(mut ev)) => {
+            //         recv_session_state.io_active_unix_secs.store(
+            //             SystemTime::now()
+            //                 .duration_since(UNIX_EPOCH)
+            //                 .unwrap()
+            //                 .as_secs() as u32,
+            //             Ordering::SeqCst,
+            //         );
+            //         ev.remote = true;
+            //         if FLAG_DATA != ev.header.flags() {
+            //             info!(
+            //                 "[{}][{}][{}]remote recv event type:{}, len:{}",
+            //                 channel,
+            //                 tunnel_id,
+            //                 ev.header.stream_id,
+            //                 get_event_type_str(ev.header.flags()),
+            //                 ev.header.len(),
+            //             );
+            //         }
+            //         let _ = handle_recv_event_tx.send(ev).await;
+            //     }
+            //     Ok(None) => {
+            //         break;
+            //     }
+            //     Err(err) => {
+            //         error!("Close remote recv since of error:{}", err);
+            //         break;
+            //     }
+            // }
         }
         error!("[{}][{}]handle_recv done", channel, tunnel_id);
+        erase_mux_session(channel, tunnel_id);
         let shutdown_ev = new_shutdown_event(0, false);
         let _ = handle_recv_event_tx.send(shutdown_ev).await;
         let _ = handle_recv_send_tx.send(Vec::new()).await;
@@ -700,27 +744,32 @@ where
     );
 
     let handle_send = async {
-        while let Some(data) = send_rx.recv().await {
-            if data.is_empty() {
+        while !handle_send_session_state.closed.load(Ordering::SeqCst) {
+            if let Some(data) = send_rx.recv().await {
+                if data.is_empty() {
+                    break;
+                }
+                if let Err(e) = wi.write_all(&data[..]).await {
+                    error!("Failed to write data with err:{}", e);
+                    break;
+                }
+                send_session_state.io_active_unix_secs.store(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as u32,
+                    Ordering::SeqCst,
+                );
+            } else {
                 break;
             }
-            if let Err(e) = wi.write_all(&data[..]).await {
-                error!("Failed to write data with err:{}", e);
-                break;
-            }
-            send_session_state.io_active_unix_secs.store(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as u32,
-                Ordering::SeqCst,
-            );
         }
         error!("[{}][{}]handle_send done", channel, tunnel_id);
         send_rx.close();
         let _ = wi.shutdown().await;
         let shutdown_ev = new_shutdown_event(0, false);
         let _ = event_tx.send(shutdown_ev).await;
+        let _ = close_tx.send(());
     };
 
     join3(handle_recv, handle_event, handle_send).await;
@@ -752,5 +801,6 @@ pub async fn handle_rmux_session(
         // max_alive_secs,
     )
     .await?;
+    let _ = inbound.shutdown(std::net::Shutdown::Both);
     Ok(())
 }
