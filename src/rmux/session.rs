@@ -462,6 +462,44 @@ fn handle_fin_event(
     false
 }
 
+async fn send_local_event(
+    mut ev: Event,
+    wctx: &mut CryptoContext,
+    send_tx: &mut mpsc::Sender<Vec<u8>>,
+) -> bool {
+    let mut buf = BytesMut::with_capacity(ev.body.len() + 64);
+    wctx.encrypt(&mut ev, &mut buf);
+    let evbuf = buf.to_vec();
+    let send_rc = send_tx.send(evbuf).await;
+    send_rc.is_ok()
+}
+
+async fn handle_local_event<'a>(
+    channel: &'a str,
+    tunnel_id: u32,
+    streams: &mut HashMap<u32, MuxStream>,
+    session_state: &Arc<MuxSessionState>,
+    ev: Event,
+    wctx: &mut CryptoContext,
+    send_tx: &mut mpsc::Sender<Vec<u8>>,
+) -> bool {
+    if FLAG_SHUTDOWN == ev.header.flags() {
+        return false;
+    }
+    if FLAG_SYN == ev.header.flags() {
+        hanle_pendding_mux_streams(channel, tunnel_id, streams);
+    }
+    if FLAG_FIN == ev.header.flags()
+        && handle_fin_event(ev.header.stream_id, streams, &session_state)
+    {
+        return false;
+    }
+    if FLAG_ROUTINE == ev.header.flags() {
+        return !handle_routine_event(tunnel_id, streams, &session_state);
+    }
+    send_local_event(ev, wctx, send_tx).await
+}
+
 async fn process_event<'a>(
     channel: &'a str,
     tunnel_id: u32,
@@ -474,34 +512,25 @@ async fn process_event<'a>(
     let mut streams = HashMap::new();
     while !session_state.closed.load(Ordering::SeqCst) {
         let rev = event_rx.recv().await;
-        if let Some(mut ev) = rev {
+        if let Some(ev) = rev {
             if FLAG_PING == ev.header.flags() {
                 handle_ping_event(tunnel_id, &mut streams, &session_state, ev.remote);
             }
             if !ev.remote {
-                if FLAG_SHUTDOWN == ev.header.flags() {
-                    break;
-                }
-                if FLAG_SYN == ev.header.flags() {
-                    hanle_pendding_mux_streams(channel, tunnel_id, &mut streams);
-                }
-                if FLAG_FIN == ev.header.flags()
-                    && handle_fin_event(ev.header.stream_id, &mut streams, &session_state)
+                if handle_local_event(
+                    channel,
+                    tunnel_id,
+                    &mut streams,
+                    &session_state,
+                    ev,
+                    &mut wctx,
+                    &mut send_tx,
+                )
+                .await
                 {
-                    break;
+                    continue;
                 }
-                if FLAG_ROUTINE == ev.header.flags() {
-                    if handle_routine_event(tunnel_id, &mut streams, &session_state) {
-                        break;
-                    } else {
-                        continue;
-                    }
-                }
-                let mut buf = BytesMut::with_capacity(ev.body.len() + 64);
-                wctx.encrypt(&mut ev, &mut buf);
-                let evbuf = buf.to_vec();
-                let _ = send_tx.send(evbuf).await;
-                continue;
+                break;
             }
             match ev.header.flags() {
                 FLAG_SYN => {
@@ -526,11 +555,15 @@ async fn process_event<'a>(
                     }
                 }
                 FLAG_PING => {
-                    let mut buf = BytesMut::new();
-                    let mut pong = new_pong_event(ev.header.stream_id, false);
-                    wctx.encrypt(&mut pong, &mut buf);
-                    let evbuf = buf.to_vec();
-                    let _ = send_tx.send(evbuf).await;
+                    if !send_local_event(
+                        new_pong_event(ev.header.stream_id, false),
+                        &mut wctx,
+                        &mut send_tx,
+                    )
+                    .await
+                    {
+                        break;
+                    }
                 }
                 FLAG_PONG => {
                     session_state.last_pong_recv_time.store(
@@ -557,6 +590,7 @@ async fn process_event<'a>(
         }
     }
     error!("[{}][{}]handle_event done", channel, tunnel_id);
+    session_state.closed.store(true, Ordering::SeqCst);
     for (_, stream) in streams.iter_mut() {
         let _ = stream.close();
     }
@@ -676,12 +710,17 @@ where
                                     ev.header.len(),
                                 );
                             }
-                            let _ = handle_recv_event_tx.send(ev).await;
+                            let send_rc = handle_recv_event_tx.send(ev).await;
+                            if send_rc.is_err(){
+                                break;
+                            }
                         }
                         Ok(None) => {
+                            //handle_recv_session_state.closed.store(true, Ordering::SeqCst);
                             break;
                         }
                         Err(err) => {
+                            //handle_recv_session_state.closed.store(true, Ordering::SeqCst);
                             error!("Close remote recv since of error:{}", err);
                             break;
                         }
@@ -725,7 +764,9 @@ where
             // }
         }
         error!("[{}][{}]handle_recv done", channel, tunnel_id);
-        erase_mux_session(channel, tunnel_id);
+        handle_recv_session_state
+            .closed
+            .store(true, Ordering::SeqCst);
         let shutdown_ev = new_shutdown_event(0, false);
         let _ = handle_recv_event_tx.send(shutdown_ev).await;
         let _ = handle_recv_send_tx.send(Vec::new()).await;
@@ -765,11 +806,14 @@ where
             }
         }
         error!("[{}][{}]handle_send done", channel, tunnel_id);
+        handle_send_session_state
+            .closed
+            .store(true, Ordering::SeqCst);
         send_rx.close();
-        let _ = wi.shutdown().await;
+        let _ = close_tx.send(());
+        //let _ = wi.shutdown().await;
         let shutdown_ev = new_shutdown_event(0, false);
         let _ = event_tx.send(shutdown_ev).await;
-        let _ = close_tx.send(());
     };
 
     join3(handle_recv, handle_event, handle_send).await;
