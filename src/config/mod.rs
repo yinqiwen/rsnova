@@ -47,6 +47,8 @@ pub struct ChannelConfig {
     pub max_alive_mins: u32,
     pub proxy: Option<String>,
     pub work_time_frame: Option<[u8; 2]>,
+    pub sni: Option<String>,
+    pub sni_proxy: Option<String>,
 }
 
 impl ChannelConfig {

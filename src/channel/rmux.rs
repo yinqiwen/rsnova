@@ -89,15 +89,29 @@ pub async fn init_rmux_client(
         }
         Ok(u) => u,
     };
-    info!("connect rmux:{} {:?}", url, config.work_time_frame);
-    let addr = format!(
-        "{}:{}",
-        conn_url.host().as_ref().unwrap(),
-        conn_url.port_or_known_default().unwrap()
-    );
+    let addr = if config.sni_proxy.is_some() {
+        let mut v = String::from(config.sni_proxy.as_ref().unwrap());
+        if v.find(':').is_none() {
+            v.push_str(":443");
+        }
+        v
+    } else {
+        format!(
+            "{}:{}",
+            conn_url.host().as_ref().unwrap(),
+            conn_url.port_or_known_default().unwrap()
+        )
+    };
+    info!("connect rmux:{} to addr:{}", url, addr);
+
+    let domain = if config.sni.is_some() {
+        config.sni.as_ref().unwrap().as_str()
+    } else {
+        conn_url.host_str().unwrap()
+    };
 
     let conn = TcpStream::connect(&addr);
-    let dur = std::time::Duration::from_secs(3);
+    let dur = std::time::Duration::from_secs(5);
     let s = tokio::time::timeout(dur, conn).await?;
     let mut conn = match s {
         Err(e) => return Err(e),
@@ -123,9 +137,9 @@ pub async fn init_rmux_client(
         "wss" => {
             let connector = TlsConnector::default();
             let conn = AsyncTcpStream::new(conn);
-            let host = conn_url.host_str();
-            //info!("TLS connect {:?}", host);
-            let tls_stream = connector.connect(host.unwrap(), conn)?.await?;
+            //let host = conn_url.host_str();
+            info!("TLS connect {:?}", domain);
+            let tls_stream = connector.connect(domain, conn)?.await?;
             let conn = AsyncTokioIO::new(tls_stream);
             let ws = match tokio_tungstenite::client_async(url, conn).await {
                 Err(e) => return Err(make_io_error(e.description())),

@@ -21,9 +21,11 @@ cipher = {key="abcdefg", method = "chacha20poly1305"}
 
 # [[channel]]
 # name = "ws"
-# url = "ws://testapp.herokuapp.com:80"
+# url = "wss://testapp.herokuapp.com:443"
 # ping_interval_sec = 10
 # conns_per_host = 5
 # max_alive_mins = 70
 # cipher = {key="abcdefg", method = "chacha20poly1305"}
 # work_time_frame=[7,22]  #only work between 7am to 22pm
+# sni= "www.herokuapp.com"
+# sni_proxy="10.10.10.10"
