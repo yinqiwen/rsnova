@@ -1,5 +1,6 @@
 # RSnova: Private Proxy Solution & Network Troubleshooting Tool.    
-[![Build Status](https://travis-ci.org/yinqiwen/rsnova.svg?branch=master)](https://travis-ci.org/yinqiwen/rsnova) 
+[![Build Status](https://travis-ci.org/yinqiwen/rsnova.svg?branch=master)](https://travis-ci.org/yinqiwen/rsnova)    
+[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy)
 
 # Features
 - Multiplexing 
