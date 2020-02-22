@@ -66,6 +66,7 @@ impl Buf for VBuf {
                 self.inner.pop_front();
             } else {
                 self.cur += cnt;
+                return;
             }
         }
     }
