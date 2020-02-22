@@ -9,7 +9,7 @@ use super::stream::MuxStream;
 use crate::channel::get_channel_stream;
 use crate::channel::ChannelStream;
 use crate::tunnel::relay;
-use crate::utils::make_io_error;
+use crate::utils::{make_io_error, VBuf};
 use bytes::BytesMut;
 use futures::future::join3;
 use futures::FutureExt;
@@ -22,6 +22,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::oneshot;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -638,8 +639,8 @@ pub async fn process_rmux_session<'a, R, W>(
     // max_alive_secs: u64,
 ) -> Result<(), std::io::Error>
 where
-    R: AsyncRead + Unpin + ?Sized,
-    W: AsyncWrite + Unpin + ?Sized,
+    R: AsyncRead + Unpin + Sized,
+    W: AsyncWrite + Unpin + Sized,
 {
     let channel = ctx.channel;
     let tunnel_id = ctx.tunnel_id;
@@ -785,23 +786,54 @@ where
     );
 
     let handle_send = async {
+        let mut vbuf = VBuf::new();
         while !handle_send_session_state.closed.load(Ordering::SeqCst) {
-            if let Some(data) = send_rx.recv().await {
-                if data.is_empty() {
+            // if let Some(data) = send_rx.recv().await {
+            //     if data.is_empty() {
+            //         break;
+            //     }
+            //     if let Err(e) = wi.write_all(&data[..]).await {
+            //         error!("Failed to write data with err:{}", e);
+            //         break;
+            //     }
+            //     send_session_state.io_active_unix_secs.store(
+            //         SystemTime::now()
+            //             .duration_since(UNIX_EPOCH)
+            //             .unwrap()
+            //             .as_secs() as u32,
+            //         Ordering::SeqCst,
+            //     );
+            // } else {
+            //     break;
+            // }
+
+            if vbuf.vlen() == 0 {
+                if let Some(data) = send_rx.recv().await {
+                    vbuf.push(data);
+                } else {
                     break;
                 }
-                if let Err(e) = wi.write_all(&data[..]).await {
-                    error!("Failed to write data with err:{}", e);
-                    break;
+            }
+            let mut exit = false;
+            while vbuf.vlen() < 64 {
+                match send_rx.try_recv() {
+                    Ok(data) => {
+                        vbuf.push(data);
+                    }
+                    Err(TryRecvError::Closed) => {
+                        exit = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        break;
+                    }
                 }
-                send_session_state.io_active_unix_secs.store(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as u32,
-                    Ordering::SeqCst,
-                );
-            } else {
+            }
+            if exit {
+                break;
+            }
+            let wrc = wi.write_buf(&mut vbuf).await;
+            if wrc.is_err() {
                 break;
             }
         }

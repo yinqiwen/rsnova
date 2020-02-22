@@ -23,8 +23,8 @@ async fn init_client<'a, R, W>(
     wi: &'a mut W,
 ) -> Result<(), std::io::Error>
 where
-    R: AsyncRead + Unpin + ?Sized,
-    W: AsyncWrite + Unpin + ?Sized,
+    R: AsyncRead + Unpin + Sized,
+    W: AsyncWrite + Unpin + Sized,
 {
     let sid = 0 as u32;
     let auth = AuthRequest {
