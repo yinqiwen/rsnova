@@ -809,16 +809,24 @@ where
 
             if vbuf.vlen() == 0 {
                 if let Some(data) = send_rx.recv().await {
+                    if data.is_empty() {
+                        break;
+                    }
                     vbuf.push(data);
                 } else {
                     break;
                 }
             }
             let mut exit = false;
-            while vbuf.vlen() < 64 {
+            while vbuf.vlen() < 32 {
                 match send_rx.try_recv() {
                     Ok(data) => {
-                        vbuf.push(data);
+                        if data.is_empty() {
+                            exit = true;
+                            break;
+                        } else {
+                            vbuf.push(data);
+                        }
                     }
                     Err(TryRecvError::Closed) => {
                         exit = true;
@@ -832,9 +840,15 @@ where
             if exit {
                 break;
             }
-            let wrc = wi.write_buf(&mut vbuf).await;
-            if wrc.is_err() {
-                break;
+            match wi.write_buf(&mut vbuf).await {
+                Ok(n) => {
+                    if 0 == n {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    break;
+                }
             }
         }
         error!("[{}][{}]handle_send done", channel, tunnel_id);
