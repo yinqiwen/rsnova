@@ -120,8 +120,11 @@ pub async fn init_rmux_client(
     match conn_url.scheme() {
         "rmux" => {
             let (mut read, mut write) = conn.split();
-            init_client(config, session_id, &mut read, &mut write).await?;
+            let rc = init_client(config, session_id, &mut read, &mut write).await;
             let _ = conn.shutdown(std::net::Shutdown::Both);
+            if rc.is_err() {
+                return rc;
+            }
         }
         "ws" => {
             let ws = match tokio_tungstenite::client_async(url, conn).await {
@@ -131,8 +134,11 @@ pub async fn init_rmux_client(
             let (write, read) = ws.split();
             let mut reader = WebsocketReader::new(read);
             let mut writer = WebsocketWriter::new(write);
-            init_client(config, session_id, &mut reader, &mut writer).await?;
+            let rc = init_client(config, session_id, &mut reader, &mut writer).await;
             writer.shutdown().await?;
+            if rc.is_err() {
+                return rc;
+            }
         }
         "wss" => {
             let connector = TlsConnector::default();
@@ -148,8 +154,11 @@ pub async fn init_rmux_client(
             let (write, read) = ws.split();
             let mut reader = WebsocketReader::new(read);
             let mut writer = WebsocketWriter::new(write);
-            init_client(config, session_id, &mut reader, &mut writer).await?;
+            let rc = init_client(config, session_id, &mut reader, &mut writer).await;
             writer.shutdown().await?;
+            if rc.is_err() {
+                return rc;
+            }
         }
         _ => {
             let _ = conn.shutdown(std::net::Shutdown::Both);

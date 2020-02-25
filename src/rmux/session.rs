@@ -663,7 +663,7 @@ where
         closed: AtomicBool::new(false),
     };
     let session_state = Arc::new(session_state);
-    let send_session_state = session_state.clone();
+    //let send_session_state = session_state.clone();
     let recv_session_state = session_state.clone();
     let mux_session = MuxSession {
         id: tunnel_id,
@@ -818,7 +818,7 @@ where
                 }
             }
             let mut exit = false;
-            while vbuf.vlen() < 32 {
+            while vbuf.vlen() < 60 {
                 match send_rx.try_recv() {
                     Ok(data) => {
                         if data.is_empty() {
@@ -840,6 +840,13 @@ where
             if exit {
                 break;
             }
+            session_state.io_active_unix_secs.store(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as u32,
+                Ordering::SeqCst,
+            );
             match wi.write_buf(&mut vbuf).await {
                 Ok(n) => {
                     if 0 == n {

@@ -71,7 +71,6 @@ impl Buf for VBuf {
         }
     }
 
-    #[allow(clippy::needless_range_loop)]
     fn bytes_vectored<'c>(&'c self, dst: &mut [IoSlice<'c>]) -> usize {
         let len = cmp::min(self.inner.len(), dst.len());
 
