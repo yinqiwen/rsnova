@@ -15,6 +15,7 @@ pub use self::config::Config;
 
 mod channel;
 pub mod config;
+mod debug;
 mod rmux;
 mod tunnel;
 mod utils;
@@ -39,6 +40,13 @@ pub async fn start_rsnova(cfg: config::Config) -> Result<(), Box<dyn Error>> {
         logger = logger.duplicate_to_stderr(flexi_logger::Duplicate::Info);
     }
     logger.start().unwrap();
+
+    if cfg.debug.is_some() {
+        let debug_cfg = cfg.debug.unwrap();
+        let debug_server = tiny_http::Server::http(debug_cfg.listen.as_str()).unwrap();
+        let handle = debug::handle_debug_server(debug_server);
+        tokio::spawn(handle);
+    }
 
     for c in cfg.tunnel {
         info!("Start rsnova client at {} ", c.listen);

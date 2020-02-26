@@ -68,9 +68,15 @@ pub struct TunnelConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DebugConfig {
+    pub listen: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub log: LogConfig,
     pub tunnel: Vec<TunnelConfig>,
     // pub server: Vec<ServerConfig>,
     pub channel: Option<Vec<ChannelConfig>>,
+    pub debug: Option<DebugConfig>,
 }

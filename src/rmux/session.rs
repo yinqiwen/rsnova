@@ -58,6 +58,9 @@ pub struct MuxSessionState {
     retired: AtomicBool,
     io_active_unix_secs: AtomicU32,
     closed: AtomicBool,
+    process_event_state: AtomicU32,
+    process_send_state: AtomicU32,
+    process_recv_state: AtomicU32,
 }
 
 impl MuxSessionState {
@@ -384,26 +387,76 @@ fn get_streams_stat_info(streams: &mut HashMap<u32, MuxStream>) -> String {
     info
 }
 
-fn log_session_state(
-    sid: u32,
-    streams: &mut HashMap<u32, MuxStream>,
-    now_unix_secs: u32,
-    session_state: &Arc<MuxSessionState>,
-) -> u32 {
+fn log_session_state(sid: u32, now_unix_secs: u32, session_state: &Arc<MuxSessionState>) -> String {
     let mut stat_info = format!(
-        "\n========================Session:{}====================\n",
+        "========================Session:{}====================\n",
         sid
     );
-    stat_info.push_str(format!("Streams:{}\n", streams.len()).as_str());
     stat_info.push_str(format!("Age:{:?}\n", session_state.born_time.elapsed()).as_str());
     stat_info.push_str(format!("PingPongGap:{}\n", session_state.ping_pong_gap()).as_str());
     let idle_secs = session_state.get_io_idle_secs(now_unix_secs);
     stat_info.push_str(format!("IOIdleSecs:{}\n", idle_secs).as_str());
     stat_info.push_str(format!("Retired:{}\n", session_state.is_retired()).as_str());
     stat_info.push_str(format!("Closed:{}\n", session_state.is_closed()).as_str());
-    stat_info.push_str(get_streams_stat_info(streams).as_str());
-    warn!("{}", stat_info);
-    idle_secs
+    stat_info.push_str(
+        format!(
+            "ProcEventState:{}\n",
+            session_state.process_event_state.load(Ordering::SeqCst)
+        )
+        .as_str(),
+    );
+    stat_info.push_str(
+        format!(
+            "ProcSendState:{}\n",
+            session_state.process_send_state.load(Ordering::SeqCst)
+        )
+        .as_str(),
+    );
+    stat_info.push_str(
+        format!(
+            "ProcRecvState:{}\n",
+            session_state.process_recv_state.load(Ordering::SeqCst)
+        )
+        .as_str(),
+    );
+    //stat_info.push_str(get_streams_stat_info(streams).as_str());
+    stat_info
+}
+
+pub fn dump_session_state() -> String {
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let mut stat_info = String::from("========================Sessions====================\n");
+    {
+        let ss = &mut CHANNEL_SESSIONS.lock().unwrap();
+        let cmap = &mut ss.channels;
+        for (channel, csession) in cmap {
+            stat_info.push_str(format!("Channel:{}\n", channel).as_str());
+            let mut count = 0;
+            for s in csession.sessions.iter() {
+                match s {
+                    Some(session) => {
+                        let info = log_session_state(session.id, now_unix_secs, &session.state);
+                        stat_info.push_str(info.as_str());
+                        count += 1;
+                    }
+                    None => {
+                        //
+                    }
+                }
+            }
+            stat_info.push_str(format!("Channel:{} Count:{}\n", channel, count).as_str());
+        }
+        stat_info.push_str("Retired Sessions:\n");
+        let retired = &mut ss.retired;
+        for s in retired {
+            let info = log_session_state(s.id, now_unix_secs, &s.state);
+            stat_info.push_str(info.as_str());
+        }
+    }
+    stat_info
 }
 
 fn handle_ping_event(
@@ -432,7 +485,8 @@ fn handle_routine_event(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as u32;
-    let idle_io_secs = log_session_state(sid, streams, now_unix_secs, &session_state);
+    let idle_io_secs = session_state.get_io_idle_secs(now_unix_secs);
+    //let idle_io_secs = log_session_state(sid, streams, now_unix_secs, &session_state);
     let should_close = (session_state.is_retired() && streams.is_empty()) || idle_io_secs >= 300;
 
     if should_close {
@@ -590,6 +644,7 @@ async fn process_event<'a>(
             break;
         }
     }
+    session_state.process_event_state.store(1, Ordering::SeqCst);
     error!("[{}][{}]handle_event done", channel, tunnel_id);
     session_state.closed.store(true, Ordering::SeqCst);
     for (_, stream) in streams.iter_mut() {
@@ -597,6 +652,7 @@ async fn process_event<'a>(
     }
     event_rx.close();
     let _ = send_tx.send(Vec::new()).await;
+    session_state.process_event_state.store(2, Ordering::SeqCst);
 }
 
 pub struct MuxContext<'a> {
@@ -661,6 +717,9 @@ where
         retired: AtomicBool::new(false),
         io_active_unix_secs: AtomicU32::new(0),
         closed: AtomicBool::new(false),
+        process_event_state: AtomicU32::new(0),
+        process_send_state: AtomicU32::new(0),
+        process_recv_state: AtomicU32::new(0),
     };
     let session_state = Arc::new(session_state);
     //let send_session_state = session_state.clone();
@@ -764,6 +823,9 @@ where
             //     }
             // }
         }
+        handle_recv_session_state
+            .process_recv_state
+            .store(1, Ordering::SeqCst);
         error!("[{}][{}]handle_recv done", channel, tunnel_id);
         handle_recv_session_state
             .closed
@@ -771,6 +833,9 @@ where
         let shutdown_ev = new_shutdown_event(0, false);
         let _ = handle_recv_event_tx.send(shutdown_ev).await;
         let _ = handle_recv_send_tx.send(Vec::new()).await;
+        handle_recv_session_state
+            .process_recv_state
+            .store(2, Ordering::SeqCst);
     };
 
     // let handle_event_event_tx = event_tx.clone();
@@ -858,6 +923,9 @@ where
                 }
             }
         }
+        handle_send_session_state
+            .process_send_state
+            .store(1, Ordering::SeqCst);
         error!("[{}][{}]handle_send done", channel, tunnel_id);
         handle_send_session_state
             .closed
@@ -867,6 +935,9 @@ where
         //let _ = wi.shutdown().await;
         let shutdown_ev = new_shutdown_event(0, false);
         let _ = event_tx.send(shutdown_ev).await;
+        handle_send_session_state
+            .process_send_state
+            .store(2, Ordering::SeqCst);
     };
 
     join3(handle_recv, handle_event, handle_send).await;

@@ -42,11 +42,13 @@ rustls="0.16"
 tokio-tungstenite = { version = "*"}
 #tungstenite="0.10.1"
 async-tls="0.6"
+tiny_http = "0.6"
 
 [dependencies.tungstenite]
 version = "0.10.1"
 default-features = false 
 features = []
+
 
 
 
