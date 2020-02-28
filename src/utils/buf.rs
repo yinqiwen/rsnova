@@ -69,6 +69,7 @@ impl Buf for VBuf {
                 return;
             }
         }
+        self.inner.shrink_to_fit();
     }
 
     fn bytes_vectored<'c>(&'c self, dst: &mut [IoSlice<'c>]) -> usize {

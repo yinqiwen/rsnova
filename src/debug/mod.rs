@@ -1,6 +1,6 @@
 use super::rmux::dump_session_state;
 
-pub async fn handle_debug_server(debug_server: tiny_http::Server) {
+pub fn handle_debug_server(debug_server: tiny_http::Server) {
     for request in debug_server.incoming_requests() {
         // println!(
         //     "received request! method: {:?}, url: {:?}, headers: {:?}",
@@ -13,7 +13,7 @@ pub async fn handle_debug_server(debug_server: tiny_http::Server) {
             let s = tiny_http::Response::from_string(dump_session_state());
             let _ = request.respond(s);
         } else {
-            let response = tiny_http::Response::from_string("hello world");
+            let response = tiny_http::Response::from_string("Not support");
             let _ = request.respond(response);
         }
     }

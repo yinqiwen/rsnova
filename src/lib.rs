@@ -22,6 +22,7 @@ mod utils;
 
 use futures::FutureExt;
 use std::error::Error;
+use std::thread;
 
 pub async fn start_rsnova(cfg: config::Config) -> Result<(), Box<dyn Error>> {
     let mut logger = flexi_logger::Logger::with_str(cfg.log.level.as_str());
@@ -44,8 +45,9 @@ pub async fn start_rsnova(cfg: config::Config) -> Result<(), Box<dyn Error>> {
     if cfg.debug.is_some() {
         let debug_cfg = cfg.debug.unwrap();
         let debug_server = tiny_http::Server::http(debug_cfg.listen.as_str()).unwrap();
-        let handle = debug::handle_debug_server(debug_server);
-        tokio::spawn(handle);
+        thread::spawn(move || {
+            debug::handle_debug_server(debug_server);
+        });
     }
 
     for c in cfg.tunnel {

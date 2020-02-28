@@ -190,6 +190,10 @@ impl AsyncWrite for MuxStreamWriter {
         _cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
         self.state.closed.store(true, Ordering::SeqCst);
+        if let Some(tx) = &self.io_state.lock().unwrap().data_tx {
+            let empty = Vec::new();
+            let _ = tx.clone().try_send(empty);
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -259,6 +263,14 @@ impl MuxStream {
     }
     pub async fn offer_data(&mut self, data: Vec<u8>) {
         self.check_data_tx();
+        if self.state.closed.load(Ordering::SeqCst) {
+            error!(
+                "[{}]Already closed for data len:{}.",
+                self.state.stream_id,
+                data.len()
+            );
+            return;
+        }
         //error!("[{}]off data len:{}.", self.state.stream_id, data.len());
         assert!(!data.is_empty());
         if let Some(tx) = &mut self.data_tx {

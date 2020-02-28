@@ -205,19 +205,24 @@ pub async fn routine_all_sessions() {
                             let ping = new_ping_event(0, false);
                             actions.push(RoutineAction::new(ping, s.event_tx.clone()));
                         }
-                        let r = new_routine_event(0);
-                        actions.push(RoutineAction::new(r, s.event_tx.clone()));
-                        if s.max_alive_secs > 0 && !channel.is_empty() {
-                            let rand_inc: i64 = {
-                                let mut rng = rand::thread_rng();
-                                rng.gen_range(-60, 60)
-                            };
-                            //let session_id = s.id;
-                            let cmp_secs = s.max_alive_secs as i64 + rand_inc;
-                            if s.state.born_time.elapsed().as_secs() > cmp_secs as u64 {
-                                s.state.retired.store(true, Ordering::SeqCst);
-                                retired.push(session.take().unwrap());
-                                //csession.session_ids.remove(&session_id);
+                        if s.state.closed.load(Ordering::SeqCst) {
+                            s.state.retired.store(true, Ordering::SeqCst);
+                            retired.push(session.take().unwrap());
+                        } else {
+                            let r = new_routine_event(0);
+                            actions.push(RoutineAction::new(r, s.event_tx.clone()));
+                            if s.max_alive_secs > 0 && !channel.is_empty() {
+                                let rand_inc: i64 = {
+                                    let mut rng = rand::thread_rng();
+                                    rng.gen_range(-60, 60)
+                                };
+                                //let session_id = s.id;
+                                let cmp_secs = s.max_alive_secs as i64 + rand_inc;
+                                if s.state.born_time.elapsed().as_secs() > cmp_secs as u64 {
+                                    s.state.retired.store(true, Ordering::SeqCst);
+                                    retired.push(session.take().unwrap());
+                                    //csession.session_ids.remove(&session_id);
+                                }
                             }
                         }
                     }
@@ -433,7 +438,7 @@ pub fn dump_session_state() -> String {
         let ss = &mut CHANNEL_SESSIONS.lock().unwrap();
         let cmap = &mut ss.channels;
         for (channel, csession) in cmap {
-            stat_info.push_str(format!("Channel:{}\n", channel).as_str());
+            stat_info.push_str(format!("======Channel:{}=======\n", channel).as_str());
             let mut count = 0;
             for s in csession.sessions.iter() {
                 match s {
@@ -447,9 +452,10 @@ pub fn dump_session_state() -> String {
                     }
                 }
             }
-            stat_info.push_str(format!("Channel:{} Count:{}\n", channel, count).as_str());
+            stat_info
+                .push_str(format!("======Channel:{} Count:{}======\n", channel, count).as_str());
         }
-        stat_info.push_str("Retired Sessions:\n");
+        stat_info.push_str("\nRetired Sessions:\n");
         let retired = &mut ss.retired;
         for s in retired {
             let info = log_session_state(s.id, now_unix_secs, &s.state);
