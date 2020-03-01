@@ -797,37 +797,6 @@ where
                     break;
                 },
             }
-            // let recv_event = read_encrypt_event(&mut rctx, ri, recv_buf).await;
-            // match recv_event {
-            //     Ok(Some(mut ev)) => {
-            //         recv_session_state.io_active_unix_secs.store(
-            //             SystemTime::now()
-            //                 .duration_since(UNIX_EPOCH)
-            //                 .unwrap()
-            //                 .as_secs() as u32,
-            //             Ordering::SeqCst,
-            //         );
-            //         ev.remote = true;
-            //         if FLAG_DATA != ev.header.flags() {
-            //             info!(
-            //                 "[{}][{}][{}]remote recv event type:{}, len:{}",
-            //                 channel,
-            //                 tunnel_id,
-            //                 ev.header.stream_id,
-            //                 get_event_type_str(ev.header.flags()),
-            //                 ev.header.len(),
-            //             );
-            //         }
-            //         let _ = handle_recv_event_tx.send(ev).await;
-            //     }
-            //     Ok(None) => {
-            //         break;
-            //     }
-            //     Err(err) => {
-            //         error!("Close remote recv since of error:{}", err);
-            //         break;
-            //     }
-            // }
         }
         handle_recv_session_state
             .process_recv_state
@@ -836,8 +805,8 @@ where
         handle_recv_session_state
             .closed
             .store(true, Ordering::SeqCst);
-        let shutdown_ev = new_shutdown_event(0, false);
-        let _ = handle_recv_event_tx.send(shutdown_ev).await;
+        //let shutdown_ev = new_shutdown_event(0, false);
+        //let _ = handle_recv_event_tx.send(shutdown_ev).await;
         let _ = handle_recv_send_tx.send(Vec::new()).await;
         handle_recv_session_state
             .process_recv_state
@@ -937,8 +906,10 @@ where
             .closed
             .store(true, Ordering::SeqCst);
         send_rx.close();
-        let _ = close_tx.send(());
-        //let _ = wi.shutdown().await;
+        let close_rc = close_tx.send(());
+        if close_rc.is_err() {
+            error!("[{}][{}]Close error:{:?}", channel, tunnel_id, close_rc);
+        }
         let shutdown_ev = new_shutdown_event(0, false);
         let _ = event_tx.send(shutdown_ev).await;
         handle_send_session_state

@@ -17,7 +17,7 @@ pub async fn relay_connection(
     relay_buf: Vec<u8>,
 ) -> Result<(), Box<dyn Error>> {
     let (mut ri, mut wi) = inbound.split();
-    relay_stream(tunnel_id, &mut ri, &mut wi, target, cfg, relay_buf).await?;
+    let _ = relay_stream(tunnel_id, &mut ri, &mut wi, target, cfg, relay_buf).await;
     let _ = inbound.shutdown(Shutdown::Both);
     Ok(())
 }

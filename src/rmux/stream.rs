@@ -35,6 +35,15 @@ struct SharedIOState {
     data_rx: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
+impl SharedIOState {
+    fn try_close(&mut self) {
+        if let Some(tx) = &mut self.data_tx {
+            let empty = Vec::new();
+            let _ = tx.clone().try_send(empty);
+        }
+    }
+}
+
 impl MuxStreamState {
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
@@ -141,6 +150,7 @@ impl AsyncWrite for MuxStreamWriter {
             io_state,
         } = &mut *self;
         if state.closed.load(Ordering::SeqCst) {
+            io_state.lock().unwrap().try_close();
             return Poll::Ready(Err(make_io_error("closed")));
         }
         if state.send_buf_window.load(Ordering::SeqCst) < 0 {
@@ -166,11 +176,17 @@ impl AsyncWrite for MuxStreamWriter {
         // }
         match tx.poll_ready(cx) {
             Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(make_io_error(e.description()))),
+            Poll::Ready(Err(e)) => {
+                io_state.lock().unwrap().try_close();
+                return Poll::Ready(Err(make_io_error(e.description())));
+            }
             Poll::Ready(Ok(())) => {}
         }
         match tx.try_send(ev) {
-            Err(e) => Poll::Ready(Err(make_io_error(e.description()))),
+            Err(e) => {
+                io_state.lock().unwrap().try_close();
+                return Poll::Ready(Err(make_io_error(e.description())));
+            }
             Ok(()) => {
                 state
                     .send_buf_window
@@ -190,10 +206,7 @@ impl AsyncWrite for MuxStreamWriter {
         _cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
         self.state.closed.store(true, Ordering::SeqCst);
-        if let Some(tx) = &self.io_state.lock().unwrap().data_tx {
-            let empty = Vec::new();
-            let _ = tx.clone().try_send(empty);
-        }
+        self.io_state.lock().unwrap().try_close();
         Poll::Ready(Ok(()))
     }
 }
