@@ -10,6 +10,8 @@ pub const METHOD_AES128_GCM: &str = "aes128gcm";
 pub const METHOD_CHACHA20_POLY1305: &str = "chacha20poly1305";
 pub const METHOD_NONE: &str = "none";
 
+static DEFAULT_RECV_BUF_SIZE: u32 = 64 * 1024;
+
 struct CryptoNonceSequence {
     nonce: u64,
 }
@@ -294,8 +296,8 @@ where
         if recv_buf.is_empty() {
             recv_buf.clear();
         }
-        if next_read_n > 0 && next_read_n < 4096 {
-            next_read_n = 4096;
+        if next_read_n > 0 && next_read_n < DEFAULT_RECV_BUF_SIZE {
+            next_read_n = DEFAULT_RECV_BUF_SIZE;
         }
         if next_read_n > 0 {
             recv_buf.reserve(next_read_n as usize);
