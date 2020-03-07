@@ -745,8 +745,8 @@ where
     );
     store_mux_session(channel, mux_session);
 
-    let (close_tx, close_rx) = oneshot::channel::<()>();
-    let mut drop = close_rx.fuse();
+    let (mut close_tx, mut close_rx) = mpsc::channel::<()>(1);
+    //let mut drop = close_rx.fuse();
 
     let mut handle_recv_event_tx = event_tx.clone();
     let mut handle_recv_send_tx = send_tx.clone();
@@ -754,8 +754,8 @@ where
     let handle_send_session_state = session_state.clone();
     let handle_recv = async move {
         while !handle_recv_session_state.closed.load(Ordering::SeqCst) {
-            select! {
-                recv_event = read_encrypt_event(&mut rctx, ri, recv_buf).fuse() => {
+            tokio::select! {
+                recv_event = read_encrypt_event(&mut rctx, ri, recv_buf) => {
                     match recv_event {
                         Ok(Some(mut ev)) => {
                             recv_session_state.io_active_unix_secs.store(
@@ -792,7 +792,7 @@ where
                         }
                     }
                 },
-                _ = drop => {
+                _ = close_rx.recv() => {
                     handle_recv_session_state.closed.store(true, Ordering::SeqCst);
                     break;
                 },
@@ -906,7 +906,7 @@ where
             .closed
             .store(true, Ordering::SeqCst);
         send_rx.close();
-        let close_rc = close_tx.send(());
+        let close_rc = close_tx.send(()).await;
         if close_rc.is_err() {
             error!("[{}][{}]Close error:{:?}", channel, tunnel_id, close_rc);
         }
