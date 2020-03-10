@@ -23,7 +23,6 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::oneshot;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -572,12 +571,14 @@ async fn process_event<'a>(
 ) {
     let mut streams = HashMap::new();
     while !session_state.closed.load(Ordering::SeqCst) {
+        session_state.process_event_state.store(0, Ordering::SeqCst);
         let rev = event_rx.recv().await;
         if let Some(ev) = rev {
             if FLAG_PING == ev.header.flags() {
                 handle_ping_event(tunnel_id, &mut streams, &session_state, ev.remote);
             }
             if !ev.remote {
+                session_state.process_event_state.store(3, Ordering::SeqCst);
                 if handle_local_event(
                     channel,
                     tunnel_id,
@@ -589,8 +590,10 @@ async fn process_event<'a>(
                 )
                 .await
                 {
+                    session_state.process_event_state.store(4, Ordering::SeqCst);
                     continue;
                 }
+                session_state.process_event_state.store(4, Ordering::SeqCst);
                 break;
             }
             match ev.header.flags() {
@@ -607,7 +610,9 @@ async fn process_event<'a>(
                 }
                 FLAG_DATA => {
                     if let Some(stream) = streams.get_mut(&ev.header.stream_id) {
+                        session_state.process_event_state.store(1, Ordering::SeqCst);
                         stream.offer_data(ev.body).await;
+                        session_state.process_event_state.store(2, Ordering::SeqCst);
                     } else {
                         warn!(
                             "[{}][{}]No stream found for data event.",
@@ -650,7 +655,7 @@ async fn process_event<'a>(
             break;
         }
     }
-    session_state.process_event_state.store(1, Ordering::SeqCst);
+    session_state.process_event_state.store(5, Ordering::SeqCst);
     error!("[{}][{}]handle_event done", channel, tunnel_id);
     session_state.closed.store(true, Ordering::SeqCst);
     for (_, stream) in streams.iter_mut() {
@@ -658,7 +663,7 @@ async fn process_event<'a>(
     }
     event_rx.close();
     let _ = send_tx.send(Vec::new()).await;
-    session_state.process_event_state.store(2, Ordering::SeqCst);
+    session_state.process_event_state.store(6, Ordering::SeqCst);
 }
 
 pub struct MuxContext<'a> {
@@ -776,7 +781,9 @@ where
                                     ev.header.len(),
                                 );
                             }
+                            handle_recv_session_state.process_recv_state.store(1, Ordering::SeqCst);
                             let send_rc = handle_recv_event_tx.send(ev).await;
+                            handle_recv_session_state.process_recv_state.store(0, Ordering::SeqCst);
                             if send_rc.is_err(){
                                 break;
                             }
@@ -800,7 +807,7 @@ where
         }
         handle_recv_session_state
             .process_recv_state
-            .store(1, Ordering::SeqCst);
+            .store(3, Ordering::SeqCst);
         error!("[{}][{}]handle_recv done", channel, tunnel_id);
         handle_recv_session_state
             .closed

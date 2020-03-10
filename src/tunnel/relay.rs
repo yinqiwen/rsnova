@@ -6,7 +6,7 @@ use crate::utils::{buf_copy, make_error};
 use futures::future::join;
 use std::error::Error;
 use std::net::Shutdown;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub async fn relay_connection(
@@ -79,12 +79,42 @@ where
         let _ = buf_copy(local_reader, remote_writer, Box::new([0; 8192])).await;
         info!("[{}]Stream close client_to_server", tunnel_id);
         let _ = remote_writer.shutdown().await;
+
+        //clear all buffer from reader
+        let mut buffer = [0; 4096];
+        loop {
+            match local_reader.read(&mut buffer).await {
+                Err(_) => {
+                    break;
+                }
+                Ok(n) => {
+                    if 0 == n {
+                        break;
+                    }
+                }
+            }
+        }
         //()
     };
     let server_to_client = async {
         let _ = buf_copy(remote_reader, local_writer, Box::new([0; 8192])).await;
         info!("[{}]Stream close server_to_client", tunnel_id);
         let _ = local_writer.shutdown().await;
+
+        //clear all buffer from reader
+        let mut buffer = [0; 4096];
+        loop {
+            match remote_reader.read(&mut buffer).await {
+                Err(_) => {
+                    break;
+                }
+                Ok(n) => {
+                    if 0 == n {
+                        break;
+                    }
+                }
+            }
+        }
         //()
     };
     join(client_to_server, server_to_client).await;
