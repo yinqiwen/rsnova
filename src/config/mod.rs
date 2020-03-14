@@ -65,6 +65,7 @@ pub struct TunnelConfig {
     pub listen: String,
     pub cipher: Option<CipherConfig>,
     pub pac: Vec<PACConfig>,
+    pub tunnel_server: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

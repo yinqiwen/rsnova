@@ -23,6 +23,15 @@ async fn handle_inbound(
     mut inbound: TcpStream,
     cfg: TunnelConfig,
 ) -> Result<(), Box<dyn Error>> {
+    if cfg.tunnel_server.is_some() {
+        let target = String::from(cfg.tunnel_server.as_ref().unwrap());
+        let relay = async move {
+            let _ = relay_connection(tunnel_id, inbound, &cfg, target, Vec::new()).await;
+        };
+        tokio::spawn(relay);
+        return Ok(());
+    }
+
     let mut peek_buf = [0u8; 3];
     inbound.peek(&mut peek_buf).await?;
     match peek_buf[0] {

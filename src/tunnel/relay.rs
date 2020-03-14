@@ -9,6 +9,8 @@ use std::net::Shutdown;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+const RELAY_BUF_SIZE: usize = 128 * 1024;
+
 pub async fn relay_connection(
     tunnel_id: u32,
     mut inbound: TcpStream,
@@ -17,6 +19,8 @@ pub async fn relay_connection(
     relay_buf: Vec<u8>,
 ) -> Result<(), Box<dyn Error>> {
     let (mut ri, mut wi) = inbound.split();
+    let mut ri = tokio::io::BufReader::new(ri);
+    let mut wi = tokio::io::BufWriter::new(wi);
     let _ = relay_stream(tunnel_id, &mut ri, &mut wi, target, cfg, relay_buf).await;
     let _ = inbound.shutdown(Shutdown::Both);
     Ok(())
@@ -76,7 +80,7 @@ where
     B: AsyncWrite + Unpin + ?Sized,
 {
     let client_to_server = async {
-        let _ = buf_copy(local_reader, remote_writer, Box::new([0; 8192])).await;
+        let _ = buf_copy(local_reader, remote_writer, Box::new([0; RELAY_BUF_SIZE])).await;
         info!("[{}]Stream close client_to_server", tunnel_id);
         let _ = remote_writer.shutdown().await;
 
@@ -97,7 +101,7 @@ where
         //()
     };
     let server_to_client = async {
-        let _ = buf_copy(remote_reader, local_writer, Box::new([0; 8192])).await;
+        let _ = buf_copy(remote_reader, local_writer, Box::new([0; RELAY_BUF_SIZE])).await;
         info!("[{}]Stream close server_to_client", tunnel_id);
         let _ = local_writer.shutdown().await;
 
