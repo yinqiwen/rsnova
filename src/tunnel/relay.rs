@@ -19,8 +19,8 @@ pub async fn relay_connection(
     relay_buf: Vec<u8>,
 ) -> Result<(), Box<dyn Error>> {
     let (mut ri, mut wi) = inbound.split();
-    let mut ri = tokio::io::BufReader::new(ri);
-    let mut wi = tokio::io::BufWriter::new(wi);
+    //let mut ri = tokio::io::BufReader::new(ri);
+    //let mut wi = tokio::io::BufWriter::new(wi);
     let _ = relay_stream(tunnel_id, &mut ri, &mut wi, target, cfg, relay_buf).await;
     let _ = inbound.shutdown(Shutdown::Both);
     Ok(())

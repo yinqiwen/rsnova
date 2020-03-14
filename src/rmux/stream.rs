@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 use crate::channel::ChannelStream;
 use crate::utils::{fill_read_buf, make_io_error};
 
+const SEND_BUF_WINDOW: i32 = 1024 * 1024;
+
 pub struct MuxStreamState {
     pub channel: String,
     pub session_id: u32,
@@ -231,7 +233,7 @@ impl MuxStream {
             channel: String::from(name),
             session_id: id0,
             stream_id: id1,
-            send_buf_window: AtomicI32::new(128 * 1024),
+            send_buf_window: AtomicI32::new(SEND_BUF_WINDOW),
             recv_buf_size: AtomicI32::new(0),
             closed: AtomicBool::new(false),
             total_recv_bytes: AtomicU32::new(0),
