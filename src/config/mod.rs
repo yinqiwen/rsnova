@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 // lazy_static! {
 //     static ref GLOBAL_CONFIG: Mutex<Config> = Mutex::new(Config::new());
 // }
+pub const DEFAULT_RELAY_BUF_SIZE: usize = 64 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LogConfig {
@@ -49,6 +50,7 @@ pub struct ChannelConfig {
     pub work_time_frame: Option<[u8; 2]>,
     pub sni: Option<String>,
     pub sni_proxy: Option<String>,
+    pub relay_buf_size: Option<usize>,
 }
 
 impl ChannelConfig {
@@ -58,6 +60,12 @@ impl ChannelConfig {
         }
         true
     }
+    pub fn relay_buf_size(&self) -> usize {
+        match self.relay_buf_size {
+            Some(v) => v,
+            None => DEFAULT_RELAY_BUF_SIZE,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -66,6 +74,16 @@ pub struct TunnelConfig {
     pub cipher: Option<CipherConfig>,
     pub pac: Vec<PACConfig>,
     pub tunnel_server: Option<String>,
+    pub relay_buf_size: Option<usize>,
+}
+
+impl TunnelConfig {
+    pub fn relay_buf_size(&self) -> usize {
+        match self.relay_buf_size {
+            Some(v) => v,
+            None => DEFAULT_RELAY_BUF_SIZE,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

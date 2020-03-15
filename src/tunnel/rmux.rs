@@ -55,6 +55,16 @@ pub async fn handle_rmux(
     inbound.write_all(&buf[..]).await?;
     let rctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);
     let wctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);
-    handle_rmux_session("", tunnel_id, inbound, rctx, wctx, &mut recv_buf, 0).await?;
+    handle_rmux_session(
+        "",
+        tunnel_id,
+        inbound,
+        rctx,
+        wctx,
+        &mut recv_buf,
+        0,
+        cfg.relay_buf_size(),
+    )
+    .await?;
     Ok(())
 }

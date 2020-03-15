@@ -23,10 +23,10 @@ pub struct BufCopy<'a, R: ?Sized, W: ?Sized> {
     pos: usize,
     cap: usize,
     amt: u64,
-    buf: Box<[u8]>,
+    buf: Vec<u8>,
 }
 
-pub fn buf_copy<'a, R, W>(reader: &'a mut R, writer: &'a mut W, buf: Box<[u8]>) -> BufCopy<'a, R, W>
+pub fn buf_copy<'a, R, W>(reader: &'a mut R, writer: &'a mut W, buf: Vec<u8>) -> BufCopy<'a, R, W>
 where
     R: AsyncRead + Unpin + ?Sized,
     W: AsyncWrite + Unpin + ?Sized,

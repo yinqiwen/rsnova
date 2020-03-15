@@ -219,6 +219,7 @@ pub struct MuxStream {
     pub data_tx: Option<mpsc::Sender<Vec<u8>>>,
     pub state: Arc<MuxStreamState>,
     io_state: Arc<Mutex<SharedIOState>>,
+    relay_buf_size: usize,
 }
 
 impl MuxStream {
@@ -228,12 +229,13 @@ impl MuxStream {
         id1: u32,
         evtx: mpsc::Sender<Event>,
         target: ConnectRequest,
+        relay_buf_size: usize,
     ) -> Self {
         let state = MuxStreamState {
             channel: String::from(name),
             session_id: id0,
             stream_id: id1,
-            send_buf_window: AtomicI32::new(SEND_BUF_WINDOW),
+            send_buf_window: AtomicI32::new(relay_buf_size as i32 * 4),
             recv_buf_size: AtomicI32::new(0),
             closed: AtomicBool::new(false),
             total_recv_bytes: AtomicU32::new(0),
@@ -252,10 +254,15 @@ impl MuxStream {
             data_tx: None,
             state: Arc::new(state),
             io_state: Arc::new(Mutex::new(io_state)),
+            relay_buf_size,
         }
     }
     pub fn id(&self) -> u32 {
         self.state.stream_id
+    }
+
+    pub fn relay_buf_size(&self) -> usize {
+        self.relay_buf_size
     }
 
     fn check_data_tx(&mut self) {
@@ -301,6 +308,7 @@ impl MuxStream {
             data_tx: None,
             state: self.state.clone(),
             io_state: self.io_state.clone(),
+            relay_buf_size: self.relay_buf_size,
         };
         if let Some(tx) = &self.data_tx {
             v.data_tx = Some(tx.clone());

@@ -244,6 +244,7 @@ pub async fn create_stream(
     channel: &str,
     proto: &str,
     addr: &str,
+    relay_buf_size: usize,
 ) -> Result<MuxStream, std::io::Error> {
     let (stream, ev, ev_sender) = {
         let mut stream: Option<MuxStream> = None;
@@ -269,6 +270,7 @@ pub async fn create_stream(
                         cev.header.stream_id,
                         session.event_tx.clone(),
                         creq,
+                        relay_buf_size,
                     );
                     session.pendding_streams.push(pendding_stream.clone());
                     stream = Some(pendding_stream);
@@ -318,6 +320,7 @@ pub fn report_update_window(
 
 async fn handle_rmux_stream(mut stream: MuxStream) -> Result<(), Box<dyn Error>> {
     let stream_id = stream.state.stream_id;
+    let relay_buf_size = stream.relay_buf_size();
     let target = String::from(stream.target.addr.as_str());
     let result = get_channel_stream(String::from("direct"), target).await;
     match result {
@@ -325,7 +328,15 @@ async fn handle_rmux_stream(mut stream: MuxStream) -> Result<(), Box<dyn Error>>
             {
                 let (mut ri, mut wi) = stream.split();
                 let (mut ro, mut wo) = remote.split();
-                relay(stream_id, &mut ri, &mut wi, &mut ro, &mut wo).await?;
+                relay(
+                    stream_id,
+                    &mut ri,
+                    &mut wi,
+                    &mut ro,
+                    &mut wo,
+                    relay_buf_size,
+                )
+                .await?;
             }
             let _ = stream.close();
             let _ = remote.close();
@@ -343,6 +354,7 @@ fn handle_syn(
     session_id: u32,
     ev: Event,
     evtx: mpsc::Sender<Event>,
+    relay_buf_size: usize,
 ) -> Option<MuxStream> {
     let connect_req: ConnectRequest = match bincode::deserialize(&ev.body[..]) {
         Ok(m) => m,
@@ -361,7 +373,7 @@ fn handle_syn(
         "[{}]Handle conn request:{} {}",
         sid, connect_req.proto, connect_req.addr
     );
-    let stream = MuxStream::new(channel, session_id, sid, evtx, connect_req);
+    let stream = MuxStream::new(channel, session_id, sid, evtx, connect_req, relay_buf_size);
     let handle = handle_rmux_stream(stream.clone()).map(move |r| {
         if let Err(e) = r {
             error!("[{}]Failed to handle rmux stream; error={}", sid, e);
@@ -568,6 +580,7 @@ async fn process_event<'a>(
     mut event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     mut send_tx: mpsc::Sender<Vec<u8>>,
+    relay_buf_size: usize,
 ) {
     let mut streams = HashMap::new();
     while !session_state.closed.load(Ordering::SeqCst) {
@@ -598,7 +611,9 @@ async fn process_event<'a>(
             }
             match ev.header.flags() {
                 FLAG_SYN => {
-                    if let Some(stream) = handle_syn(channel, tunnel_id, ev, event_tx.clone()) {
+                    if let Some(stream) =
+                        handle_syn(channel, tunnel_id, ev, event_tx.clone(), relay_buf_size)
+                    {
                         streams.entry(stream.state.stream_id).or_insert(stream);
                     } else {
                     }
@@ -704,6 +719,7 @@ pub async fn process_rmux_session<'a, R, W>(
     // mut wctx: CryptoContext,
     // recv_buf: &mut BytesMut,
     // max_alive_secs: u64,
+    relay_buf_size: usize,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin + Sized,
@@ -830,6 +846,7 @@ where
         event_rx,
         event_tx.clone(),
         send_tx.clone(),
+        relay_buf_size,
     );
 
     let handle_send = async {
@@ -938,6 +955,7 @@ pub async fn handle_rmux_session(
     wctx: CryptoContext,
     recv_buf: &mut BytesMut,
     max_alive_secs: u64,
+    relay_buf_size: usize,
     //cfg: &TunnelConfig,
 ) -> Result<(), std::io::Error> {
     let (mut ri, mut wi) = inbound.split();
@@ -951,6 +969,7 @@ pub async fn handle_rmux_session(
         // wctx,
         // recv_buf,
         // max_alive_secs,
+        relay_buf_size,
     )
     .await?;
     let _ = inbound.shutdown(std::net::Shutdown::Both);

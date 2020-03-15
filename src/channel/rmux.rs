@@ -1,5 +1,5 @@
 use super::ChannelStream;
-use crate::config::ChannelConfig;
+use crate::config::{ChannelConfig, DEFAULT_RELAY_BUF_SIZE};
 
 use crate::rmux::{
     create_stream, new_auth_event, process_rmux_session, read_encrypt_event, write_encrypt_event,
@@ -67,6 +67,7 @@ where
         // wctx,
         // &mut recv_buf,
         // config.max_alive_mins as u64 * 60,
+        config.relay_buf_size(),
     )
     .await?;
     Ok(())
@@ -173,6 +174,6 @@ pub async fn get_rmux_stream(
     channel: &str,
     addr: String,
 ) -> Result<Box<dyn ChannelStream + Send>, std::io::Error> {
-    let stream = create_stream(channel, "tcp", addr.as_str()).await?;
+    let stream = create_stream(channel, "tcp", addr.as_str(), DEFAULT_RELAY_BUF_SIZE).await?;
     Ok(Box::new(stream))
 }
