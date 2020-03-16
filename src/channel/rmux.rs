@@ -5,7 +5,10 @@ use crate::rmux::{
     create_stream, new_auth_event, process_rmux_session, read_encrypt_event, write_encrypt_event,
     AuthRequest, AuthResponse, CryptoContext, MuxContext,
 };
-use crate::utils::{make_io_error, AsyncTcpStream, AsyncTokioIO, WebsocketReader, WebsocketWriter};
+use crate::utils::{
+    http_proxy_connect, make_io_error, AsyncTcpStream, AsyncTokioIO, WebsocketReader,
+    WebsocketWriter,
+};
 //use crate::utils::make_io_error;
 use async_tls::TlsConnector;
 use bytes::BytesMut;
@@ -110,14 +113,30 @@ pub async fn init_rmux_client(
     } else {
         conn_url.host_str().unwrap()
     };
-
-    let conn = TcpStream::connect(&addr);
-    let dur = std::time::Duration::from_secs(5);
-    let s = tokio::time::timeout(dur, conn).await?;
-    let mut conn = match s {
-        Err(e) => return Err(e),
-        Ok(c) => c,
+    let mut conn = match config.proxy.as_ref() {
+        Some(p) => {
+            let proxy_url = match Url::parse(p.as_str()) {
+                Err(e) => {
+                    error!("invalid connect url:{} with error:{}", url, e);
+                    return Err(make_io_error("invalid connect url"));
+                }
+                Ok(u) => u,
+            };
+            http_proxy_connect(&proxy_url, addr.as_str()).await?
+        }
+        None => {
+            let c = TcpStream::connect(&addr);
+            let dur = std::time::Duration::from_secs(5);
+            let s = tokio::time::timeout(dur, c).await?;
+            match s {
+                Err(e) => {
+                    return Err(e);
+                }
+                Ok(c) => c,
+            }
+        }
     };
+
     match conn_url.scheme() {
         "rmux" => {
             let (mut read, mut write) = conn.split();

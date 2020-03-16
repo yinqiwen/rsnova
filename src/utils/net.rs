@@ -43,7 +43,7 @@ pub async fn http_proxy_connect(proxy: &Url, remote: &str) -> Result<TcpStream, 
     let connect_str = format!(
         "CONNECT {} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n",
         remote, remote
-    ).into_bytes();
+    );
     let raddr: Vec<SocketAddr> = match proxy.socket_addrs(|| None) {
         Ok(m) => m,
         Err(err) => {
@@ -54,6 +54,8 @@ pub async fn http_proxy_connect(proxy: &Url, remote: &str) -> Result<TcpStream, 
             return Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted));
         }
     };
+    let connect_bytes = connect_str.into_bytes();
+
     let conn = TcpStream::connect(&raddr[0]);
     let dur = std::time::Duration::from_secs(3);
     let s = tokio::time::timeout(dur, conn).await?;
@@ -61,10 +63,11 @@ pub async fn http_proxy_connect(proxy: &Url, remote: &str) -> Result<TcpStream, 
     let mut socket = match s {
         Ok(s) => s,
         Err(err) => {
+            error!("Failed to connect proxy:{} with err:{}", raddr[0], err);
             return Err(err);
         }
     };
-    socket.write_all(&connect_str[..]).await?;
+    socket.write_all(&connect_bytes[..]).await?;
     let (head, _) = read_until_separator(&mut socket, "\r\n\r\n").await?;
     if is_ok_response(&head[..]) {
         return Ok(socket);

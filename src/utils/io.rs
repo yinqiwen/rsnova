@@ -95,11 +95,15 @@ pub async fn read_until_separator(
     separator: &str,
 ) -> Result<(Bytes, Bytes), std::io::Error> {
     let mut buf = BytesMut::with_capacity(1024);
-
+    let mut b = [0u8; 1024];
     loop {
-        buf.reserve(1024);
-        stream.read_buf(&mut buf).await?;
-        if let Some(pos) = twoway::find_bytes(&buf, separator.as_bytes()) {
+        let n = stream.read(&mut b).await?;
+        if n > 0 {
+            buf.extend_from_slice(&b[0..n]);
+        } else {
+            return Ok((buf.freeze(), Bytes::default()));
+        }
+        if let Some(pos) = twoway::find_bytes(&buf[..], separator.as_bytes()) {
             let wsize = separator.len();
             let body = buf.split_off(pos + wsize);
             return Ok((buf.freeze(), body.freeze()));
