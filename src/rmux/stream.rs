@@ -209,6 +209,9 @@ impl AsyncWrite for MuxStreamWriter {
     ) -> Poll<Result<(), std::io::Error>> {
         self.state.closed.store(true, Ordering::SeqCst);
         self.io_state.lock().unwrap().try_close();
+        if let Some(waker) = self.io_state.lock().unwrap().waker.take() {
+            waker.wake()
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -242,7 +245,7 @@ impl MuxStream {
             total_send_bytes: AtomicU32::new(0),
             born_time: Instant::now(),
         };
-        let (dtx, drx) = mpsc::channel(16);
+        let (dtx, drx) = mpsc::channel(8);
         let io_state = SharedIOState {
             waker: None,
             data_tx: Some(dtx),

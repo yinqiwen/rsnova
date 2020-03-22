@@ -21,6 +21,7 @@ fi
 # Package up the release binary
 if [ "$TARGET" = "x86_64-pc-windows-msvc" ]
 then
+    mv target/$TARGET/release/rsnova target/$TARGET/release/rsnova.exe
     tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova.exe
 else
     tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova

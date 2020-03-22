@@ -88,12 +88,13 @@ where
 {
     let client_to_server = async {
         //let _ = buf_copy(local_reader, remote_writer, Box::new([0; RELAY_BUF_SIZE])).await;
-        let _ = buf_copy(local_reader, remote_writer, vec![0; relay_buf_size]).await;
-        info!("[{}]Stream close client_to_server", tunnel_id);
+        {
+            let _ = buf_copy(local_reader, remote_writer, vec![0; relay_buf_size]).await;
+            info!("[{}]Stream close client_to_server", tunnel_id);
+        }
         let _ = remote_writer.shutdown().await;
-
         //clear all buffer from reader
-        let mut buffer = [0; 4096];
+        let mut buffer = [0; 512];
         loop {
             match local_reader.read(&mut buffer).await {
                 Err(_) => {
@@ -110,12 +111,13 @@ where
     };
     let server_to_client = async {
         //let _ = buf_copy(remote_reader, local_writer, Box::new([0; RELAY_BUF_SIZE])).await;
-        let _ = buf_copy(remote_reader, local_writer, vec![0; relay_buf_size]).await;
-        info!("[{}]Stream close server_to_client", tunnel_id);
+        {
+            let _ = buf_copy(remote_reader, local_writer, vec![0; relay_buf_size]).await;
+            info!("[{}]Stream close server_to_client", tunnel_id);
+        }
         let _ = local_writer.shutdown().await;
-
         //clear all buffer from reader
-        let mut buffer = [0; 4096];
+        let mut buffer = [0; 512];
         loop {
             match remote_reader.read(&mut buffer).await {
                 Err(_) => {
