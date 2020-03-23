@@ -17,8 +17,6 @@ use tokio::sync::mpsc;
 use crate::channel::ChannelStream;
 use crate::utils::{fill_read_buf, make_io_error};
 
-const SEND_BUF_WINDOW: i32 = 1024 * 1024;
-
 pub struct MuxStreamState {
     pub channel: String,
     pub session_id: u32,
@@ -42,6 +40,9 @@ impl SharedIOState {
         if let Some(tx) = &mut self.data_tx {
             let empty = Vec::new();
             let _ = tx.clone().try_send(empty);
+        }
+        if let Some(waker) = self.waker.take() {
+            waker.wake()
         }
     }
 }
@@ -209,9 +210,6 @@ impl AsyncWrite for MuxStreamWriter {
     ) -> Poll<Result<(), std::io::Error>> {
         self.state.closed.store(true, Ordering::SeqCst);
         self.io_state.lock().unwrap().try_close();
-        if let Some(waker) = self.io_state.lock().unwrap().waker.take() {
-            waker.wake()
-        }
         Poll::Ready(Ok(()))
     }
 }
@@ -348,13 +346,7 @@ impl ChannelStream for MuxStream {
             let empty = Vec::new();
             let _ = tx.clone().try_send(empty);
         }
-        if let Some(tx) = &self.io_state.lock().unwrap().data_tx {
-            let empty = Vec::new();
-            let _ = tx.clone().try_send(empty);
-        }
-        if let Some(waker) = self.io_state.lock().unwrap().waker.take() {
-            waker.wake()
-        }
+        self.io_state.lock().unwrap().try_close();
         let fin = new_fin_event(self.state.stream_id, false);
         let _ = self.event_tx.try_send(fin);
         Ok(())
