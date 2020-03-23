@@ -11,7 +11,13 @@ then
 fi
 
 # Compile the binary for the current target
-cargo build --target=$TARGET --release
+
+if [ "$TARGET" = "x86_64-pc-windows-msvc" ]
+then
+    cargo build --release
+else
+    cargo build --target=$TARGET --release
+fi
 EXITCODE=$?
 if [ $EXITCODE -ne 0 ]; then
     echo "cargo build failed"
@@ -21,8 +27,7 @@ fi
 # Package up the release binary
 if [ "$TARGET" = "x86_64-pc-windows-msvc" ]
 then
-    mv target/$TARGET/release/rsnova target/$TARGET/release/rsnova.exe
-    tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova.exe
+    tar -C target/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova.exe
 else
     tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova
 fi
