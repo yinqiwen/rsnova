@@ -94,19 +94,19 @@ where
         }
         let _ = remote_writer.shutdown().await;
         //clear all buffer from reader
-        let mut buffer = [0; 512];
-        loop {
-            match local_reader.read(&mut buffer).await {
-                Err(_) => {
-                    break;
-                }
-                Ok(n) => {
-                    if 0 == n {
-                        break;
-                    }
-                }
-            }
-        }
+        // let mut buffer = [0; 512];
+        // loop {
+        //     match local_reader.read(&mut buffer).await {
+        //         Err(_) => {
+        //             break;
+        //         }
+        //         Ok(n) => {
+        //             if 0 == n {
+        //                 break;
+        //             }
+        //         }
+        //     }
+        // }
         //()
     };
     let server_to_client = async {
@@ -117,19 +117,19 @@ where
         }
         let _ = local_writer.shutdown().await;
         //clear all buffer from reader
-        let mut buffer = [0; 512];
-        loop {
-            match remote_reader.read(&mut buffer).await {
-                Err(_) => {
-                    break;
-                }
-                Ok(n) => {
-                    if 0 == n {
-                        break;
-                    }
-                }
-            }
-        }
+        // let mut buffer = [0; 512];
+        // loop {
+        //     match remote_reader.read(&mut buffer).await {
+        //         Err(_) => {
+        //             break;
+        //         }
+        //         Ok(n) => {
+        //             if 0 == n {
+        //                 break;
+        //             }
+        //         }
+        //     }
+        // }
         //()
     };
     join(client_to_server, server_to_client).await;

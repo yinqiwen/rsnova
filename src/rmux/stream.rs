@@ -31,15 +31,16 @@ pub struct MuxStreamState {
 
 struct SharedIOState {
     waker: Option<Waker>,
-    data_tx: Option<mpsc::Sender<Vec<u8>>>,
-    data_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    data_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    data_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 impl SharedIOState {
     fn try_close(&mut self) {
         if let Some(tx) = &mut self.data_tx {
             let empty = Vec::new();
-            let _ = tx.clone().try_send(empty);
+            //let _ = tx.clone().try_send(empty);
+            let _ = tx.clone().send(empty);
         }
         if let Some(waker) = self.waker.take() {
             waker.wake()
@@ -54,7 +55,7 @@ impl MuxStreamState {
 }
 
 struct MuxStreamReader {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
     recv_buf: BytesMut,
     state: Arc<MuxStreamState>,
 }
@@ -217,7 +218,7 @@ impl AsyncWrite for MuxStreamWriter {
 pub struct MuxStream {
     pub target: ConnectRequest,
     event_tx: mpsc::Sender<Event>,
-    pub data_tx: Option<mpsc::Sender<Vec<u8>>>,
+    pub data_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     pub state: Arc<MuxStreamState>,
     io_state: Arc<Mutex<SharedIOState>>,
     relay_buf_size: usize,
@@ -243,7 +244,7 @@ impl MuxStream {
             total_send_bytes: AtomicU32::new(0),
             born_time: Instant::now(),
         };
-        let (dtx, drx) = mpsc::channel(8);
+        let (dtx, drx) = mpsc::unbounded_channel();
         let io_state = SharedIOState {
             waker: None,
             data_tx: Some(dtx),
@@ -297,7 +298,8 @@ impl MuxStream {
         //error!("[{}]off data len:{}.", self.state.stream_id, data.len());
         assert!(!data.is_empty());
         if let Some(tx) = &mut self.data_tx {
-            let _ = tx.send(data).await;
+            //let _ = tx.send(data).await;
+            let _ = tx.send(data);
         } else {
             //error!("[{}]Non recv rx for data.", self.state.stream_id);
         }
@@ -344,7 +346,8 @@ impl ChannelStream for MuxStream {
         self.state.close();
         if let Some(tx) = &self.data_tx {
             let empty = Vec::new();
-            let _ = tx.clone().try_send(empty);
+            //let _ = tx.clone().try_send(empty);
+            let _ = tx.clone().send(empty);
         }
         self.io_state.lock().unwrap().try_close();
         let fin = new_fin_event(self.state.stream_id, false);
