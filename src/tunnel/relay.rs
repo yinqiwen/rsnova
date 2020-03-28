@@ -103,6 +103,7 @@ where
             .await;
             info!("[{}]Stream close client_to_server", tunnel_id);
         }
+        client_to_server_state.clone().lock().unwrap().close();
         let _ = remote_writer.shutdown().await;
         if !server_to_client_state.clone().lock().unwrap().is_closed() {
             delay_for(Duration::from_secs(5)).await;
@@ -122,6 +123,7 @@ where
             .await;
             info!("[{}]Stream close server_to_client", tunnel_id);
         }
+        server_to_client_state.clone().lock().unwrap().close();
         let _ = local_writer.shutdown().await;
         if !client_to_server_state.clone().lock().unwrap().is_closed() {
             delay_for(Duration::from_secs(5)).await;
