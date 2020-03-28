@@ -1,13 +1,16 @@
 use crate::channel::get_channel_stream;
 use crate::config::TunnelConfig;
 use crate::rmux::get_channel_session_size;
-use crate::utils::{buf_copy, make_error};
+use crate::utils::{make_error, relay_buf_copy, RelayState};
 
 use futures::future::join;
 use std::error::Error;
 use std::net::Shutdown;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::delay_for;
 
 pub async fn relay_connection(
     tunnel_id: u32,
@@ -86,51 +89,44 @@ where
     A: AsyncRead + Unpin + ?Sized,
     B: AsyncWrite + Unpin + ?Sized,
 {
+    let client_to_server_state = Arc::new(Mutex::new(RelayState::new()));
+    let server_to_client_state = Arc::new(Mutex::new(RelayState::new()));
     let client_to_server = async {
         //let _ = buf_copy(local_reader, remote_writer, Box::new([0; RELAY_BUF_SIZE])).await;
         {
-            let _ = buf_copy(local_reader, remote_writer, vec![0; relay_buf_size]).await;
+            let _ = relay_buf_copy(
+                local_reader,
+                remote_writer,
+                vec![0; relay_buf_size],
+                client_to_server_state.clone(),
+            )
+            .await;
             info!("[{}]Stream close client_to_server", tunnel_id);
         }
         let _ = remote_writer.shutdown().await;
-        //clear all buffer from reader
-        // let mut buffer = [0; 512];
-        // loop {
-        //     match local_reader.read(&mut buffer).await {
-        //         Err(_) => {
-        //             break;
-        //         }
-        //         Ok(n) => {
-        //             if 0 == n {
-        //                 break;
-        //             }
-        //         }
-        //     }
-        // }
-        //()
+        if !server_to_client_state.clone().lock().unwrap().is_closed() {
+            delay_for(Duration::from_secs(5)).await;
+            server_to_client_state.clone().lock().unwrap().close();
+        }
     };
+
     let server_to_client = async {
         //let _ = buf_copy(remote_reader, local_writer, Box::new([0; RELAY_BUF_SIZE])).await;
         {
-            let _ = buf_copy(remote_reader, local_writer, vec![0; relay_buf_size]).await;
+            let _ = relay_buf_copy(
+                remote_reader,
+                local_writer,
+                vec![0; relay_buf_size],
+                server_to_client_state.clone(),
+            )
+            .await;
             info!("[{}]Stream close server_to_client", tunnel_id);
         }
         let _ = local_writer.shutdown().await;
-        //clear all buffer from reader
-        // let mut buffer = [0; 512];
-        // loop {
-        //     match remote_reader.read(&mut buffer).await {
-        //         Err(_) => {
-        //             break;
-        //         }
-        //         Ok(n) => {
-        //             if 0 == n {
-        //                 break;
-        //             }
-        //         }
-        //     }
-        // }
-        //()
+        if !client_to_server_state.clone().lock().unwrap().is_closed() {
+            delay_for(Duration::from_secs(5)).await;
+            client_to_server_state.clone().lock().unwrap().close();
+        }
     };
     join(client_to_server, server_to_client).await;
     Ok(())
