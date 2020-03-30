@@ -6,10 +6,8 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::time::delay_for;
 
 pub fn make_error(desc: &str) -> Box<dyn Error> {
     Box::new(std::io::Error::new(std::io::ErrorKind::Other, desc))

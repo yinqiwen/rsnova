@@ -12,12 +12,7 @@ fi
 
 # Compile the binary for the current target
 
-if [ "$TARGET" = "x86_64-pc-windows-msvc" ]
-then
-    cargo build --release
-else
-    cargo build --target=$TARGET --release
-fi
+cargo build --target=$TARGET --release
 EXITCODE=$?
 if [ $EXITCODE -ne 0 ]; then
     echo "cargo build failed"
