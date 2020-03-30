@@ -23,7 +23,7 @@ fi
 if [ "$TARGET" = "x86_64-pc-windows-msvc" ]
 then
     echo "Build for windows"
-    echo "`ls -l target/$TARGET/release`"
+    #echo "`ls -l target/$TARGET/release`"
     tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova.exe
 else
     tar -C target/$TARGET/release -cf rsnova-$TRAVIS_TAG-$TARGET.tar rsnova
