@@ -3,11 +3,11 @@
 # Install the Rust stdlib for the current target
 rustup target add $TARGET
 
-if [ "$TARGET" = "armv5te-unknown-linux-musleabi" ]
+if [ "$TARGET" = "armv7-unknown-linux-musleabi" ]
 then
-  wget https://musl.cc/arm-linux-musleabihf-cross.tgz
-  tar zxf ./arm-linux-musleabihf-cross.tgz -C /tmp
-  export PATH=/tmp/arm-linux-musleabihf-cross/bin:$PATH
+  wget https://musl.cc/arm-linux-musleabi-cross.tgz
+  tar zxf ./arm-linux-musleabi-cross.tgz -C /tmp
+  export PATH=/tmp/arm-linux-musleabi-cross/bin:$PATH
 fi
 
 # Compile the binary for the current target
