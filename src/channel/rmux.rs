@@ -125,6 +125,7 @@ pub async fn init_rmux_client(
             http_proxy_connect(&proxy_url, addr.as_str()).await?
         }
         None => {
+            info!("TCP connect {}", addr);
             let c = TcpStream::connect(&addr);
             let dur = std::time::Duration::from_secs(5);
             let s = tokio::time::timeout(dur, c).await?;
@@ -147,8 +148,14 @@ pub async fn init_rmux_client(
             }
         }
         "ws" => {
+            if !url.ends_with('/') {
+                url.push_str("/relay")
+            } else {
+                url.push_str("relay")
+            }
+            info!("connect url:{}", url);
             let ws = match tokio_tungstenite::client_async(url, conn).await {
-                Err(e) => return Err(make_io_error(e.description())),
+                Err(e) => return Err(make_io_error(&e.to_string())),
                 Ok((s, _)) => s,
             };
             let (write, read) = ws.split();
@@ -168,7 +175,7 @@ pub async fn init_rmux_client(
             let tls_stream = connector.connect(domain, conn)?.await?;
             let conn = AsyncTokioIO::new(tls_stream);
             let ws = match tokio_tungstenite::client_async(url, conn).await {
-                Err(e) => return Err(make_io_error(e.description())),
+                Err(e) => return Err(make_io_error(&e.to_string())),
                 Ok((s, _)) => s,
             };
             let (write, read) = ws.split();
