@@ -137,6 +137,17 @@ pub async fn init_rmux_client(
             }
         }
     };
+    match conn_url.scheme() {
+        "ws" | "wss" => {
+            if !url.ends_with('/') {
+                url.push_str("/relay")
+            } else {
+                url.push_str("relay")
+            }
+            info!("connect url:{}", url);
+        }
+        _ => {}
+    }
 
     match conn_url.scheme() {
         "rmux" => {
@@ -148,12 +159,6 @@ pub async fn init_rmux_client(
             }
         }
         "ws" => {
-            if !url.ends_with('/') {
-                url.push_str("/relay")
-            } else {
-                url.push_str("relay")
-            }
-            info!("connect url:{}", url);
             let ws = match tokio_tungstenite::client_async(url, conn).await {
                 Err(e) => return Err(make_io_error(&e.to_string())),
                 Ok((s, _)) => s,
