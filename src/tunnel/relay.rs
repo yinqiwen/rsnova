@@ -3,13 +3,14 @@ use crate::config::TunnelConfig;
 use crate::rmux::get_channel_session_size;
 use crate::utils::{make_error, relay_buf_copy, RelayState};
 
-use futures::future::join;
+use futures::future::join3;
 use std::error::Error;
 use std::net::Shutdown;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time;
 use tokio::time::delay_for;
 
 pub async fn relay_connection(
@@ -89,8 +90,11 @@ where
     A: AsyncRead + Unpin + ?Sized,
     B: AsyncWrite + Unpin + ?Sized,
 {
-    let client_to_server_state = Arc::new(Mutex::new(RelayState::new()));
-    let server_to_client_state = Arc::new(Mutex::new(RelayState::new()));
+    let c2s_state = Arc::new(Mutex::new(RelayState::new()));
+    let s2c_state = Arc::new(Mutex::new(RelayState::new()));
+
+    let c2s_state_c2s = c2s_state.clone();
+    let s2c_state_c2s = s2c_state.clone();
     let client_to_server = async {
         //let _ = buf_copy(local_reader, remote_writer, Box::new([0; RELAY_BUF_SIZE])).await;
         {
@@ -98,19 +102,21 @@ where
                 local_reader,
                 remote_writer,
                 vec![0; relay_buf_size],
-                client_to_server_state.clone(),
+                c2s_state_c2s.clone(),
             )
             .await;
             info!("[{}]Stream close client_to_server", tunnel_id);
         }
-        client_to_server_state.clone().lock().unwrap().close();
+        c2s_state_c2s.lock().unwrap().close();
         let _ = remote_writer.shutdown().await;
-        if !server_to_client_state.clone().lock().unwrap().is_closed() {
+        if !s2c_state_c2s.lock().unwrap().is_closed() {
             delay_for(Duration::from_secs(5)).await;
-            server_to_client_state.clone().lock().unwrap().close();
+            s2c_state_c2s.lock().unwrap().close();
         }
     };
 
+    let c2s_state_s2c = c2s_state.clone();
+    let s2c_state_s2c = s2c_state.clone();
     let server_to_client = async {
         //let _ = buf_copy(remote_reader, local_writer, Box::new([0; RELAY_BUF_SIZE])).await;
         {
@@ -118,18 +124,34 @@ where
                 remote_reader,
                 local_writer,
                 vec![0; relay_buf_size],
-                server_to_client_state.clone(),
+                s2c_state_s2c.clone(),
             )
             .await;
             info!("[{}]Stream close server_to_client", tunnel_id);
         }
-        server_to_client_state.clone().lock().unwrap().close();
+        s2c_state_s2c.lock().unwrap().close();
         let _ = local_writer.shutdown().await;
-        if !client_to_server_state.clone().lock().unwrap().is_closed() {
+        if !c2s_state_s2c.lock().unwrap().is_closed() {
             delay_for(Duration::from_secs(5)).await;
-            client_to_server_state.clone().lock().unwrap().close();
+            c2s_state_s2c.lock().unwrap().close();
         }
     };
-    join(client_to_server, server_to_client).await;
+
+    let check_timeout = async {
+        let mut interval = time::interval(Duration::from_secs(1));
+        let max_wait_secs = 30;
+        while !c2s_state.lock().unwrap().is_closed() || !s2c_state.lock().unwrap().is_closed() {
+            interval.tick().await;
+            if c2s_state.lock().unwrap().pending_elapsed().as_secs() > max_wait_secs
+                && s2c_state.lock().unwrap().pending_elapsed().as_secs() > max_wait_secs
+            {
+                c2s_state.lock().unwrap().close();
+                s2c_state.lock().unwrap().close();
+                return;
+            }
+        }
+    };
+
+    join3(client_to_server, server_to_client, check_timeout).await;
     Ok(())
 }

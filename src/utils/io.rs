@@ -6,6 +6,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 
@@ -20,6 +21,7 @@ pub fn make_io_error(desc: &str) -> std::io::Error {
 pub struct RelayState {
     shutdown: bool,
     waker: Option<Waker>,
+    pending_timestamp: Option<SystemTime>,
 }
 
 impl RelayState {
@@ -27,7 +29,12 @@ impl RelayState {
         Self {
             shutdown: false,
             waker: None,
+            pending_timestamp: None,
         }
+    }
+    fn set_waker(&mut self, w: Waker) {
+        self.waker = Some(w);
+        self.pending_timestamp = Some(SystemTime::now());
     }
     pub fn is_closed(&self) -> bool {
         self.shutdown
@@ -38,6 +45,13 @@ impl RelayState {
             if let Some(waker) = self.waker.take() {
                 waker.wake()
             }
+        }
+    }
+
+    pub fn pending_elapsed(&self) -> Duration {
+        match self.pending_timestamp {
+            Some(v) => v.elapsed().unwrap(),
+            None => Duration::from_secs(0),
         }
     }
 }
@@ -87,6 +101,7 @@ where
             if self.state.lock().unwrap().shutdown {
                 return Poll::Ready(Ok(self.amt));
             }
+            let _ = self.state.lock().unwrap().pending_timestamp.take();
             // If our buffer is empty, then we need to read some data to
             // continue.
             if self.pos == self.cap && !self.read_done {
@@ -95,7 +110,7 @@ where
                 let n = match pin_reader.poll_read(cx, &mut me.buf) {
                     Poll::Pending => {
                         let mut shared_state = self.state.lock().unwrap();
-                        shared_state.waker = Some(cx.waker().clone());
+                        shared_state.set_waker(cx.waker().clone());
                         return Poll::Pending;
                     }
                     Poll::Ready(Err(e)) => {
@@ -119,7 +134,7 @@ where
                 let i = match pin_writer.poll_write(cx, &me.buf[me.pos..me.cap]) {
                     Poll::Pending => {
                         let mut shared_state = self.state.lock().unwrap();
-                        shared_state.waker = Some(cx.waker().clone());
+                        shared_state.set_waker(cx.waker().clone());
                         return Poll::Pending;
                     }
                     Poll::Ready(Err(e)) => {
@@ -147,7 +162,7 @@ where
                 match pin_writer.poll_flush(cx) {
                     Poll::Pending => {
                         let mut shared_state = self.state.lock().unwrap();
-                        shared_state.waker = Some(cx.waker().clone());
+                        shared_state.set_waker(cx.waker().clone());
                         return Poll::Pending;
                     }
                     Poll::Ready(Err(e)) => {
