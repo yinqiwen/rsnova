@@ -189,14 +189,14 @@ impl AsyncWrite for MuxStreamWriter {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => {
                 io_state.lock().unwrap().try_close();
-                return Poll::Ready(Err(make_io_error(e.description())));
+                return Poll::Ready(Err(make_io_error(&e.to_string())));
             }
             Poll::Ready(Ok(())) => {}
         }
         match tx.try_send(ev) {
             Err(e) => {
                 io_state.lock().unwrap().try_close();
-                return Poll::Ready(Err(make_io_error(e.description())));
+                return Poll::Ready(Err(make_io_error(&e.to_string())));
             }
             Ok(()) => {
                 state

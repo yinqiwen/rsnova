@@ -1,7 +1,6 @@
 use crate::config::TunnelConfig;
 use crate::rmux::{
-    handle_rmux_session, new_auth_event, read_encrypt_event, AuthRequest, AuthResponse,
-    CryptoContext,
+    handle_rmux_session, new_auth_event, read_rmux_event, AuthRequest, AuthResponse, CryptoContext,
 };
 use crate::utils::make_io_error;
 use bytes::BytesMut;
@@ -21,13 +20,9 @@ pub async fn handle_rmux(
     let mut rctx = CryptoContext::new(method.as_str(), key.as_str(), 0);
     let mut wctx = CryptoContext::new(method.as_str(), key.as_str(), 0);
     //1. auth connection
-    let mut recv_buf = BytesMut::new();
-    let recv_ev = match read_encrypt_event(&mut rctx, &mut inbound, &mut recv_buf).await {
+    let recv_ev = match read_rmux_event(&mut rctx, &mut inbound).await {
         Err(_) => return Err(make_io_error("can NOT read first auth envent.")),
-        Ok(Some(ev)) => ev,
-        Ok(None) => {
-            return Err(make_io_error("can NOT read first auth envent."));
-        }
+        Ok(ev) => ev,
     };
     let auth_req: AuthRequest = match bincode::deserialize(&recv_ev.body[..]) {
         Ok(m) => m,
@@ -55,16 +50,6 @@ pub async fn handle_rmux(
     inbound.write_all(&buf[..]).await?;
     let rctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);
     let wctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);
-    handle_rmux_session(
-        "",
-        tunnel_id,
-        inbound,
-        rctx,
-        wctx,
-        &mut recv_buf,
-        0,
-        cfg.relay_buf_size(),
-    )
-    .await?;
+    handle_rmux_session("", tunnel_id, inbound, rctx, wctx, 0, cfg.relay_buf_size()).await?;
     Ok(())
 }

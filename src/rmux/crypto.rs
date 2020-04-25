@@ -40,9 +40,6 @@ pub struct CryptoContext {
 
 type DecryptError = (u32, &'static str);
 
-// type EncryptFunc = fn(ctx: &CryptoContext, ev: &Event, out: &mut BytesMut);
-// type DecryptFunc = fn(ctx: &CryptoContext, buf: &mut BytesMut) -> Result<Event, DecryptError>;
-
 fn make_key<K: BoundKey<CryptoNonceSequence>>(
     algorithm: &'static Algorithm,
     key: &[u8],
@@ -90,20 +87,6 @@ impl CryptoContext {
             _ => panic!("not supported crypto method."),
         }
     }
-
-    // fn get_decrypt_nonce(&self) -> Nonce {
-    //     let mut d = [0u8; NONCE_LEN];
-    //     let v = self.nonce.to_le_bytes();
-    //     d[0..8].copy_from_slice(&v[..]);
-    //     Nonce::assume_unique_for_key(d)
-    // }
-
-    // fn get_encrypt_nonce(&self) -> Nonce {
-    //     let mut d = [0u8; NONCE_LEN];
-    //     let v = self.nonce.to_le_bytes();
-    //     d[0..8].copy_from_slice(&v[..]);
-    //     Nonce::assume_unique_for_key(d)
-    // }
 
     fn skip32_decrypt_key(&self) -> [u8; 10] {
         let mut sk: [u8; 10] = Default::default();
@@ -280,56 +263,152 @@ impl CryptoContext {
             })
         }
     }
-}
 
-pub async fn read_encrypt_event<'a, T>(
-    ctx: &'a mut CryptoContext,
-    reader: &'a mut T,
-    recv_buf: &mut BytesMut,
-) -> Result<Option<Event>, std::io::Error>
-where
-    T: AsyncRead + Unpin + ?Sized,
-{
-    let mut next_read_n: u32 = 0;
-    loop {
-        if recv_buf.is_empty() {
-            recv_buf.clear();
-        }
-        if next_read_n > 0 && next_read_n < DEFAULT_RECV_BUF_SIZE {
-            next_read_n = DEFAULT_RECV_BUF_SIZE;
-        }
-        if next_read_n > 0 {
-            recv_buf.reserve(next_read_n as usize);
-            let pos = recv_buf.len();
-            let cap = recv_buf.capacity();
-            unsafe {
-                recv_buf.set_len(cap);
+    fn decrypt_header(&mut self, buf: &[u8]) -> (Header, u32) {
+        if self.opening_key.is_none() {
+            let mut xbuf: [u8; 4] = Default::default();
+            xbuf.copy_from_slice(&buf[0..4]);
+            let e1 = u32::from_le_bytes(xbuf);
+            xbuf.copy_from_slice(&buf[4..8]);
+            let e2 = u32::from_le_bytes(xbuf);
+            let h = Header {
+                flag_len: e1,
+                stream_id: e2,
+            };
+            let mut body_data_len = h.len();
+            if FLAG_WIN_UPDATE == h.flags() {
+                body_data_len = 0;
             }
-            // info!(
-            //     "Start read at pos:{}, available buf:{}",
-            //     pos,
-            //     recv_buf[pos..].len()
-            // );
-            let n = reader.read(&mut recv_buf[pos..]).await?;
-            if 0 == n {
-                return Ok(None);
+            return (h, body_data_len);
+        } else {
+            let sk = self.skip32_decrypt_key();
+            let mut xbuf: [u8; 4] = Default::default();
+            xbuf.copy_from_slice(&buf[0..4]);
+            let e1 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
+            xbuf.copy_from_slice(&buf[4..8]);
+            let e2 = skip32::decode(&sk, u32::from_le_bytes(xbuf));
+            let h = Header {
+                flag_len: e1,
+                stream_id: e2,
+            };
+            let mut body_data_len = 0;
+            if FLAG_WIN_UPDATE != h.flags() && h.len() > 0 {
+                let opening_key = self.opening_key.as_mut().unwrap();
+                body_data_len = h.len() + opening_key.algorithm().tag_len() as u32;
             }
-            unsafe {
-                recv_buf.set_len(pos + n);
-            }
+            return (h, body_data_len);
         }
-        let r = ctx.decrypt(recv_buf);
-        match r {
-            Ok(ev) => return Ok(Some(ev)),
-            Err((n, reason)) => {
-                if !reason.is_empty() {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, reason));
+    }
+    pub fn decrypt_body(&mut self, header: Header, body: &mut [u8]) -> Result<Event, DecryptError> {
+        if body.len() == 0 {
+            self.nonce += 1;
+            let ev = Event {
+                header,
+                body: vec![],
+                remote: true,
+            };
+            return Ok(ev);
+        }
+        if self.opening_key.is_none() {
+            let out = Vec::from(&body[0..header.len() as usize]);
+            let ev = Event {
+                header,
+                body: out,
+                remote: true,
+            };
+            return Ok(ev);
+        } else {
+            let opening_key = self.opening_key.as_mut().unwrap();
+            match opening_key.open_in_place(Aad::empty(), &mut body[..]) {
+                Ok(_) => {}
+                Err(e) => {
+                    error!(
+                        "decrypt error:{} for event:{} {} {} {} {}",
+                        e,
+                        header.stream_id,
+                        header.flags(),
+                        header.len(),
+                        body.len(),
+                        self.nonce,
+                    );
+                    return Err((0, "Decrypt error"));
                 }
-                next_read_n = n;
             }
+            let out = Vec::from(&body[0..header.len() as usize]);
+            self.nonce += 1;
+            let ev = Event {
+                header,
+                body: out,
+                remote: true,
+            };
+            return Ok(ev);
         }
     }
 }
+
+pub async fn read_rmux_event<'a, T>(
+    ctx: &'a mut CryptoContext,
+    reader: &'a mut T,
+) -> Result<Event, std::io::Error>
+where
+    T: AsyncRead + Unpin + ?Sized,
+{
+    let mut hbuf = vec![0; EVENT_HEADER_LEN];
+    let _ = reader.read_exact(&mut hbuf).await?;
+    let (header, next_n) = ctx.decrypt_header(&hbuf[..]);
+    let mut dbuf = vec![0; next_n as usize];
+    if next_n > 0 {
+        let _ = reader.read_exact(&mut dbuf).await?;
+    }
+    match ctx.decrypt_body(header, &mut dbuf[..]) {
+        Ok(ev) => Ok(ev),
+        Err((_, reason)) => Err(std::io::Error::new(std::io::ErrorKind::Other, reason)),
+    }
+}
+
+// pub async fn read_encrypt_event<'a, T>(
+//     ctx: &'a mut CryptoContext,
+//     reader: &'a mut T,
+//     recv_buf: &mut BytesMut,
+// ) -> Result<Option<Event>, std::io::Error>
+// where
+//     T: AsyncRead + Unpin + ?Sized,
+// {
+//     let mut next_read_n: u32 = 0;
+//     loop {
+//         if recv_buf.is_empty() {
+//             recv_buf.clear();
+//         }
+//         if next_read_n > 0 && next_read_n < DEFAULT_RECV_BUF_SIZE {
+//             next_read_n = DEFAULT_RECV_BUF_SIZE;
+//         }
+//         if next_read_n > 0 {
+//             recv_buf.reserve(next_read_n as usize);
+//             let pos = recv_buf.len();
+//             let cap = recv_buf.capacity();
+//             unsafe {
+//                 recv_buf.set_len(cap);
+//             }
+//             let n = reader.read(&mut recv_buf[pos..]).await?;
+//             if 0 == n {
+//                 return Ok(None);
+//             }
+//             unsafe {
+//                 recv_buf.set_len(pos + n);
+//             }
+//         }
+//         let r = ctx.decrypt(recv_buf);
+//         match r {
+//             Ok(ev) => return Ok(Some(ev)),
+//             Err((n, reason)) => {
+//                 if !reason.is_empty() {
+//                     return Err(std::io::Error::new(std::io::ErrorKind::Other, reason));
+//                 }
+//                 next_read_n = n;
+//             }
+//         }
+//     }
+// }
 
 pub async fn write_encrypt_event<'a, T>(
     ctx: &'a mut CryptoContext,

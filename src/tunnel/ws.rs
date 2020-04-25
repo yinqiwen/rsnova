@@ -1,7 +1,7 @@
 use crate::config::TunnelConfig;
 use crate::rmux::{
-    new_auth_event, process_rmux_session, read_encrypt_event, AuthRequest, AuthResponse,
-    CryptoContext, MuxContext,
+    new_auth_event, process_rmux_session, read_rmux_event, AuthRequest, AuthResponse,
+    CryptoContext, MuxContext, DEFAULT_RECV_BUF_SIZE,
 };
 use crate::utils::{make_io_error, WebsocketReader, WebsocketWriter};
 use bytes::BytesMut;
@@ -80,20 +80,17 @@ pub async fn handle_websocket(
         }
     };
     let (write, read) = ws_stream.split();
-    let mut reader = WebsocketReader::new(read);
+    let reader = WebsocketReader::new(read);
     let mut writer = WebsocketWriter::new(write);
+    let mut buf_reader = tokio::io::BufReader::with_capacity(DEFAULT_RECV_BUF_SIZE, reader);
     let key = String::from(cfg.cipher.as_ref().unwrap().key.as_str());
     let method = String::from(cfg.cipher.as_ref().unwrap().method.as_str());
     let mut rctx = CryptoContext::new(method.as_str(), key.as_str(), 0);
     let mut wctx = CryptoContext::new(method.as_str(), key.as_str(), 0);
     //1. auth connection
-    let mut recv_buf = BytesMut::new();
-    let recv_ev = match read_encrypt_event(&mut rctx, &mut reader, &mut recv_buf).await {
+    let recv_ev = match read_rmux_event(&mut rctx, &mut buf_reader).await {
         Err(e) => return Err(make_io_error(&e.to_string())),
-        Ok(Some(ev)) => ev,
-        Ok(None) => {
-            return Err(make_io_error("can NOT read first auth envent."));
-        }
+        Ok(ev) => ev,
     };
     let auth_req: AuthRequest = match bincode::deserialize(&recv_ev.body[..]) {
         Ok(m) => m,
@@ -121,12 +118,12 @@ pub async fn handle_websocket(
     writer.write_all(&buf[..]).await?;
     let rctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);
     let wctx = CryptoContext::new(auth_res.method.as_str(), key.as_str(), auth_res.rand);
-    let ctx = MuxContext::new("", tunnel_id, rctx, wctx, 0, &mut recv_buf);
+    let ctx = MuxContext::new("", tunnel_id, rctx, wctx, 0);
     process_rmux_session(
         ctx,
         // "",
         // tunnel_id,
-        &mut reader,
+        &mut buf_reader,
         &mut writer,
         // rctx,
         // wctx,

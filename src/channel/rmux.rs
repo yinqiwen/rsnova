@@ -2,8 +2,8 @@ use super::ChannelStream;
 use crate::config::{ChannelConfig, DEFAULT_RELAY_BUF_SIZE};
 
 use crate::rmux::{
-    create_stream, new_auth_event, process_rmux_session, read_encrypt_event, write_encrypt_event,
-    AuthRequest, AuthResponse, CryptoContext, MuxContext,
+    create_stream, new_auth_event, process_rmux_session, read_rmux_event, write_encrypt_event,
+    AuthRequest, AuthResponse, CryptoContext, MuxContext, DEFAULT_RECV_BUF_SIZE,
 };
 use crate::utils::{
     http_proxy_connect, make_io_error, AsyncTcpStream, AsyncTokioIO, WebsocketReader,
@@ -15,7 +15,7 @@ use bytes::BytesMut;
 use futures::StreamExt;
 use std::error::Error;
 use std::io::ErrorKind;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use url::Url;
 
@@ -26,7 +26,7 @@ async fn init_client<'a, R, W>(
     wi: &'a mut W,
 ) -> Result<(), std::io::Error>
 where
-    R: AsyncRead + Unpin + Sized,
+    R: AsyncBufRead + Unpin + Sized,
     W: AsyncWrite + Unpin + Sized,
 {
     let sid = 0 as u32;
@@ -40,11 +40,10 @@ where
     let mut rctx = CryptoContext::new(method.as_str(), key.as_str(), 0);
     let mut wctx = CryptoContext::new(method.as_str(), key.as_str(), 0);
     write_encrypt_event(&mut wctx, wi, ev).await?;
-    let mut recv_buf = BytesMut::new();
-    let recv_ev = match read_encrypt_event(&mut rctx, ri, &mut recv_buf).await {
-        Err(e) => return Err(make_io_error(e.description())),
-        Ok(None) => return Err(make_io_error("can NOT read first auth envent.")),
-        Ok(Some(ev)) => ev,
+
+    let recv_ev = match read_rmux_event(&mut rctx, ri).await {
+        Err(e) => return Err(make_io_error(&e.to_string())),
+        Ok(ev) => ev,
     };
     let decoded: AuthResponse = bincode::deserialize(&recv_ev.body[..]).unwrap();
     if !decoded.success {
@@ -59,7 +58,6 @@ where
         rctx,
         wctx,
         config.max_alive_mins as u64 * 60,
-        &mut recv_buf,
     );
     process_rmux_session(
         ctx, // config.name.as_str(),
@@ -151,8 +149,9 @@ pub async fn init_rmux_client(
 
     match conn_url.scheme() {
         "rmux" => {
-            let (mut read, mut write) = conn.split();
-            let rc = init_client(config, session_id, &mut read, &mut write).await;
+            let (read, mut write) = conn.split();
+            let mut buf_reader = tokio::io::BufReader::with_capacity(DEFAULT_RECV_BUF_SIZE, read);
+            let rc = init_client(config, session_id, &mut buf_reader, &mut write).await;
             let _ = conn.shutdown(std::net::Shutdown::Both);
             if rc.is_err() {
                 return rc;
@@ -164,9 +163,10 @@ pub async fn init_rmux_client(
                 Ok((s, _)) => s,
             };
             let (write, read) = ws.split();
-            let mut reader = WebsocketReader::new(read);
+            let reader = WebsocketReader::new(read);
             let mut writer = WebsocketWriter::new(write);
-            let rc = init_client(config, session_id, &mut reader, &mut writer).await;
+            let mut buf_reader = tokio::io::BufReader::with_capacity(DEFAULT_RECV_BUF_SIZE, reader);
+            let rc = init_client(config, session_id, &mut buf_reader, &mut writer).await;
             writer.shutdown().await?;
             if rc.is_err() {
                 return rc;
@@ -184,9 +184,10 @@ pub async fn init_rmux_client(
                 Ok((s, _)) => s,
             };
             let (write, read) = ws.split();
-            let mut reader = WebsocketReader::new(read);
+            let reader = WebsocketReader::new(read);
             let mut writer = WebsocketWriter::new(write);
-            let rc = init_client(config, session_id, &mut reader, &mut writer).await;
+            let mut buf_reader = tokio::io::BufReader::with_capacity(DEFAULT_RECV_BUF_SIZE, reader);
+            let rc = init_client(config, session_id, &mut buf_reader, &mut writer).await;
             writer.shutdown().await?;
             if rc.is_err() {
                 return rc;

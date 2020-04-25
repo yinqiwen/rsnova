@@ -35,7 +35,7 @@ where
                 let m = match msg {
                     Ok(m) => m,
                     Err(e) => {
-                        return Poll::Ready(Err(make_io_error(e.description())));
+                        return Poll::Ready(Err(make_io_error(&e.to_string())));
                     }
                 };
                 if !m.is_binary() {
@@ -99,7 +99,7 @@ where
         pin_mut!(future);
         match future.as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(make_io_error(e.description()))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(make_io_error(&e.to_string()))),
             Poll::Ready(Ok(())) => Poll::Ready(Ok(blen)),
         }
     }
@@ -115,7 +115,7 @@ where
         pin_mut!(future);
         match future.as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(make_io_error(e.description()))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(make_io_error(&e.to_string()))),
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
         }
     }
