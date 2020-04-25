@@ -15,7 +15,7 @@ use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
 use crate::channel::ChannelStream;
-use crate::utils::{fill_read_buf, make_io_error};
+use crate::utils::{clear_unbounded_channel, fill_read_buf, make_io_error};
 
 pub struct MuxStreamState {
     pub channel: String,
@@ -84,6 +84,12 @@ fn inc_recv_buf_window(state: &MuxStreamState, inc: usize, cx: &mut Context<'_>)
     }
 }
 
+impl Drop for MuxStreamReader {
+    fn drop(&mut self) {
+        clear_unbounded_channel(&mut self.rx);
+    }
+}
+
 impl AsyncRead for MuxStreamReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -96,7 +102,7 @@ impl AsyncRead for MuxStreamReader {
             state,
         } = &mut *self;
         if state.closed.load(Ordering::SeqCst) {
-            rx.close();
+            clear_unbounded_channel(rx);
             return Poll::Ready(Err(make_io_error("closed")));
         }
         if !recv_buf.is_empty() {
@@ -112,7 +118,8 @@ impl AsyncRead for MuxStreamReader {
                     //close
                     //error!("[{}]####2 Close", state.stream_id);
                     state.close();
-                    rx.close();
+                    //rx.close();
+                    clear_unbounded_channel(rx);
                     return Poll::Ready(Ok(0));
                 }
                 if copy_n > buf.len() {
@@ -129,7 +136,7 @@ impl AsyncRead for MuxStreamReader {
             Poll::Ready(None) => {
                 //error!("[{}]####3 Close", state.stream_id);
                 state.close();
-                rx.close();
+                clear_unbounded_channel(rx);
                 Poll::Ready(Ok(0))
             }
             Poll::Pending => Poll::Pending,

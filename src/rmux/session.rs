@@ -9,7 +9,7 @@ use super::stream::MuxStream;
 use crate::channel::get_channel_stream;
 use crate::channel::ChannelStream;
 use crate::tunnel::relay;
-use crate::utils::{make_io_error, VBuf};
+use crate::utils::{clear_channel, make_io_error, VBuf};
 use bytes::BytesMut;
 use futures::future::join3;
 use futures::FutureExt;
@@ -236,7 +236,7 @@ pub async fn routine_all_sessions() {
     }
     for action in actions.iter_mut() {
         let ev = action.ev.take().unwrap();
-        let _ = action.sender.send(ev).await;
+        let _ = action.sender.try_send(ev);
     }
 }
 
@@ -503,7 +503,10 @@ fn handle_routine_event(
         .unwrap()
         .as_secs() as u32;
     let idle_io_secs = session_state.get_io_idle_secs(now_unix_secs);
-    //let idle_io_secs = log_session_state(sid, streams, now_unix_secs, &session_state);
+    let mut stat_info = log_session_state(sid, now_unix_secs, &session_state);
+    stat_info.push_str(get_streams_stat_info(streams).as_str());
+    stat_info.push_str(format!("Streams:{}\n", streams.len()).as_str());
+    info!("{}", stat_info);
     let should_close = (session_state.is_retired() && streams.is_empty()) || idle_io_secs >= 300;
 
     if should_close {
@@ -676,7 +679,8 @@ async fn process_event<'a>(
     for (_, stream) in streams.iter_mut() {
         let _ = stream.close();
     }
-    event_rx.close();
+    clear_channel(&mut event_rx);
+
     let _ = send_tx.send(Vec::new()).await;
     session_state.process_event_state.store(6, Ordering::SeqCst);
 }
@@ -831,6 +835,7 @@ where
         //let shutdown_ev = new_shutdown_event(0, false);
         //let _ = handle_recv_event_tx.send(shutdown_ev).await;
         let _ = handle_recv_send_tx.send(Vec::new()).await;
+        clear_channel(&mut close_rx);
         handle_recv_session_state
             .process_recv_state
             .store(2, Ordering::SeqCst);
@@ -929,7 +934,7 @@ where
         handle_send_session_state
             .closed
             .store(true, Ordering::SeqCst);
-        send_rx.close();
+        clear_channel(&mut send_rx);
         let close_rc = close_tx.send(()).await;
         if close_rc.is_err() {
             error!("[{}][{}]Close error:{:?}", channel, tunnel_id, close_rc);

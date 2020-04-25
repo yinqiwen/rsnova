@@ -1,10 +1,9 @@
 use bytes::{Buf, BufMut, BytesMut};
 //use tokio::io::read_exact;
-use tokio::prelude::*;
-
-use ring::aead::*;
-
 use super::event::*;
+use crate::utils::make_io_error;
+use ring::aead::*;
+use tokio::prelude::*;
 
 pub const METHOD_AES128_GCM: &str = "aes128gcm";
 pub const METHOD_CHACHA20_POLY1305: &str = "chacha20poly1305";

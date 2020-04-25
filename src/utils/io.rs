@@ -32,6 +32,10 @@ impl RelayState {
             pending_timestamp: None,
         }
     }
+    fn clear_waker(&mut self) {
+        let _ = self.waker.take();
+        let _ = self.pending_timestamp.take();
+    }
     fn set_waker(&mut self, w: Waker) {
         self.waker = Some(w);
         self.pending_timestamp = Some(SystemTime::now());
@@ -98,10 +102,10 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         loop {
+            let _ = self.state.lock().unwrap().clear_waker();
             if self.state.lock().unwrap().shutdown {
                 return Poll::Ready(Ok(self.amt));
             }
-            let _ = self.state.lock().unwrap().pending_timestamp.take();
             // If our buffer is empty, then we need to read some data to
             // continue.
             if self.pos == self.cap && !self.read_done {
@@ -194,6 +198,34 @@ pub async fn read_until_separator(
             let wsize = separator.len();
             let body = buf.split_off(pos + wsize);
             return Ok((buf.freeze(), body.freeze()));
+        }
+    }
+}
+
+pub fn clear_channel<T>(channel: &mut tokio::sync::mpsc::Receiver<T>) {
+    channel.close();
+    while true {
+        match channel.try_recv() {
+            Ok(_) => {
+                continue;
+            }
+            _ => {
+                break;
+            }
+        }
+    }
+}
+
+pub fn clear_unbounded_channel<T>(channel: &mut tokio::sync::mpsc::UnboundedReceiver<T>) {
+    channel.close();
+    while true {
+        match channel.try_recv() {
+            Ok(_) => {
+                continue;
+            }
+            _ => {
+                break;
+            }
         }
     }
 }
