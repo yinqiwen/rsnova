@@ -53,6 +53,9 @@ impl RelayState {
     }
 
     pub fn pending_elapsed(&self) -> Duration {
+        if self.shutdown {
+            return Duration::from_secs(std::u32::MAX as u64);
+        }
         match self.pending_timestamp {
             Some(v) => v.elapsed().unwrap(),
             None => Duration::from_secs(0),

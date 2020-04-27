@@ -9,8 +9,6 @@ pub const METHOD_AES128_GCM: &str = "aes128gcm";
 pub const METHOD_CHACHA20_POLY1305: &str = "chacha20poly1305";
 pub const METHOD_NONE: &str = "none";
 
-static DEFAULT_RECV_BUF_SIZE: u32 = 64 * 1024;
-
 struct CryptoNonceSequence {
     nonce: u64,
 }
@@ -299,49 +297,35 @@ impl CryptoContext {
             return (h, body_data_len);
         }
     }
-    pub fn decrypt_body(&mut self, header: Header, body: &mut [u8]) -> Result<Event, DecryptError> {
-        if body.len() == 0 {
+    pub fn decrypt_body(&mut self, ev: &mut Event) -> Option<DecryptError> {
+        if ev.body.is_empty() {
             self.nonce += 1;
-            let ev = Event {
-                header,
-                body: vec![],
-                remote: true,
-            };
-            return Ok(ev);
+            return None;
         }
         if self.opening_key.is_none() {
-            let out = Vec::from(&body[0..header.len() as usize]);
-            let ev = Event {
-                header,
-                body: out,
-                remote: true,
-            };
-            return Ok(ev);
+            None
         } else {
             let opening_key = self.opening_key.as_mut().unwrap();
-            match opening_key.open_in_place(Aad::empty(), &mut body[..]) {
+            match opening_key.open_in_place(Aad::empty(), &mut ev.body[..]) {
                 Ok(_) => {}
                 Err(e) => {
                     error!(
                         "decrypt error:{} for event:{} {} {} {} {}",
                         e,
-                        header.stream_id,
-                        header.flags(),
-                        header.len(),
-                        body.len(),
+                        ev.header.stream_id,
+                        ev.header.flags(),
+                        ev.header.len(),
+                        ev.body.len(),
                         self.nonce,
                     );
-                    return Err((0, "Decrypt error"));
+                    return Some((0, "Decrypt error"));
                 }
             }
-            let out = Vec::from(&body[0..header.len() as usize]);
+            unsafe {
+                ev.body.set_len(ev.header.len() as usize);
+            }
             self.nonce += 1;
-            let ev = Event {
-                header,
-                body: out,
-                remote: true,
-            };
-            return Ok(ev);
+            None
         }
     }
 }
@@ -360,9 +344,14 @@ where
     if next_n > 0 {
         let _ = reader.read_exact(&mut dbuf).await?;
     }
-    match ctx.decrypt_body(header, &mut dbuf[..]) {
-        Ok(ev) => Ok(ev),
-        Err((_, reason)) => Err(std::io::Error::new(std::io::ErrorKind::Other, reason)),
+    let mut ev = Event {
+        header,
+        body: dbuf,
+        remote: true,
+    };
+    match ctx.decrypt_body(&mut ev) {
+        None => Ok(ev),
+        Some((_, reason)) => Err(std::io::Error::new(std::io::ErrorKind::Other, reason)),
     }
 }
 
