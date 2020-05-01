@@ -8,8 +8,8 @@ pub fn fill_read_buf(src: &mut BytesMut, dst: &mut [u8]) -> usize {
         return 0;
     }
     let mut n = src.len();
-    if n > src.len() {
-        n = src.len();
+    if n > dst.len() {
+        n = dst.len();
     }
     dst[0..n].copy_from_slice(&src[0..n]);
     src.advance(n);
