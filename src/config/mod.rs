@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 // lazy_static! {
 //     static ref GLOBAL_CONFIG: Mutex<Config> = Mutex::new(Config::new());
 // }
-pub const DEFAULT_RELAY_BUF_SIZE: usize = 64 * 1024;
+pub const DEFAULT_RELAY_BUF_SIZE: usize = 4 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LogConfig {

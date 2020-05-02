@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::time;
 use tokio::time::delay_for;
 
-static RELAYS: AtomicU32 = AtomicU32::new(0);
+// static RELAYS: AtomicU32 = AtomicU32::new(0);
 
 pub async fn relay_connection(
     tunnel_id: u32,
@@ -57,24 +57,25 @@ where
         return Err(make_error("no valid channel found."));
     }
 
-    RELAYS.fetch_add(1, Ordering::SeqCst);
     let remote_target = String::from(target.as_str());
-    info!(
-        "[{}][{}]Stream open with curent relay:{}",
-        tunnel_id,
-        remote_target,
-        RELAYS.load(Ordering::SeqCst)
-    );
-    let mut remote = get_channel_stream(channel, target).await?;
+    // RELAYS.fetch_add(1, Ordering::SeqCst);
+    // info!(
+    //     "[{}][{}]Stream open with curent relay:{}",
+    //     tunnel_id,
+    //     remote_target,
+    //     RELAYS.load(Ordering::SeqCst)
+    // );
+    let mut remote = match get_channel_stream(channel, target).await {
+        Ok(s) => s,
+        Err(e) => {
+            //RELAYS.fetch_sub(1, Ordering::SeqCst);
+            return Err(make_error(&e.to_string()));
+        }
+    };
     {
         let (mut ro, mut wo) = remote.split();
-        let mut failed = false;
-        if !relay_buf.is_empty() {
-            if wo.write_all(&relay_buf[..]).await.is_err() {
-                failed = true;
-            }
-        }
-        if !failed {
+        let no_relay = !relay_buf.is_empty() && wo.write_all(&relay_buf[..]).await.is_err();
+        if !no_relay {
             let _ = relay(
                 tunnel_id,
                 local_reader,
@@ -87,13 +88,13 @@ where
         }
     }
     let _ = remote.close();
-    RELAYS.fetch_sub(1, Ordering::SeqCst);
-    info!(
-        "[{}][{}]Stream close with curent relay:{}",
-        tunnel_id,
-        remote_target,
-        RELAYS.load(Ordering::SeqCst)
-    );
+    // RELAYS.fetch_sub(1, Ordering::SeqCst);
+    // info!(
+    //     "[{}][{}]Stream close with curent relay:{}",
+    //     tunnel_id,
+    //     remote_target,
+    //     RELAYS.load(Ordering::SeqCst)
+    // );
     Ok(())
 }
 

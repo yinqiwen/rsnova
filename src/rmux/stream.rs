@@ -3,7 +3,6 @@ use super::message::ConnectRequest;
 use super::session::report_update_window;
 
 use bytes::BytesMut;
-use std::error::Error;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -16,6 +15,12 @@ use tokio::sync::mpsc;
 
 use crate::channel::ChannelStream;
 use crate::utils::{clear_unbounded_channel, fill_read_buf, make_io_error};
+
+const MIN_REPORT_RECV_SIZE: i32 = 32 * 1024;
+
+// static READER_COUNT: AtomicU32 = AtomicU32::new(0);
+// static WRITER_COUNT: AtomicU32 = AtomicU32::new(0);
+// static STREAM_COUNT: AtomicU32 = AtomicU32::new(0);
 
 pub struct MuxStreamState {
     pub channel: String,
@@ -67,8 +72,12 @@ fn inc_recv_buf_window(state: &MuxStreamState, inc: usize, cx: &mut Context<'_>)
     state
         .total_recv_bytes
         .fetch_add(inc as u32, Ordering::SeqCst);
-    let min_report_window: i32 = 32 * 1024;
     let current_recv_buf_size = state.recv_buf_size.load(Ordering::SeqCst);
+    let mut min_report_window: i32 = current_recv_buf_size * 4;
+    if min_report_window > MIN_REPORT_RECV_SIZE {
+        min_report_window = MIN_REPORT_RECV_SIZE;
+    }
+
     if current_recv_buf_size >= min_report_window
         && report_update_window(
             cx,
@@ -87,6 +96,12 @@ fn inc_recv_buf_window(state: &MuxStreamState, inc: usize, cx: &mut Context<'_>)
 impl Drop for MuxStreamReader {
     fn drop(&mut self) {
         clear_unbounded_channel(&mut self.rx);
+        // READER_COUNT.fetch_sub(1, Ordering::SeqCst);
+        // info!(
+        //     "Drop reader, READER:{}, WRITER:{}",
+        //     READER_COUNT.load(Ordering::SeqCst),
+        //     WRITER_COUNT.load(Ordering::SeqCst),
+        // );
     }
 }
 
@@ -149,6 +164,16 @@ struct MuxStreamWriter {
     state: Arc<MuxStreamState>,
     io_state: Arc<Mutex<SharedIOState>>,
 }
+impl Drop for MuxStreamWriter {
+    fn drop(&mut self) {
+        // WRITER_COUNT.fetch_sub(1, Ordering::SeqCst);
+        // info!(
+        //     "Drop writer, READER:{}, WRITER:{}",
+        //     READER_COUNT.load(Ordering::SeqCst),
+        //     WRITER_COUNT.load(Ordering::SeqCst),
+        // );
+    }
+}
 impl AsyncWrite for MuxStreamWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -196,7 +221,7 @@ impl AsyncWrite for MuxStreamWriter {
         match tx.try_send(ev) {
             Err(e) => {
                 io_state.lock().unwrap().try_close();
-                return Poll::Ready(Err(make_io_error(&e.to_string())));
+                Poll::Ready(Err(make_io_error(&e.to_string())))
             }
             Ok(()) => {
                 state
@@ -231,6 +256,13 @@ pub struct MuxStream {
     relay_buf_size: usize,
 }
 
+impl Drop for MuxStream {
+    fn drop(&mut self) {
+        // STREAM_COUNT.fetch_sub(1, Ordering::SeqCst);
+        // info!("Drop stream {}", STREAM_COUNT.load(Ordering::SeqCst),);
+    }
+}
+
 impl MuxStream {
     pub fn new(
         name: &str,
@@ -257,6 +289,8 @@ impl MuxStream {
             data_tx: Some(dtx),
             data_rx: Some(drx),
         };
+        // STREAM_COUNT.fetch_add(1, Ordering::SeqCst);
+        // info!("New stream {}", STREAM_COUNT.load(Ordering::SeqCst),);
         Self {
             target,
             event_tx: evtx,
@@ -320,6 +354,8 @@ impl MuxStream {
             io_state: self.io_state.clone(),
             relay_buf_size: self.relay_buf_size,
         };
+        // STREAM_COUNT.fetch_add(1, Ordering::SeqCst);
+        // info!("Clone stream {}", STREAM_COUNT.load(Ordering::SeqCst),);
         if let Some(tx) = &self.data_tx {
             v.data_tx = Some(tx.clone());
         }
@@ -345,6 +381,13 @@ impl ChannelStream for MuxStream {
             state: self.state.clone(),
             io_state: self.io_state.clone(),
         };
+        // READER_COUNT.fetch_add(1, Ordering::SeqCst);
+        // WRITER_COUNT.fetch_add(1, Ordering::SeqCst);
+        // info!(
+        //     "Create READER:{}, WRITER:{}",
+        //     READER_COUNT.load(Ordering::SeqCst),
+        //     WRITER_COUNT.load(Ordering::SeqCst),
+        // );
         //error!("[{}]split.", self.state.stream_id);
         (Box::new(r), Box::new(w))
     }

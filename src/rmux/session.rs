@@ -283,8 +283,7 @@ pub async fn create_stream(
         }
         (stream, ev, ev_sender)
     };
-    if stream.is_some() {
-        let _ = ev_sender.unwrap().send(ev.unwrap()).await;
+    if stream.is_some() && ev_sender.unwrap().send(ev.unwrap()).await.is_ok() {
         return Ok(stream.unwrap());
     }
     Err(make_io_error("no channel found."))
