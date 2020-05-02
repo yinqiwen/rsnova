@@ -1,6 +1,5 @@
-use super::event::{new_data_event, new_fin_event, Event};
+use super::event::{new_data_event, new_fin_event, new_window_update_event, Event};
 use super::message::ConnectRequest;
-use super::session::report_update_window;
 
 use bytes::BytesMut;
 use std::pin::Pin;
@@ -62,6 +61,7 @@ impl MuxStreamState {
 }
 
 struct MuxStreamReader {
+    tx: mpsc::Sender<Event>,
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     recv_buf: BytesMut,
     state: Arc<MuxStreamState>,
@@ -69,7 +69,12 @@ struct MuxStreamReader {
 
 impl MuxStreamReader {}
 
-fn inc_recv_buf_window(state: &MuxStreamState, inc: usize, cx: &mut Context<'_>) {
+fn inc_recv_buf_window(
+    tx: &mut mpsc::Sender<Event>,
+    state: &MuxStreamState,
+    inc: usize,
+    cx: &mut Context<'_>,
+) -> Poll<std::io::Result<()>> {
     state.recv_buf_size.fetch_add(inc as i32, Ordering::SeqCst);
     state
         .total_recv_bytes
@@ -79,19 +84,26 @@ fn inc_recv_buf_window(state: &MuxStreamState, inc: usize, cx: &mut Context<'_>)
     if min_report_window > MIN_REPORT_RECV_SIZE {
         min_report_window = MIN_REPORT_RECV_SIZE;
     }
-
-    if current_recv_buf_size >= min_report_window
-        && report_update_window(
-            cx,
-            state.channel.as_str(),
-            state.session_id,
-            state.stream_id,
-            current_recv_buf_size as u32,
-        )
-    {
-        state
-            .recv_buf_size
-            .fetch_sub(current_recv_buf_size, Ordering::SeqCst);
+    if current_recv_buf_size >= min_report_window {
+        let ev = new_window_update_event(state.stream_id, current_recv_buf_size as u32, false);
+        match tx.poll_ready(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => {
+                return Poll::Ready(Err(make_io_error(&e.to_string())));
+            }
+        }
+        match tx.try_send(ev) {
+            Err(e) => Poll::Ready(Err(make_io_error(&e.to_string()))),
+            Ok(()) => {
+                state
+                    .recv_buf_size
+                    .fetch_sub(current_recv_buf_size, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+        }
+    } else {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -114,6 +126,7 @@ impl AsyncRead for MuxStreamReader {
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         let Self {
+            tx,
             rx,
             recv_buf,
             state,
@@ -122,10 +135,21 @@ impl AsyncRead for MuxStreamReader {
             clear_unbounded_channel(rx);
             return Poll::Ready(Err(make_io_error("closed")));
         }
-        if !recv_buf.is_empty() {
-            let n = fill_read_buf(recv_buf, buf);
-            inc_recv_buf_window(&state, n, cx);
-            return Poll::Ready(Ok(n));
+        let n = if !recv_buf.is_empty() {
+            fill_read_buf(recv_buf, buf)
+        } else {
+            0
+        };
+        match inc_recv_buf_window(tx, &state, n, cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                if n > 0 {
+                    return Poll::Ready(Ok(n));
+                }
+            }
+            Poll::Ready(Err(e)) => {
+                return Poll::Ready(Err(e));
+            }
         }
         recv_buf.clear();
         match rx.poll_recv(cx) {
@@ -142,12 +166,18 @@ impl AsyncRead for MuxStreamReader {
                 if copy_n > buf.len() {
                     copy_n = buf.len();
                 }
+                match inc_recv_buf_window(tx, &state, copy_n, cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Err(e));
+                    }
+                }
                 //info!("[{}]tx ready {} ", state.stream_id, copy_n);
                 buf[0..copy_n].copy_from_slice(&b[0..copy_n]);
                 if copy_n < b.len() {
                     recv_buf.extend_from_slice(&b[copy_n..]);
                 }
-                inc_recv_buf_window(&state, copy_n, cx);
                 Poll::Ready(Ok(copy_n))
             }
             Poll::Ready(None) => {
@@ -255,7 +285,6 @@ pub struct MuxStream {
     pub data_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     pub state: Arc<MuxStreamState>,
     io_state: Arc<Mutex<SharedIOState>>,
-    relay_buf_size: usize,
 }
 
 impl Drop for MuxStream {
@@ -300,7 +329,6 @@ impl MuxStream {
             data_tx: None,
             state: Arc::new(state),
             io_state: Arc::new(Mutex::new(io_state)),
-            relay_buf_size,
         }
     }
     pub fn id(&self) -> u32 {
@@ -308,7 +336,7 @@ impl MuxStream {
     }
 
     pub fn relay_buf_size(&self) -> usize {
-        self.relay_buf_size
+        self.state.relay_buf_size
     }
 
     fn check_data_tx(&mut self) {
@@ -355,7 +383,6 @@ impl MuxStream {
             data_tx: None,
             state: self.state.clone(),
             io_state: self.io_state.clone(),
-            relay_buf_size: self.relay_buf_size,
         };
         // STREAM_COUNT.fetch_add(1, Ordering::SeqCst);
         // info!("Clone stream {}", STREAM_COUNT.load(Ordering::SeqCst),);
@@ -375,6 +402,7 @@ impl ChannelStream for MuxStream {
     ) {
         //let (dtx, drx) = mpsc::channel(16);
         let r = MuxStreamReader {
+            tx: self.event_tx.clone(),
             rx: self.io_state.lock().unwrap().data_rx.take().unwrap(),
             recv_buf: BytesMut::new(),
             state: self.state.clone(),

@@ -57,7 +57,7 @@ where
         return Err(make_error("no valid channel found."));
     }
 
-    let remote_target = String::from(target.as_str());
+    //let remote_target = String::from(target.as_str());
     // RELAYS.fetch_add(1, Ordering::SeqCst);
     // info!(
     //     "[{}][{}]Stream open with curent relay:{}",

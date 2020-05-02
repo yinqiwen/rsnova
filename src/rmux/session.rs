@@ -289,35 +289,6 @@ pub async fn create_stream(
     Err(make_io_error("no channel found."))
 }
 
-pub fn report_update_window(
-    cx: &mut Context<'_>,
-    channel: &str,
-    session_id: u32,
-    stream_id: u32,
-    window: u32,
-) -> bool {
-    let cmap = &mut CHANNEL_SESSIONS.lock().unwrap().channels;
-    if let Some(csession) = cmap.get_mut(channel) {
-        for cs in csession.sessions.iter_mut() {
-            if let Some(ss) = cs {
-                if ss.id == session_id {
-                    let ev = new_window_update_event(stream_id, window, false);
-                    match ss.event_tx.poll_ready(cx) {
-                        Poll::Ready(Ok(())) => {}
-                        _ => {
-                            return false;
-                        }
-                    }
-                    if let Ok(()) = ss.event_tx.try_send(ev) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    true
-}
-
 async fn handle_rmux_stream(mut stream: MuxStream) -> Result<(), Box<dyn Error>> {
     let stream_id = stream.state.stream_id;
     let relay_buf_size = stream.relay_buf_size();
