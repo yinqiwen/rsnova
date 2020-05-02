@@ -17,6 +17,7 @@ use crate::channel::ChannelStream;
 use crate::utils::{clear_unbounded_channel, fill_read_buf, make_io_error};
 
 const MIN_REPORT_RECV_SIZE: i32 = 32 * 1024;
+const RELAY_BUF_FACTOR: usize = 4;
 
 // static READER_COUNT: AtomicU32 = AtomicU32::new(0);
 // static WRITER_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -32,6 +33,7 @@ pub struct MuxStreamState {
     pub total_recv_bytes: AtomicU32,
     pub total_send_bytes: AtomicU32,
     pub born_time: Instant,
+    relay_buf_size: usize,
 }
 
 struct SharedIOState {
@@ -73,7 +75,7 @@ fn inc_recv_buf_window(state: &MuxStreamState, inc: usize, cx: &mut Context<'_>)
         .total_recv_bytes
         .fetch_add(inc as u32, Ordering::SeqCst);
     let current_recv_buf_size = state.recv_buf_size.load(Ordering::SeqCst);
-    let mut min_report_window: i32 = current_recv_buf_size * 4;
+    let mut min_report_window: i32 = (state.relay_buf_size * RELAY_BUF_FACTOR) as i32;
     if min_report_window > MIN_REPORT_RECV_SIZE {
         min_report_window = MIN_REPORT_RECV_SIZE;
     }
@@ -276,12 +278,13 @@ impl MuxStream {
             channel: String::from(name),
             session_id: id0,
             stream_id: id1,
-            send_buf_window: AtomicI32::new(relay_buf_size as i32 * 4),
+            send_buf_window: AtomicI32::new((relay_buf_size * RELAY_BUF_FACTOR) as i32),
             recv_buf_size: AtomicI32::new(0),
             closed: AtomicBool::new(false),
             total_recv_bytes: AtomicU32::new(0),
             total_send_bytes: AtomicU32::new(0),
             born_time: Instant::now(),
+            relay_buf_size,
         };
         let (dtx, drx) = mpsc::unbounded_channel();
         let io_state = SharedIOState {
