@@ -6,6 +6,7 @@ use tokio::io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::mux::event::{self, OpenStreamEvent};
+use crate::tunnel::DefaultTimeoutSecs;
 
 pub struct Stream<'a, LR, LW, RR, RW> {
     local_reader: &'a mut LR,
@@ -56,7 +57,7 @@ where
     }
 
     pub async fn transfer(&mut self) -> Result<()> {
-        let timeout_secs = Duration::from_secs(5);
+        let timeout_secs = Duration::from_secs(DefaultTimeoutSecs);
         let client_to_server = timeout_copy(
             &mut self.local_reader,
             &mut self.remote_writer,
@@ -76,7 +77,7 @@ pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteEx
     mut lr: &'a mut LR,
     mut lw: &'a mut LW,
 ) -> Result<()> {
-    let timeout_secs = Duration::from_secs(10);
+    let timeout_secs = Duration::from_secs(DefaultTimeoutSecs);
     match timeout(timeout_secs, event::read_event(&mut lr)).await? {
         Err(e) => match e.kind() {
             std::io::ErrorKind::UnexpectedEof => Ok(()),
