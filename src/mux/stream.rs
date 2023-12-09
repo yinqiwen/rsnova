@@ -25,6 +25,7 @@ pub enum Control {
     NewStream((u32, mpsc::Sender<Vec<u8>>, Option<mpsc::Receiver<Vec<u8>>>)),
     StreamData(u32, Vec<u8>, bool),
     StreamClose(u32, bool),
+    StreamDrop(u32),
     Ping,
     Close,
 }
@@ -144,18 +145,28 @@ impl AsyncWrite for MuxStream {
 
 impl Drop for MuxStream {
     fn drop(&mut self) {
+        match self.ev_writer.get_ref() {
+            Some(sender) => {
+                let sender = sender.clone();
+                let stream_drop = Control::StreamDrop(self.id);
+                if !self.initial_close {
+                    self.initial_close = true;
+                    let stream_close = Control::StreamClose(self.id, false);
+                    tokio::spawn(async move {
+                        let _ = sender.send(stream_close).await;
+                        let _ = sender.send(stream_drop).await;
+                    });
+                } else {
+                    tokio::spawn(async move {
+                        let _ = sender.send(stream_drop).await;
+                    });
+                }
+            }
+            None => {}
+        }
         if !self.initial_close {
             self.initial_close = true;
             let ctrl = Control::StreamClose(self.id, false);
-            match self.ev_writer.get_ref() {
-                Some(sender) => {
-                    let sender = sender.clone();
-                    tokio::spawn(async move {
-                        let _ = sender.send(ctrl).await;
-                    });
-                }
-                None => {}
-            }
         }
     }
 }

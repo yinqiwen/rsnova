@@ -168,12 +168,17 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     match stream_senders.get(&id) {
                         Some(stream_sender) => {
                             if incoming {
-                                let is_fin = data.len() == 0;
+                                let data_len = data.len();
                                 if let Err(e) = stream_sender.send(data).await {
                                     // handle error
-                                    tracing::error!("Stream:{} send error:{}", id, e);
+                                    tracing::error!(
+                                        "Stream:{} send error:{} with data len:{}",
+                                        id,
+                                        e,
+                                        data_len
+                                    );
                                 }
-                                if is_fin {
+                                if data_len == 0 {
                                     //stream_senders.remove(&id);
                                 }
                             } else {
@@ -213,6 +218,9 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     }
                     None => {}
                 },
+                Control::StreamDrop(sid) => {
+                    stream_senders.remove(&sid);
+                }
                 Control::Ping => {
                     let ev = event::new_ping_event();
                     if let Err(e) = event::write_event(&mut w, ev).await {
