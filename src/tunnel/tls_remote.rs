@@ -83,6 +83,7 @@ pub async fn start_tls_remote_server(
             let stream = acceptor.accept(stream).await?;
             tracing::info!("TLS connection incoming");
             handle_tls_connection(stream, conn_id).await?;
+            tracing::info!("TLS connection close");
             fut_free_ids.lock().unwrap().push_back(conn_id);
             Ok(()) as Result<()>
         };

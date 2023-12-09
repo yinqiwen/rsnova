@@ -100,7 +100,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
                 event::FLAG_FIN => {
                     let _ = ev_writer
-                        .send(Control::StreamClose(ev.header.stream_id, true))
+                        .send(Control::StreamShutdown(ev.header.stream_id, true))
                         .await;
                 }
                 event::FLAG_DATA => {
@@ -128,7 +128,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let ev_writer = ev_writer_orig.clone();
     let read_ctrl_fut = async move {
-        let labels: [(&str, String); 1] = [("idx", format!("{}!", id))];
+        let labels: [(&str, String); 1] = [("idx", format!("{}", id))];
         let mut incoming_streams: VecDeque<MuxStream> = VecDeque::new();
         let mut accept_callback: Option<oneshot::Sender<Result<MuxStream>>> = None;
         let mut stream_senders: HashMap<u32, mpsc::Sender<Vec<u8>>> = HashMap::new();
@@ -178,9 +178,6 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                         data_len
                                     );
                                 }
-                                if data_len == 0 {
-                                    //stream_senders.remove(&id);
-                                }
                             } else {
                                 let ev = event::new_data_event(id, data);
                                 if let Err(e) = event::write_event(&mut w, ev).await {
@@ -201,24 +198,26 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         }
                     }
                 }
-                Control::StreamClose(sid, remote) => match stream_senders.get(&sid) {
+                Control::StreamShutdown(sid, remote) => match stream_senders.get(&sid) {
                     Some(sender) => {
                         if !remote {
-                            tracing::info!("[{}]Stream close initial.", sid);
+                            tracing::info!("[{}]Stream shutdown initial.", sid);
+                            //stream_senders.remove(&sid);
                             let ev = event::new_fin_event(sid);
                             if let Err(e) = event::write_event(&mut w, ev).await {
                                 tracing::error!("write fin failed:{}", e);
                                 break;
                             }
                         } else {
-                            tracing::info!("[{}]Stream close by remote", sid);
+                            tracing::info!("[{}]Stream shutdown by remote", sid);
                             let _ = sender.send(Vec::new()).await;
-                            stream_senders.remove(&sid);
+                            //stream_senders.remove(&sid);
                         }
                     }
                     None => {}
                 },
-                Control::StreamDrop(sid) => {
+                Control::StreamClose(sid) => {
+                    tracing::info!("[{}]Stream close", sid);
                     stream_senders.remove(&sid);
                 }
                 Control::Ping => {

@@ -24,8 +24,8 @@ pub enum Control {
     AcceptStream(oneshot::Sender<Result<MuxStream>>),
     NewStream((u32, mpsc::Sender<Vec<u8>>, Option<mpsc::Receiver<Vec<u8>>>)),
     StreamData(u32, Vec<u8>, bool),
-    StreamClose(u32, bool),
-    StreamDrop(u32),
+    StreamShutdown(u32, bool),
+    StreamClose(u32),
     Ping,
     Close,
 }
@@ -129,7 +129,7 @@ impl AsyncWrite for MuxStream {
     ) -> Poll<Result<(), std::io::Error>> {
         if !self.initial_close {
             self.initial_close = true;
-            let ctrl = Control::StreamClose(self.id, false);
+            let ctrl = Control::StreamShutdown(self.id, false);
             match ready!(self.ev_writer.poll_reserve(cx)) {
                 Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
                 Ok(v) => match self.ev_writer.send_item(ctrl) {
@@ -148,10 +148,10 @@ impl Drop for MuxStream {
         match self.ev_writer.get_ref() {
             Some(sender) => {
                 let sender = sender.clone();
-                let stream_drop = Control::StreamDrop(self.id);
+                let stream_drop = Control::StreamClose(self.id);
                 if !self.initial_close {
                     self.initial_close = true;
-                    let stream_close = Control::StreamClose(self.id, false);
+                    let stream_close = Control::StreamShutdown(self.id, false);
                     tokio::spawn(async move {
                         let _ = sender.send(stream_close).await;
                         let _ = sender.send(stream_drop).await;
@@ -163,10 +163,6 @@ impl Drop for MuxStream {
                 }
             }
             None => {}
-        }
-        if !self.initial_close {
-            self.initial_close = true;
-            let ctrl = Control::StreamClose(self.id, false);
         }
     }
 }
