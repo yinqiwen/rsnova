@@ -17,7 +17,7 @@ pub struct MuxStream {
     ev_writer: PollSender<Control>,
     inbound_reader: mpsc::Receiver<Vec<u8>>,
     recv_buf: BytesMut,
-    eof_close: bool,
+    initial_close: bool,
 }
 
 pub enum Control {
@@ -57,7 +57,7 @@ impl MuxStream {
             ev_writer: PollSender::new(ev_writer),
             inbound_reader,
             recv_buf: BytesMut::new(),
-            eof_close: false,
+            initial_close: false,
         }
     }
 
@@ -82,7 +82,7 @@ impl AsyncRead for MuxStream {
             Poll::Ready(Some(b)) => {
                 let mut copy_n: usize = b.len();
                 if 0 == copy_n {
-                    self.eof_close = true;
+                    //self.initial_close = true;
                     return Poll::Ready(Ok(()));
                 }
                 if copy_n > buf.remaining() {
@@ -95,7 +95,7 @@ impl AsyncRead for MuxStream {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => {
-                self.eof_close = true;
+                // self.eof_close = true;
                 //error!("[{}]####3 Close", state.stream_id);
                 Poll::Ready(Ok(()))
             }
@@ -126,7 +126,8 @@ impl AsyncWrite for MuxStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        if !self.eof_close {
+        if !self.initial_close {
+            self.initial_close = true;
             let ctrl = Control::StreamClose(self.id, false);
             match ready!(self.ev_writer.poll_reserve(cx)) {
                 Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
@@ -143,7 +144,8 @@ impl AsyncWrite for MuxStream {
 
 impl Drop for MuxStream {
     fn drop(&mut self) {
-        if !self.eof_close {
+        if !self.initial_close {
+            self.initial_close = true;
             let ctrl = Control::StreamClose(self.id, false);
             match self.ev_writer.get_ref() {
                 Some(sender) => {

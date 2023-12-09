@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tracing_subscriber::fmt::format;
 
 use super::event;
 
@@ -97,7 +98,12 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         )))
                         .await;
                 }
-                event::FLAG_FIN | event::FLAG_DATA => {
+                event::FLAG_FIN => {
+                    let _ = ev_writer
+                        .send(Control::StreamClose(ev.header.stream_id, true))
+                        .await;
+                }
+                event::FLAG_DATA => {
                     // if ev.header.flags() == event::FLAG_FIN {
                     //     tracing::info!("recv fin:{}", ev.header.stream_id);
                     // }
@@ -122,11 +128,13 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let ev_writer = ev_writer_orig.clone();
     let read_ctrl_fut = async move {
+        let labels: [(&str, String); 1] = [("idx", format!("{}!", id))];
         let mut incoming_streams: VecDeque<MuxStream> = VecDeque::new();
         let mut accept_callback: Option<oneshot::Sender<Result<MuxStream>>> = None;
         let mut stream_senders: HashMap<u32, mpsc::Sender<Vec<u8>>> = HashMap::new();
 
         while let Some(ctrl) = ev_reader.recv().await {
+            metrics::gauge!("mux.streams", stream_senders.len() as f64, &labels);
             match ctrl {
                 Control::AcceptStream(callback) => {
                     if accept_callback.is_some() {
@@ -166,7 +174,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                     tracing::error!("Stream:{} send error:{}", id, e);
                                 }
                                 if is_fin {
-                                    stream_senders.remove(&id);
+                                    //stream_senders.remove(&id);
                                 }
                             } else {
                                 let ev = event::new_data_event(id, data);
@@ -188,15 +196,19 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         }
                     }
                 }
-                Control::StreamClose(sid, remote) => match stream_senders.remove_entry(&sid) {
-                    Some((id, sender)) => {
-                        let _ = sender.send(Vec::new()).await;
+                Control::StreamClose(sid, remote) => match stream_senders.get(&sid) {
+                    Some(sender) => {
                         if !remote {
-                            let ev = event::new_fin_event(id);
+                            tracing::info!("[{}]Stream close initial.", sid);
+                            let ev = event::new_fin_event(sid);
                             if let Err(e) = event::write_event(&mut w, ev).await {
                                 tracing::error!("write fin failed:{}", e);
                                 break;
                             }
+                        } else {
+                            tracing::info!("[{}]Stream close by remote", sid);
+                            let _ = sender.send(Vec::new()).await;
+                            stream_senders.remove(&sid);
                         }
                     }
                     None => {}

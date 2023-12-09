@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crate::mux;
 use crate::tunnel::stream::handle_server_stream;
 use rustls_pemfile::Item;
-use std::{fs, io, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::VecDeque, fs, io, net::SocketAddr, path::PathBuf, sync::Arc, sync::Mutex};
 
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -68,15 +68,22 @@ pub async fn start_tls_remote_server(
     tracing::info!("TLS server listening on {:?}", listen);
 
     let mut id: u32 = 0;
+    let free_ids = Arc::new(Mutex::new(VecDeque::new()));
     loop {
-        let conn_id = id;
+        let conn_id = if free_ids.lock().unwrap().is_empty() {
+            id += 1;
+            id - 1
+        } else {
+            free_ids.lock().unwrap().pop_front().unwrap()
+        };
         let (stream, _) = listener.accept().await?;
-        id += 1;
         let acceptor = acceptor.clone();
+        let fut_free_ids = free_ids.clone();
         let fut = async move {
             let stream = acceptor.accept(stream).await?;
             tracing::info!("TLS connection incoming");
             handle_tls_connection(stream, conn_id).await?;
+            fut_free_ids.lock().unwrap().push_back(conn_id);
             Ok(()) as Result<()>
         };
 
