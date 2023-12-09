@@ -4,6 +4,9 @@ use bytes::Buf;
 use bytes::BytesMut;
 use futures::ready;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::SeqCst;
 use std::task::{Context, Poll};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -12,17 +15,38 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::PollSender;
 
+struct MuxStreamState {
+    close_by_remote: AtomicBool,
+    io_active_timestamp_secs: AtomicU64,
+}
+
+impl MuxStreamState {
+    fn new() -> Self {
+        Self {
+            close_by_remote: AtomicBool::new(false),
+            io_active_timestamp_secs: AtomicU64::new(0),
+        }
+    }
+}
+
 pub struct MuxStream {
     id: u32,
     ev_writer: PollSender<Control>,
-    inbound_reader: mpsc::Receiver<Vec<u8>>,
+    inbound_reader: mpsc::Receiver<Option<Vec<u8>>>,
     recv_buf: BytesMut,
+    state: MuxStreamState,
     initial_close: bool,
 }
 
 pub enum Control {
     AcceptStream(oneshot::Sender<Result<MuxStream>>),
-    NewStream((u32, mpsc::Sender<Vec<u8>>, Option<mpsc::Receiver<Vec<u8>>>)),
+    NewStream(
+        (
+            u32,
+            mpsc::Sender<Option<Vec<u8>>>,
+            Option<mpsc::Receiver<Option<Vec<u8>>>>,
+        ),
+    ),
     StreamData(u32, Vec<u8>, bool),
     StreamShutdown(u32, bool),
     StreamClose(u32),
@@ -51,13 +75,14 @@ impl MuxStream {
     pub fn new(
         id: u32,
         ev_writer: mpsc::Sender<Control>,
-        inbound_reader: mpsc::Receiver<Vec<u8>>,
+        inbound_reader: mpsc::Receiver<Option<Vec<u8>>>,
     ) -> Self {
         Self {
             id,
             ev_writer: PollSender::new(ev_writer),
             inbound_reader,
             recv_buf: BytesMut::new(),
+            state: MuxStreamState::new(),
             initial_close: false,
         }
     }
@@ -80,21 +105,31 @@ impl AsyncRead for MuxStream {
             }
         };
         match self.inbound_reader.poll_recv(cx) {
-            Poll::Ready(Some(b)) => {
-                let mut copy_n: usize = b.len();
-                if 0 == copy_n {
-                    //self.initial_close = true;
-                    return Poll::Ready(Ok(()));
+            Poll::Ready(Some(data)) => match data {
+                Some(b) => {
+                    let mut copy_n: usize = b.len();
+                    if 0 == copy_n {
+                        return Poll::Ready(Ok(()));
+                    }
+                    if copy_n > buf.remaining() {
+                        copy_n = buf.remaining();
+                    }
+                    buf.put_slice(&b[0..copy_n]);
+                    if copy_n < b.len() {
+                        self.recv_buf.extend_from_slice(&b[copy_n..]);
+                    }
+                    Poll::Ready(Ok(()))
                 }
-                if copy_n > buf.remaining() {
-                    copy_n = buf.remaining();
+                None => {
+                    self.state
+                        .close_by_remote
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "close by remote",
+                    )))
                 }
-                buf.put_slice(&b[0..copy_n]);
-                if copy_n < b.len() {
-                    self.recv_buf.extend_from_slice(&b[copy_n..]);
-                }
-                Poll::Ready(Ok(()))
-            }
+            },
             Poll::Ready(None) => {
                 // self.eof_close = true;
                 //error!("[{}]####3 Close", state.stream_id);
@@ -147,18 +182,18 @@ impl Drop for MuxStream {
     fn drop(&mut self) {
         match self.ev_writer.get_ref() {
             Some(sender) => {
-                let sender = sender.clone();
-                let stream_drop = Control::StreamClose(self.id);
                 if !self.initial_close {
-                    self.initial_close = true;
+                    let ctrl_sender = sender.clone();
                     let stream_close = Control::StreamShutdown(self.id, false);
                     tokio::spawn(async move {
-                        let _ = sender.send(stream_close).await;
-                        let _ = sender.send(stream_drop).await;
+                        let _ = ctrl_sender.send(stream_close).await;
                     });
-                } else {
+                }
+                if !self.state.close_by_remote.load(SeqCst) {
+                    let ctrl_sender = sender.clone();
+                    let stream_drop = Control::StreamClose(self.id);
                     tokio::spawn(async move {
-                        let _ = sender.send(stream_drop).await;
+                        let _ = ctrl_sender.send(stream_drop).await;
                     });
                 }
             }
