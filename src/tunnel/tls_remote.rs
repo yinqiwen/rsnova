@@ -110,7 +110,12 @@ async fn handle_tls_connection(
             let stream_id = stream.id();
             let (mut stream_reader, mut stream_writer) = tokio::io::split(stream);
             if let Err(e) = handle_server_stream(&mut stream_reader, &mut stream_writer).await {
-                tracing::error!("[{}]failed: {reason}", stream_id, reason = e.to_string());
+                tracing::error!(
+                    "[{}/{}]failed: {reason}",
+                    id,
+                    stream_id,
+                    reason = e.to_string()
+                );
             }
             metrics::decrement_gauge!("tls_server_proxy_streams", 1.0);
         });

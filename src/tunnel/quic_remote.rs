@@ -109,6 +109,7 @@ async fn handle_quic_connection(conn: quinn::Connecting) -> Result<()> {
         // Each stream initiated by the client constitutes a new request.
         loop {
             let stream = connection.accept_bi().await;
+            metrics::increment_gauge!("quic_server_proxy_streams", 1.0);
             let (mut send_stream, mut recv_stream) = match stream {
                 Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
                     tracing::info!("connection closed");
@@ -125,6 +126,7 @@ async fn handle_quic_connection(conn: quinn::Connecting) -> Result<()> {
                     print_type_of(&e);
                     tracing::error!("failed: {reason}", reason = e.to_string());
                 }
+                metrics::decrement_gauge!("quic_server_proxy_streams", 1.0);
             });
         }
     }

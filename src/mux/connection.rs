@@ -202,7 +202,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 Control::StreamShutdown(sid, remote) => match stream_senders.get(&sid) {
                     Some(sender) => {
                         if !remote {
-                            tracing::info!("[{}/{}]Stream shutdown initial.", conn_id, sid);
+                            tracing::info!("[{}/{}]Stream shutdown write.", conn_id, sid);
                             //stream_senders.remove(&sid);
                             let ev = event::new_fin_event(sid);
                             if let Err(e) = event::write_event(&mut w, ev).await {
@@ -210,7 +210,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                 break;
                             }
                         } else {
-                            tracing::info!("[{}/{}]Stream shutdown by remote", conn_id, sid);
+                            tracing::info!("[{}/{}]Stream shutdown read.", conn_id, sid);
                             let _ = sender.send(Some(Vec::new())).await;
                             //stream_senders.remove(&sid);
                         }
@@ -218,7 +218,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     None => {}
                 },
                 Control::StreamClose(sid) => {
-                    tracing::info!("[{}/{}]Stream close", conn_id, sid);
+                    tracing::info!("[{}/{}]Stream close.", conn_id, sid);
                     match stream_senders.remove_entry(&sid) {
                         Some((_, sender)) => {
                             let _ = sender.send(None).await;

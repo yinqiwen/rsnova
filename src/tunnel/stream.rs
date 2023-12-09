@@ -1,12 +1,32 @@
 use anyhow::{anyhow, Result};
-use bincode::{Decode, Encode};
 use futures::future::try_join;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tokio::io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::mux::event::{self, OpenStreamEvent};
+use crate::tunnel::CheckTimeoutSecs;
 use crate::tunnel::DefaultTimeoutSecs;
+
+struct TransferState {
+    abort: AtomicBool,
+    io_active_timestamp_secs: AtomicU64,
+}
+
+impl TransferState {
+    fn new() -> Self {
+        Self {
+            abort: AtomicBool::new(false),
+            io_active_timestamp_secs: AtomicU64::new(0),
+        }
+    }
+}
 
 pub struct Stream<'a, LR, LW, RR, RW> {
     local_reader: &'a mut LR,
@@ -18,24 +38,56 @@ pub struct Stream<'a, LR, LW, RR, RW> {
 async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     r: &mut R,
     w: &mut W,
-    timeout_duration: std::time::Duration,
+    timeout_sec: u64,
+    state: Arc<TransferState>,
 ) -> Result<()> {
     let mut buf = [0u8; 8192];
+    let check_timeout_secs = Duration::from_secs(CheckTimeoutSecs);
     loop {
-        let n = timeout(timeout_duration, r.read(&mut buf)).await??;
-        if n == 0 {
-            break;
+        if state.abort.load(SeqCst) {
+            return Err(anyhow!("abort"));
         }
-        w.write_all(&buf[0..n]).await?;
+        match timeout(check_timeout_secs, r.read(&mut buf)).await {
+            Err(_) => {
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if now_secs > (state.io_active_timestamp_secs.load(SeqCst) + timeout_sec) {
+                    return Err(anyhow!("timeout"));
+                }
+            }
+            Ok(Ok(n)) => {
+                if n == 0 {
+                    break;
+                };
+                state.io_active_timestamp_secs.store(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    SeqCst,
+                );
+                if let Err(ex) = w.write_all(&buf[0..n]).await {
+                    state.abort.store(true, SeqCst);
+                    return Err(ex.into());
+                }
+            }
+            Ok(Err(e)) => {
+                state.abort.store(true, SeqCst);
+                return Err(e.into());
+            }
+        }
     }
     Ok(())
 }
 async fn timeout_copy<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     r: &mut R,
     w: &mut W,
-    timeout_duration: std::time::Duration,
+    timeout_sec: u64,
+    state: Arc<TransferState>,
 ) -> Result<()> {
-    let result = timeout_copy_impl(r, w, timeout_duration).await;
+    let result = timeout_copy_impl(r, w, timeout_sec, state).await;
     w.shutdown().await?;
     result
 }
@@ -57,16 +109,18 @@ where
     }
 
     pub async fn transfer(&mut self) -> Result<()> {
-        let timeout_secs = Duration::from_secs(DefaultTimeoutSecs);
+        let state = Arc::new(TransferState::new());
         let client_to_server = timeout_copy(
             &mut self.local_reader,
             &mut self.remote_writer,
-            timeout_secs,
+            DefaultTimeoutSecs,
+            state.clone(),
         );
         let server_to_client = timeout_copy(
             &mut self.remote_reader,
             &mut self.local_writer,
-            timeout_secs,
+            DefaultTimeoutSecs,
+            state.clone(),
         );
         try_join(client_to_server, server_to_client).await?;
         Ok(())
