@@ -123,7 +123,7 @@ async fn handle_quic_connection(conn: quinn::Connecting) -> Result<()> {
             tokio::spawn(async move {
                 //tracing::info!("handle quic stream");
                 if let Err(e) = handle_server_stream(&mut recv_stream, &mut send_stream).await {
-                    print_type_of(&e);
+                    //print_type_of(&e);
                     tracing::error!("failed: {reason}", reason = e.to_string());
                 }
                 metrics::decrement_gauge!("quic_server_proxy_streams", 1.0);

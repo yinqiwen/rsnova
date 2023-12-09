@@ -52,7 +52,7 @@ struct Args {
     #[redact(partial)]
     key: Option<PathBuf>,
     /// TLS certificate in PEM format
-    #[clap(long = "cert", requires = "key", default_value = "cert.der")]
+    #[clap(long = "cert", default_value = "cert.der")]
     cert: Option<PathBuf>,
 
     #[clap(long, value_enum, default_value_t=Role::CLIENT)]

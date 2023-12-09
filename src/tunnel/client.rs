@@ -76,7 +76,10 @@ impl MuxConnection for QuicInnerConnection {
     async fn ping(&mut self) -> anyhow::Result<()> {
         match &mut self.inner {
             None => Err(anyhow!("null connection")),
-            Some(c) => Ok(()),
+            Some(c) => {
+                let _ = self.open_stream().await?;
+                Ok(())
+            }
         }
     }
     async fn connect(

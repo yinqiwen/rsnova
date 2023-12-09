@@ -4,9 +4,6 @@ use bytes::Buf;
 use bytes::BytesMut;
 use futures::ready;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::SeqCst;
 use std::task::{Context, Poll};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -15,27 +12,13 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::PollSender;
 
-struct MuxStreamState {
-    close_by_remote: AtomicBool,
-    io_active_timestamp_secs: AtomicU64,
-}
-
-impl MuxStreamState {
-    fn new() -> Self {
-        Self {
-            close_by_remote: AtomicBool::new(false),
-            io_active_timestamp_secs: AtomicU64::new(0),
-        }
-    }
-}
-
 pub struct MuxStream {
     id: u32,
     ev_writer: PollSender<Control>,
     inbound_reader: mpsc::Receiver<Option<Vec<u8>>>,
     recv_buf: BytesMut,
-    state: MuxStreamState,
     initial_close: bool,
+    close_by_remote: bool,
 }
 
 pub enum Control {
@@ -82,8 +65,8 @@ impl MuxStream {
             ev_writer: PollSender::new(ev_writer),
             inbound_reader,
             recv_buf: BytesMut::new(),
-            state: MuxStreamState::new(),
             initial_close: false,
+            close_by_remote: false,
         }
     }
 
@@ -121,9 +104,7 @@ impl AsyncRead for MuxStream {
                     Poll::Ready(Ok(()))
                 }
                 None => {
-                    self.state
-                        .close_by_remote
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.close_by_remote = true;
                     Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionReset,
                         "close by remote",
@@ -189,7 +170,7 @@ impl Drop for MuxStream {
                         let _ = ctrl_sender.send(stream_close).await;
                     });
                 }
-                if !self.state.close_by_remote.load(SeqCst) {
+                if !self.close_by_remote {
                     let ctrl_sender = sender.clone();
                     let stream_drop = Control::StreamClose(self.id);
                     tokio::spawn(async move {
