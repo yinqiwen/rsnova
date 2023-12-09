@@ -1,12 +1,11 @@
-use super::relay::relay_connection;
-use crate::utils::make_error;
-
-use crate::config::TunnelConfig;
-use std::error::Error;
+use anyhow::{anyhow, Result};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+
+use crate::tunnel::Message;
 
 mod v5 {
     pub const VERSION: u8 = 5;
@@ -49,24 +48,24 @@ fn name_port(addr_buf: &[u8]) -> Option<String> {
 pub async fn handle_socks5(
     tunnel_id: u32,
     mut inbound: TcpStream,
-    cfg: &TunnelConfig,
-) -> Result<(), Box<dyn Error>> {
+    sender: mpsc::UnboundedSender<Message>,
+) -> Result<()> {
     //let mut peek_buf = Vec::new();
     let mut num_methods_buf = [0u8; 2];
     inbound.read_exact(&mut num_methods_buf).await?;
     let mut vdata = vec![0; num_methods_buf[1] as usize];
     inbound.read_exact(&mut vdata).await?;
     if !vdata.contains(&v5::METH_NO_AUTH) {
-        return Err(make_error("no supported method given"));
+        return Err(anyhow!("no supported method given"));
     }
     inbound.write_all(&[v5::VERSION, v5::METH_NO_AUTH]).await?;
     let mut head = [0u8; 4];
     inbound.read_exact(&mut head).await?;
     if head[0] != v5::VERSION {
-        return Err(make_error("didn't confirm with v5 version"));
+        return Err(anyhow!("didn't confirm with v5 version"));
     }
     if head[1] != v5::CMD_CONNECT {
-        return Err(make_error("unsupported command"));
+        return Err(anyhow!("unsupported command"));
     }
     let target_addr = match head[3] {
         v5::ATYP_IPV4 => {
@@ -100,13 +99,12 @@ pub async fn handle_socks5(
             match name_port(&addr_buf) {
                 Some(addr) => addr,
                 None => {
-                    return Err(make_error("can not get addr with domian"));
+                    return Err(anyhow!("can not get addr with domian"));
                 }
             }
         }
         n => {
-            let msg = format!("unknown ATYP received: {}", n);
-            return Err(make_error(msg.as_str()));
+            return Err(anyhow!("unknown ATYP received: {}", n));
         }
     };
     let mut resp = [0u8; 10];
@@ -124,13 +122,15 @@ pub async fn handle_socks5(
     resp[3] = 1; // socksAtypeV4         = 0x01
     inbound.write_all(&resp).await?;
 
-    info!(
+    tracing::info!(
         "[{}]Handle SOCKS5 proxy to {} with local:{} remote:{}",
         tunnel_id,
         target_addr,
         inbound.local_addr().unwrap(),
         inbound.peer_addr().unwrap()
     );
-    relay_connection(tunnel_id, inbound, cfg, target_addr, Vec::new()).await?;
+
+    let msg = Message::open_stream(inbound, target_addr, None);
+    sender.send(msg)?;
     Ok(())
 }
