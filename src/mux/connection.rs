@@ -11,6 +11,8 @@ use super::event;
 
 use super::stream::Control;
 
+const DefaultStreamChannelSize: usize = 16;
+
 pub struct Connection {
     ev_writer: mpsc::Sender<Control>,
     stream_id_seed: AtomicU32,
@@ -28,7 +30,7 @@ impl Connection {
         mode: Mode,
         id: u32,
     ) -> Self {
-        let (sender_orig, receiver) = mpsc::channel::<Control>(5);
+        let (sender_orig, receiver) = mpsc::channel::<Control>(4096);
         let sender = sender_orig.clone();
         tokio::spawn(async move {
             handle_mux_connection(id, r, w, receiver, sender).await;
@@ -51,7 +53,7 @@ impl Connection {
         Ok(())
     }
     pub async fn open_stream(&self) -> Result<MuxStream> {
-        let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>(2);
+        let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>(DefaultStreamChannelSize);
         let id = self.stream_id_seed.fetch_add(2, Ordering::SeqCst);
         let stream = MuxStream::new(id, self.ev_writer.clone(), receiver);
         if let Err(e) = self
@@ -89,7 +91,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             match ev.header.flags() {
                 event::FLAG_SYN => {
                     //tracing::info!("recv syn:{}", ev.header.stream_id);
-                    let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>(2);
+                    let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>(DefaultStreamChannelSize);
                     let _ = ev_writer
                         .send(Control::NewStream((
                             ev.header.stream_id,
@@ -250,6 +252,10 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         //close streams
         for (_, sender) in stream_senders.drain().take(1) {
             let _ = sender.send(Some(Vec::new())).await;
+        }
+        if accept_callback.is_some(){
+            let _ = accept_callback.unwrap().send(Err(anyhow!("connection closed")));
+            accept_callback = None;
         }
     };
     tokio::join!(read_connection_fut, read_ctrl_fut);

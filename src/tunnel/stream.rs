@@ -54,7 +54,9 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
                     .unwrap()
                     .as_secs();
                 if now_secs > (state.io_active_timestamp_secs.load(SeqCst) + timeout_sec) {
-                    return Err(anyhow!("timeout"));
+                    return Err(anyhow!(format!("timeout after inactive {}secs", now_secs- state.io_active_timestamp_secs.load(SeqCst))));
+                }else{
+                    continue;
                 }
             }
             Ok(Ok(n)) => {

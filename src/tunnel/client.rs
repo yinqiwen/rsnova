@@ -270,7 +270,7 @@ async fn mux_client_loop<T: MuxClientTrait>(
                 }
             }
             Message::HealthCheck => {
-                //let _ = client.health_check().await;
+                let _ = client.health_check().await;
             }
         }
     }

@@ -70,21 +70,19 @@ pub async fn start_tls_remote_server(
     let mut id: u32 = 0;
     let free_ids = Arc::new(Mutex::new(VecDeque::new()));
     loop {
+        let (stream, _) = listener.accept().await?;
         let conn_id = if free_ids.lock().unwrap().is_empty() {
             id += 1;
             id - 1
         } else {
             free_ids.lock().unwrap().pop_front().unwrap()
         };
-        let (stream, _) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let fut_free_ids = free_ids.clone();
         let fut = async move {
             let stream = acceptor.accept(stream).await?;
             tracing::info!("TLS connection incoming");
             handle_tls_connection(stream, conn_id).await?;
-            tracing::info!("TLS connection close");
-            fut_free_ids.lock().unwrap().push_back(conn_id);
             Ok(()) as Result<()>
         };
 
@@ -92,6 +90,7 @@ pub async fn start_tls_remote_server(
             if let Err(e) = fut.await {
                 tracing::error!("connection failed: {reason}", reason = e.to_string())
             }
+            fut_free_ids.lock().unwrap().push_back(conn_id);
         });
     }
 }
