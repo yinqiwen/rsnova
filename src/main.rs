@@ -61,7 +61,7 @@ struct Args {
     #[clap(default_value = "5", long)]
     concurrent: usize,
 
-    #[clap(default_value = "google.com", long)]
+    #[clap(default_value = "mydomain.io", long)]
     tls_host: String,
 
     #[clap(default_value = "false", long)]
