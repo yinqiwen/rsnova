@@ -1,7 +1,7 @@
 use metrics::{decrement_gauge, increment_gauge};
 use std::io;
 use std::net::ToSocketAddrs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -103,29 +103,19 @@ impl MuxConnection for QuicInnerConnection {
     async fn open_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)> {
         match &mut self.inner {
             None => Err(anyhow!("null connection")),
-            Some(c) => {
-                let (send, recv) = c.open_bi().await.map_err(|e| {
-                    tracing::error!("{}", e);
-                    // c.close( &[u8; 1]);
+            Some(c) => match c.open_bi().await {
+                Err(e) => {
+                    let _ = c.close(
+                        quinn::VarInt::from_u32(48100),
+                        "open stream failed".as_bytes(),
+                    );
                     self.inner = None;
-                    anyhow!("failed to open stream: {}", e)
-                })?;
-
-                Ok((send, recv))
-            }
+                    Err(e.into())
+                }
+                Ok((send, recv)) => Ok((send, recv)),
+            },
         }
     }
-    // async fn accept_stream(&self) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream)> {
-    //     let (send, recv) = self
-    //         .inner
-    //         .as_ref()
-    //         .unwrap()
-    //         .accept_bi()
-    //         .await
-    //         .map_err(|e| anyhow!("failed to accept stream: {}", e))?;
-
-    //     Ok((send, recv))
-    // }
 }
 
 pub struct TlsInnerConnection {

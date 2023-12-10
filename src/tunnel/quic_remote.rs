@@ -64,21 +64,10 @@ pub async fn start_quic_remote_server(
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     server_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
-    // if options.keylog {
-    //     server_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
-    // }
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(0_u8.into());
-    // if options.stateless_retry {
-    //     server_config.use_retry(true);
-    // }
-
-    // let root = Arc::<Path>::from(options.root.clone());
-    // if !root.exists() {
-    //     bail!("root path does not exist");
-    // }
 
     let endpoint = quinn::Endpoint::server(server_config, listen.clone())?;
     tracing::info!("QUIC server listening on {}", endpoint.local_addr()?);
@@ -104,7 +93,7 @@ async fn handle_quic_connection(conn: quinn::Connecting) -> Result<()> {
     let connection = conn.await?;
 
     async {
-        tracing::info!("QUIC connection established");
+        // tracing::info!("QUIC connection established");
 
         // Each stream initiated by the client constitutes a new request.
         loop {
