@@ -44,6 +44,7 @@ jobs:
         timeout-minutes: 120
         run: |
           compile_target=${{ matrix.target }}
+          chmod +x ./ci/build_linux.sh
           ./ci/build_linux.sh ${{ matrix.target }}
 
       - name: Upload Github Assets
@@ -88,6 +89,7 @@ jobs:
       - name: Build release
         shell: bash
         run: |
+          chmod +x ./ci/build_other.sh
           ./ci/build_other.sh ${{ matrix.target }}
 
       - name: Upload Github Assets
@@ -117,6 +119,7 @@ jobs:
       - name: Build release
         shell: bash
         run: |
+          chmod +x ./ci/build_other.sh
           ./ci/build_other.sh x86_64-pc-windows-msvc
 
       - name: Upload Github Assets
