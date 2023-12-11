@@ -1,18 +1,17 @@
 #![feature(map_try_insert)]
 
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use clap::{Parser, ValueEnum};
 
-use metrics::gauge;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::{task, time};
+use tokio::time;
 use tracing_subscriber;
-use url::{ParseError, Url};
-use veil::Redact; // 1.3.0
+use url::Url;
+use veil::Redact;
 
 mod mux;
 mod tunnel;
@@ -48,11 +47,11 @@ struct Args {
     #[clap(default_value = "127.0.0.1:48101", long, env)]
     admin: String,
 
-    #[clap(long = "key", requires = "cert", default_value = "key.der")]
+    #[clap(long = "key", requires = "cert", default_value = "key.pem")]
     #[redact(partial)]
     key: Option<PathBuf>,
     /// TLS certificate in PEM format
-    #[clap(long = "cert", default_value = "cert.der")]
+    #[clap(long = "cert", default_value = "cert.pem")]
     cert: Option<PathBuf>,
 
     #[clap(long, value_enum, default_value_t=Role::CLIENT)]
@@ -76,8 +75,8 @@ struct Args {
 // }
 
 fn rcgen(tls_host: &String) {
-    let cert_path = std::path::PathBuf::from(r"./cert.der");
-    let key_path = std::path::PathBuf::from(r"./key.der");
+    let cert_path = std::path::PathBuf::from(r"./cert.pem");
+    let key_path = std::path::PathBuf::from(r"./key.pem");
     // let cert_der_path = std::path::PathBuf::from(r"./cert.der");
 
     println!(
@@ -85,8 +84,8 @@ fn rcgen(tls_host: &String) {
         cert_path, key_path, tls_host,
     );
     let cert = rcgen::generate_simple_self_signed(vec![tls_host.into()]).unwrap();
-    let key = cert.serialize_private_key_der();
-    let cert = cert.serialize_der().unwrap();
+    let key = cert.serialize_private_key_pem();
+    let cert = cert.serialize_pem().unwrap();
     // let cert = cert.serialize_pem().unwrap();
 
     if let Err(e) = fs::write(&cert_path, &cert) {

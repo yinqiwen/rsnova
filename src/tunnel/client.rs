@@ -16,8 +16,10 @@ use crate::mux::MuxStream;
 use crate::mux::{self, event};
 use crate::tunnel::stream::Stream;
 use crate::tunnel::ALPN_QUIC_HTTP;
+// use crate::utils::read_tls_certs;
+use crate::utils::read_tokio_tls_certs;
 
-struct OpenStreamRequest {
+pub struct OpenStreamRequest {
     tcp_stream: tokio::net::TcpStream,
     event: OpenStreamEvent,
     payload: Option<Vec<u8>>,
@@ -63,13 +65,15 @@ trait MuxConnection {
 }
 
 pub struct QuicInnerConnection {
-    inner: Option<quinn::Connection>,
-    endpoint: Arc<quinn::Endpoint>,
+    // inner: Option<quinn::Connection>,
+    // endpoint: Arc<quinn::Endpoint>,
+    inner: Option<s2n_quic::Connection>,
+    endpoint: Arc<s2n_quic::client::Client>,
 }
 
 impl MuxConnection for QuicInnerConnection {
-    type SendStream = quinn::SendStream;
-    type RecvStream = quinn::RecvStream;
+    type SendStream = s2n_quic::stream::SendStream;
+    type RecvStream = s2n_quic::stream::ReceiveStream;
     fn is_valid(&self) -> bool {
         !self.inner.is_none()
     }
@@ -77,22 +81,27 @@ impl MuxConnection for QuicInnerConnection {
         match &mut self.inner {
             None => Err(anyhow!("null connection")),
             Some(c) => {
-                let _ = self.open_stream().await?;
-                Ok(())
+                if let Err(e) = c.ping() {
+                    let _ = c.close(s2n_quic::application::Error::UNKNOWN);
+                    self.inner = None;
+                    tracing::info!("ping fail:{}", e);
+                    Err(e.into())
+                } else {
+                    Ok(())
+                }
             }
         }
     }
     async fn connect(
         &mut self,
         url: &Url,
-        key_path: &PathBuf,
+        _key_path: &PathBuf,
         host: &String,
     ) -> anyhow::Result<()> {
         match &mut self.inner {
             None => match new_quic_connection(&self.endpoint, url, host).await {
                 Ok(c) => {
                     self.inner = Some(c);
-
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -103,16 +112,17 @@ impl MuxConnection for QuicInnerConnection {
     async fn open_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)> {
         match &mut self.inner {
             None => Err(anyhow!("null connection")),
-            Some(c) => match c.open_bi().await {
+            Some(c) => match c.open_bidirectional_stream().await {
                 Err(e) => {
-                    let _ = c.close(
-                        quinn::VarInt::from_u32(48100),
-                        "open stream failed".as_bytes(),
-                    );
+                    let _ = c.close(s2n_quic::application::Error::UNKNOWN);
                     self.inner = None;
+                    tracing::info!("open stream fail:{}", e);
                     Err(e.into())
                 }
-                Ok((send, recv)) => Ok((send, recv)),
+                Ok(stream) => {
+                    let (r, s) = stream.split();
+                    Ok((s, r))
+                }
             },
         }
     }
@@ -356,37 +366,66 @@ impl MuxClient<TlsInnerConnection> {
     }
 }
 
-fn new_quic_endpoint(url: &Url, cert_path: &PathBuf) -> anyhow::Result<quinn::Endpoint> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(&rustls::Certificate(std::fs::read(cert_path)?))?;
-    let mut client_crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    client_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
-
-    let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
-    endpoint.set_default_client_config(client_config);
-    Ok(endpoint)
+fn new_quic_endpoint(_url: &Url, cert_path: &PathBuf) -> anyhow::Result<s2n_quic::client::Client> {
+    let client = s2n_quic::client::Client::builder()
+        .with_tls(cert_path.as_path())?
+        .with_io("0.0.0.0:0")?
+        .start()?;
+    Ok(client)
 }
+
 async fn new_quic_connection(
-    endpoint: &quinn::Endpoint,
+    endpoint: &s2n_quic::client::Client,
     url: &Url,
     host: &String,
-) -> anyhow::Result<quinn::Connection> {
-    let remote = (url.host_str().unwrap(), url.port().unwrap_or(4433))
+) -> anyhow::Result<s2n_quic::Connection> {
+    let remote: std::net::SocketAddr = (url.host_str().unwrap(), url.port().unwrap_or(4433))
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
 
-    let conn: quinn::Connection = endpoint
-        .connect(remote, host)?
-        .await
-        .map_err(|e: quinn::ConnectionError| anyhow!("failed to connect: {}", e))?;
-    Ok(conn)
+    let connect = s2n_quic::client::Connect::new(remote).with_server_name(host.as_str());
+    let mut connection = endpoint.connect(connect).await?;
+    // ensure the connection doesn't time out with inactivity
+    connection.keep_alive(true)?;
+    Ok(connection)
 }
+
+// fn new_quic_endpoint(url: &Url, cert_path: &PathBuf) -> anyhow::Result<quinn::Endpoint> {
+//     let mut roots = rustls::RootCertStore::empty();
+//     // roots.add(&rustls::Certificate(std::fs::read(cert_path)?))?;
+//     let certs = read_tls_certs(&cert_path)?;
+
+//     roots.add(certs.get(0).unwrap())?;
+
+//     let mut client_crypto = rustls::ClientConfig::builder()
+//         .with_safe_defaults()
+//         .with_root_certificates(roots)
+//         .with_no_client_auth();
+
+//     client_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+
+//     let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+//     let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+//     endpoint.set_default_client_config(client_config);
+//     Ok(endpoint)
+// }
+// async fn new_quic_connection(
+//     endpoint: &quinn::Endpoint,
+//     url: &Url,
+//     host: &String,
+// ) -> anyhow::Result<quinn::Connection> {
+//     let remote = (url.host_str().unwrap(), url.port().unwrap_or(4433))
+//         .to_socket_addrs()?
+//         .next()
+//         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
+
+//     let conn: quinn::Connection = endpoint
+//         .connect(remote, host)?
+//         .await
+//         .map_err(|e: quinn::ConnectionError| anyhow!("failed to connect: {}", e))?;
+//     Ok(conn)
+// }
 
 async fn new_tls_connection(
     url: &Url,
@@ -397,10 +436,12 @@ async fn new_tls_connection(
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
+
+    let certs = read_tokio_tls_certs(&cert_path)?;
+
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    roots.add(&tokio_rustls::rustls::Certificate(std::fs::read(
-        cert_path,
-    )?))?;
+    roots.add(certs.get(0).unwrap())?;
+
     let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(roots)

@@ -1,5 +1,5 @@
 use crate::utils;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bytes::Buf;
 use bytes::BytesMut;
 use futures::ready;
@@ -130,7 +130,7 @@ impl AsyncWrite for MuxStream {
         let ctrl = Control::StreamData(self.id, Vec::from(buf), false);
         match ready!(self.ev_writer.poll_reserve(cx)) {
             Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
-            Ok(v) => match self.ev_writer.send_item(ctrl) {
+            Ok(_v) => match self.ev_writer.send_item(ctrl) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
                 Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
             },
@@ -148,7 +148,7 @@ impl AsyncWrite for MuxStream {
             let ctrl = Control::StreamShutdown(self.id, false);
             match ready!(self.ev_writer.poll_reserve(cx)) {
                 Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
-                Ok(v) => match self.ev_writer.send_item(ctrl) {
+                Ok(_) => match self.ev_writer.send_item(ctrl) {
                     Ok(()) => Poll::Ready(Ok(())),
                     Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
                 },

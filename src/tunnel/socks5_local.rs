@@ -11,12 +11,12 @@ mod v5 {
     pub const VERSION: u8 = 5;
 
     pub const METH_NO_AUTH: u8 = 0;
-    pub const METH_GSSAPI: u8 = 1;
-    pub const METH_USER_PASS: u8 = 2;
+    // pub const METH_GSSAPI: u8 = 1;
+    // pub const METH_USER_PASS: u8 = 2;
 
     pub const CMD_CONNECT: u8 = 1;
-    pub const CMD_BIND: u8 = 2;
-    pub const CMD_UDP_ASSOCIATE: u8 = 3;
+    // pub const CMD_BIND: u8 = 2;
+    // pub const CMD_UDP_ASSOCIATE: u8 = 3;
 
     pub const ATYP_IPV4: u8 = 1;
     pub const ATYP_IPV6: u8 = 4;

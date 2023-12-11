@@ -9,8 +9,8 @@ mod tls_remote;
 
 // pub const DEFAULT_TLS_HOST: &str = "google.com";
 pub const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
-pub const DefaultTimeoutSecs: u64 = 30;
-pub const CheckTimeoutSecs: u64 = 5;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+pub const CHECK_TIMEOUT_SECS: u64 = 5;
 
 pub use self::client::Message;
 pub use self::client::MuxClient;

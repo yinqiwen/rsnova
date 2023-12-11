@@ -8,9 +8,9 @@ pub struct MetricsLogRecorder {
 }
 
 impl Recorder for MetricsLogRecorder {
-    fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {}
-    fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {}
-    fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {}
+    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
     fn register_counter(&self, key: &Key) -> Counter {
         self.registry
             .get_or_create_counter(key, |c| Counter::from_arc(c.clone()))

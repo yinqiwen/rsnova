@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 // use pki_types::{CertificateDer, PrivateKeyDer};
 use crate::mux;
 use crate::tunnel::stream::handle_server_stream;
+use crate::utils::read_tokio_tls_certs;
 use rustls_pemfile::Item;
-use std::{collections::VecDeque, fs, io, net::SocketAddr, path::PathBuf, sync::Arc, sync::Mutex};
+use std::{collections::VecDeque, fs, net::SocketAddr, path::PathBuf, sync::Arc, sync::Mutex};
 
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -46,16 +47,18 @@ pub async fn start_tls_remote_server(
         }
     };
 
-    let certs = fs::read(cert_path.clone()).context("failed to read certificate chain")?;
-    let certs = if cert_path.extension().map_or(false, |x| x == "der") {
-        vec![tokio_rustls::rustls::Certificate(certs)]
-    } else {
-        rustls_pemfile::certs(&mut &*certs)
-            .context("invalid PEM-encoded certificate")?
-            .into_iter()
-            .map(tokio_rustls::rustls::Certificate)
-            .collect()
-    };
+    let certs = read_tokio_tls_certs(&cert_path)?;
+
+    // let certs = fs::read(cert_path.clone()).context("failed to read certificate chain")?;
+    // let certs = if cert_path.extension().map_or(false, |x| x == "der") {
+    //     vec![tokio_rustls::rustls::Certificate(certs)]
+    // } else {
+    //     rustls_pemfile::certs(&mut &*certs)
+    //         .context("invalid PEM-encoded certificate")?
+    //         .into_iter()
+    //         .map(tokio_rustls::rustls::Certificate)
+    //         .collect()
+    // };
 
     let mut server_crypto = tokio_rustls::rustls::ServerConfig::builder()
         .with_safe_defaults()

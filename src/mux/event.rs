@@ -1,9 +1,8 @@
 //use tokio::codec::{Decoder, Encoder};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bincode::{config, Decode, Encode};
-use bytes::{Buf, BufMut, BytesMut};
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::oneshot;
+use bytes::{BufMut, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const FLAG_OPEN: u8 = 1;
 pub const FLAG_FIN: u8 = 2;
@@ -17,18 +16,18 @@ pub const FLAG_PING: u8 = 5;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 
-pub fn get_event_type_str(flags: u8) -> &'static str {
-    match flags {
-        FLAG_OPEN => "FLAG_SYN",
-        // FLAG_FIN => "FLAG_FIN",
-        // FLAG_DATA => "FLAG_DATA",
-        // FLAG_WIN_UPDATE => "FLAG_WIN_UPDATE",
-        // FLAG_PING => "FLAG_PING",
-        // FLAG_SHUTDOWN => "FLAG_SHUTDOWN",
-        // FLAG_PONG => "FLAG_PONG",
-        _ => "INVALID",
-    }
-}
+// pub fn get_event_type_str(flags: u8) -> &'static str {
+//     match flags {
+//         FLAG_OPEN => "FLAG_SYN",
+//         // FLAG_FIN => "FLAG_FIN",
+//         // FLAG_DATA => "FLAG_DATA",
+//         // FLAG_WIN_UPDATE => "FLAG_WIN_UPDATE",
+//         // FLAG_PING => "FLAG_PING",
+//         // FLAG_SHUTDOWN => "FLAG_SHUTDOWN",
+//         // FLAG_PONG => "FLAG_PONG",
+//         _ => "INVALID",
+//     }
+// }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
@@ -49,7 +48,7 @@ impl Header {
         (self.flag_len & 0xFF) as u8
     }
     pub fn len(&self) -> u32 {
-        (self.flag_len >> 8)
+        self.flag_len >> 8
     }
     #[allow(dead_code)]
     pub fn set_len(&mut self, v: u32) {
@@ -82,7 +81,7 @@ impl Event {
 }
 
 #[allow(dead_code)]
-pub fn new_empty_event(inbound: bool) -> Event {
+pub fn new_empty_event() -> Event {
     Event {
         header: Header {
             flag_len: get_flag_len(0, 0),
