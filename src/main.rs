@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
             let tunnel_sender: UnboundedSender<tunnel::Message>;
             match args.remote.as_ref().unwrap().scheme() {
                 "quic" => {
-                    tunnel_sender = tunnel::MuxClient::<tunnel::QuicInnerConnection>::from(
+                    tunnel_sender = tunnel::new_quic_client(
                         &args.remote.as_ref().unwrap(),
                         &args.cert.as_ref().unwrap(),
                         &args.tls_host,
@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
                 }
                 "tls" => {
-                    tunnel_sender = tunnel::MuxClient::<tunnel::TlsInnerConnection>::from(
+                    tunnel_sender = tunnel::new_tls_client(
                         &args.remote.as_ref().unwrap(),
                         &args.cert.as_ref().unwrap(),
                         &args.tls_host,

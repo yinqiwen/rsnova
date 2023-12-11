@@ -2,6 +2,9 @@ Rust practice project
 
 ## Features
 
+- QUIC/TLS Support
+- HTTP/Socks5 Proxy
+
 
 # Getting Started
 
@@ -19,12 +22,12 @@ $ ./target/release/rsnova --rcgen
 
 **Launch Server At Remote Server**
 ```sh
-$ ./rsnova --role server --protocol tls --key ./key.der --cert ./cert.der --listen 0.0.0.0:48100
+$ ./rsnova --role server --protocol tls --key ./key.pem --cert ./cert.pem --listen 0.0.0.0:48100
 ```
 
 **Launch Server At Local Client**
 ```sh
-$ ./rsnova --role client  --cert ./cert.der --listen 127.0.0.1:48100 --remote tls://<ip:port>
+$ ./rsnova --role client  --cert ./cert.pem --listen 127.0.0.1:48100 --remote tls://<ip:port>
 ```
 
 **Use Proxy**    
