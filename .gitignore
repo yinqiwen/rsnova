@@ -4,6 +4,7 @@
 Cargo.lock
 .vscode
 *.der
+*.pem
 
 
 # Added by cargo

@@ -43,14 +43,6 @@ jobs:
           chmod +x ./ci/build_linux.sh
           ./ci/build_linux.sh ${{ matrix.target }}
 
-      - name: Upload Github Assets
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          files: ci/release/*
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          tag_name: ${{ inputs.tag || github.ref_name }}
 
   build-unix:
     runs-on: ${{ matrix.os }}
@@ -88,14 +80,7 @@ jobs:
           chmod +x ./ci/build_other.sh
           ./ci/build_other.sh ${{ matrix.target }}
 
-      - name: Upload Github Assets
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          files: ci/release/*
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          tag_name: ${{ inputs.tag || github.ref_name }}
+
 
   build-windows:
     runs-on: windows-latest
@@ -118,11 +103,3 @@ jobs:
           chmod +x ./ci/build_other.sh
           ./ci/build_other.sh x86_64-pc-windows-msvc
 
-      - name: Upload Github Assets
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          files: ci/release/*
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          tag_name: ${{ inputs.tag || github.ref_name }}
