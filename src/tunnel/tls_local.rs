@@ -26,8 +26,7 @@ pub fn valid_tls_version(buf: &[u8]) -> bool {
 }
 
 pub async fn peek_sni(inbound: &mut TcpStream) -> Result<String> {
-    let mut peek_buf: Vec<u8> = Vec::new();
-    peek_buf.resize(4096, 0);
+    let mut peek_buf: Vec<u8> = vec![0; 4096];
     let ver_len: usize = 5;
     let mut peek_cursor: usize = 0;
     let peek_n = inbound.peek(peek_buf.as_mut_slice()).await?;

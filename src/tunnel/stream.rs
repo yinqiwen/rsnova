@@ -134,7 +134,7 @@ where
 
 pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteExt + Unpin>(
     mut lr: &'a mut LR,
-    mut lw: &'a mut LW,
+    lw: &'a mut LW,
 ) -> Result<()> {
     let timeout_secs = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     match timeout(timeout_secs, event::read_event(&mut lr)).await? {
@@ -161,7 +161,7 @@ pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteEx
                 LW,
                 tokio::net::tcp::ReadHalf<'_>,
                 tokio::net::tcp::WriteHalf<'_>,
-            > = Stream::new(&mut lr, &mut lw, &mut remote_receiver, &mut remote_sender);
+            > = Stream::new(lr, lw, &mut remote_receiver, &mut remote_sender);
             stream.transfer().await
         }
     }

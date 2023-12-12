@@ -31,12 +31,9 @@ fn extract_target(headers_buf: &Vec<u8>, default_port: &str) -> Result<String> {
             if url.has_host() {
                 target_addr.push_str(url.host_str().unwrap());
             }
-            match url.port() {
-                Some(p) => {
-                    target_addr.push(':');
-                    target_addr.push_str(p.to_string().as_str());
-                }
-                None => {}
+            if let Some(p) = url.port() {
+                target_addr.push(':');
+                target_addr.push_str(p.to_string().as_str());
             }
         }
     }

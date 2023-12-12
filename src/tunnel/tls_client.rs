@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use std::net::ToSocketAddrs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -25,7 +26,7 @@ impl MuxConnection for TlsConnection {
     type SendStream = tokio::io::WriteHalf<MuxStream>;
     type RecvStream = tokio::io::ReadHalf<MuxStream>;
     fn is_valid(&self) -> bool {
-        !self.inner.is_none()
+        self.inner.is_some()
     }
 
     async fn ping(&mut self) -> anyhow::Result<()> {
@@ -34,12 +35,7 @@ impl MuxConnection for TlsConnection {
             Some(c) => c.ping().await,
         }
     }
-    async fn connect(
-        &mut self,
-        url: &Url,
-        key_path: &PathBuf,
-        host: &String,
-    ) -> anyhow::Result<()> {
+    async fn connect(&mut self, url: &Url, key_path: &Path, host: &str) -> anyhow::Result<()> {
         match new_tls_connection(url, key_path, host).await {
             Ok(c) => {
                 let (r, w) = tokio::io::split(c);
@@ -71,7 +67,7 @@ impl MuxConnection for TlsConnection {
 impl MuxClient<TlsConnection> {
     pub async fn from(
         url: &Url,
-        cert_path: &PathBuf,
+        cert_path: &Path,
         host: &String,
         count: usize,
     ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
@@ -83,14 +79,14 @@ impl MuxClient<TlsConnection> {
                     conns: Vec::new(),
                     host: String::from(host),
                     cursor: 0,
-                    cert: Some(cert_path.clone()),
+                    cert: Some(PathBuf::from(cert_path)),
                 };
                 for i in 0..count {
                     let mut tls_conn: TlsConnection = TlsConnection {
                         inner: None,
                         id: i as u32,
                     };
-                    match tls_conn.connect(url, cert_path, &host).await {
+                    match tls_conn.connect(url, cert_path, host).await {
                         Err(e) => {
                             if i == 0 {
                                 return Err(e);
@@ -103,26 +99,24 @@ impl MuxClient<TlsConnection> {
                     client.conns.push(tls_conn);
                 }
                 tokio::spawn(mux_client_loop(client, receiver));
-                return Ok(sender);
+                Ok(sender)
             }
-            _ => {
-                return Err(anyhow!("unsupported schema:{:?}", url.scheme()));
-            }
+            _ => Err(anyhow!("unsupported schema:{:?}", url.scheme())),
         }
     }
 }
 
 async fn new_tls_connection(
     url: &Url,
-    cert_path: &PathBuf,
-    domain: &String,
+    cert_path: &Path,
+    domain: &str,
 ) -> anyhow::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
     let remote = (url.host_str().unwrap(), url.port().unwrap_or(4433))
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
 
-    let certs = read_tokio_tls_certs(&cert_path)?;
+    let certs = read_tokio_tls_certs(cert_path)?;
 
     let mut roots = rustls::RootCertStore::empty();
     for cert in certs {
@@ -139,7 +133,7 @@ async fn new_tls_connection(
     let connector = TlsConnector::from(Arc::new(client_crypto));
     let stream = TcpStream::connect(&remote).await?;
 
-    let domain = pki_types::ServerName::try_from(domain.as_str())
+    let domain = pki_types::ServerName::try_from(domain)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?
         .to_owned();
 
@@ -150,7 +144,7 @@ async fn new_tls_connection(
 
 pub async fn new_tls_client(
     url: &Url,
-    cert_path: &PathBuf,
+    cert_path: &Path,
     host: &String,
     count: usize,
 ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {

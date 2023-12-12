@@ -2,7 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 // use quinn::ConnectionError;
 
-use rustls_pemfile::Item;
+use pki_types::PrivateKeyDer;
 use std::sync::Arc;
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -19,26 +19,23 @@ pub async fn start_quic_remote_server(
     cert_path: &PathBuf,
     key_path: &PathBuf,
 ) -> Result<()> {
-    let key = std::fs::read(key_path.clone()).context("failed to read private key")?;
-    let key = if key_path.extension().map_or(false, |x| x == "der") {
-        tracing::debug!("private key with DER format");
-        tokio_rustls::rustls::PrivateKey(key)
-    } else {
+    let key = {
+        let key = std::fs::read(key_path).context("failed to read private key")?;
         match rustls_pemfile::read_one(&mut &*key) {
             Ok(x) => match x.unwrap() {
-                Item::Pkcs1Key(key) => {
+                rustls_pemfile::Item::Pkcs1Key(key) => {
                     tracing::debug!("private key with PKCS #1 format");
-                    tokio_rustls::rustls::PrivateKey(Vec::from(key.secret_pkcs1_der()))
+                    PrivateKeyDer::Pkcs1(key)
                 }
-                Item::Pkcs8Key(key) => {
+                rustls_pemfile::Item::Pkcs8Key(key) => {
                     tracing::debug!("private key with PKCS #8 format");
-                    tokio_rustls::rustls::PrivateKey(Vec::from(key.secret_pkcs8_der()))
+                    PrivateKeyDer::Pkcs8(key)
                 }
-                Item::Sec1Key(key) => {
+                rustls_pemfile::Item::Sec1Key(key) => {
                     tracing::debug!("private key with SEC1 format");
-                    tokio_rustls::rustls::PrivateKey(Vec::from(key.secret_sec1_der()))
+                    PrivateKeyDer::Sec1(key)
                 }
-                Item::X509Certificate(_) => {
+                rustls_pemfile::Item::X509Certificate(_) => {
                     anyhow::bail!("you should provide a key file instead of cert");
                 }
                 _ => {
@@ -50,11 +47,10 @@ pub async fn start_quic_remote_server(
             }
         }
     };
-
     let certs = read_tokio_tls_certs(&cert_path)?;
 
-    let mut server_crypto = tokio_rustls::rustls::ServerConfig::builder()
-        .with_safe_defaults()
+    let mut server_crypto = rustls::ServerConfig::builder()
+        // .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     server_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();

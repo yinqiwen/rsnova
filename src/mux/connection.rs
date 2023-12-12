@@ -190,7 +190,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             }
                         }
                         None => {
-                            if data.len() > 0 {
+                            if !data.is_empty() {
                                 tracing::error!(
                                     "No stream:{}/{} found for for data incoming:{} with data len:{}",
                                     conn_id,sid,
@@ -201,8 +201,8 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         }
                     }
                 }
-                Control::StreamShutdown(sid, remote) => match stream_senders.get(&sid) {
-                    Some(sender) => {
+                Control::StreamShutdown(sid, remote) => {
+                    if let Some(sender) = stream_senders.get(&sid) {
                         if !remote {
                             tracing::info!("[{}/{}]Stream shutdown write.", conn_id, sid);
                             //stream_senders.remove(&sid);
@@ -217,8 +217,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             //stream_senders.remove(&sid);
                         }
                     }
-                    None => {}
-                },
+                }
                 Control::StreamClose(sid) => {
                     tracing::info!("[{}/{}]Stream close.", conn_id, sid);
                     match stream_senders.remove_entry(&sid) {

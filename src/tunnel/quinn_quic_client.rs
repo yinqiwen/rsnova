@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use std::net::ToSocketAddrs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -33,12 +34,7 @@ impl MuxConnection for QuinnConnection {
             }
         }
     }
-    async fn connect(
-        &mut self,
-        url: &Url,
-        _key_path: &PathBuf,
-        host: &String,
-    ) -> anyhow::Result<()> {
+    async fn connect(&mut self, url: &Url, _key_path: &Path, host: &str) -> anyhow::Result<()> {
         match &mut self.inner {
             None => match new_quic_connection(&self.endpoint, url, host).await {
                 Ok(c) => {
@@ -71,8 +67,8 @@ impl MuxConnection for QuinnConnection {
 impl MuxClient<QuinnConnection> {
     pub async fn from(
         url: &Url,
-        cert_path: &PathBuf,
-        host: &String,
+        cert_path: &Path,
+        host: &str,
         count: usize,
     ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
         match url.scheme() {
@@ -83,7 +79,7 @@ impl MuxClient<QuinnConnection> {
                     conns: Vec::new(),
                     host: String::from(host),
                     cursor: 0,
-                    cert: Some(cert_path.clone()),
+                    cert: Some(PathBuf::from(cert_path)),
                 };
                 let endpoint = new_quic_endpoint(url, cert_path)?;
                 let endpoint = Arc::new(endpoint);
@@ -114,14 +110,17 @@ impl MuxClient<QuinnConnection> {
     }
 }
 
-fn new_quic_endpoint(_url: &Url, cert_path: &PathBuf) -> anyhow::Result<quinn::Endpoint> {
+fn new_quic_endpoint(_url: &Url, cert_path: &Path) -> anyhow::Result<quinn::Endpoint> {
     let certs = read_tokio_tls_certs(&cert_path)?;
 
-    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    roots.add(certs.get(0).unwrap())?;
+    let certs = read_tokio_tls_certs(cert_path)?;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).unwrap();
+    }
 
-    let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder()
-        .with_safe_defaults()
+    let mut client_crypto = rustls::ClientConfig::builder()
+        // .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
 
@@ -135,7 +134,7 @@ fn new_quic_endpoint(_url: &Url, cert_path: &PathBuf) -> anyhow::Result<quinn::E
 async fn new_quic_connection(
     endpoint: &quinn::Endpoint,
     url: &Url,
-    host: &String,
+    host: &str,
 ) -> anyhow::Result<quinn::Connection> {
     let remote = (url.host_str().unwrap(), url.port().unwrap_or(4433))
         .to_socket_addrs()?
@@ -151,8 +150,8 @@ async fn new_quic_connection(
 
 pub async fn new_quic_client(
     url: &Url,
-    cert_path: &PathBuf,
-    host: &String,
+    cert_path: &Path,
+    host: &str,
     count: usize,
 ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
     MuxClient::<QuinnConnection>::from(url, cert_path, host, count).await

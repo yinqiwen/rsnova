@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use metrics::{decrement_gauge, increment_gauge};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use url::Url;
@@ -47,8 +47,7 @@ pub(crate) trait MuxConnection {
     type SendStream: AsyncWrite + Unpin + Send;
     type RecvStream: AsyncRead + Unpin + Send;
     async fn ping(&mut self) -> anyhow::Result<()>;
-    async fn connect(&mut self, url: &Url, key_path: &PathBuf, host: &String)
-        -> anyhow::Result<()>;
+    async fn connect(&mut self, url: &Url, key_path: &Path, host: &str) -> anyhow::Result<()>;
     async fn open_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)>;
     fn is_valid(&self) -> bool;
     // async fn accept_stream(&self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)>;
@@ -91,10 +90,8 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
                 {
                     tracing::error!("reconnect error:{}", e);
                 }
-            } else {
-                if let Err(e) = c.ping().await {
-                    tracing::error!("open stream failed:{}", e);
-                }
+            } else if let Err(e) = c.ping().await {
+                tracing::error!("open stream failed:{}", e);
             }
         }
         Ok(())

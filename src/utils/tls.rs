@@ -3,12 +3,12 @@ use pki_types::CertificateDer;
 use rustls_pemfile::certs;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::Path;
 
 fn load_certs(path: &std::path::Path) -> std::io::Result<Vec<CertificateDer<'static>>> {
     certs(&mut BufReader::new(File::open(path)?)).collect()
 }
-pub fn read_tokio_tls_certs(cert_path: &PathBuf) -> Result<Vec<CertificateDer<'static>>> {
+pub fn read_tokio_tls_certs(cert_path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     // let certs = std::fs::read(cert_path.clone()).context("failed to read certificate chain")?;
     // let certs = if cert_path.extension().map_or(false, |x| x == "der") {
     //     vec![tokio_rustls::rustls::Certificate(certs)]
@@ -25,7 +25,7 @@ pub fn read_tokio_tls_certs(cert_path: &PathBuf) -> Result<Vec<CertificateDer<'s
     //     pem_certs
     // };
     // Ok(certs)
-    match load_certs(&cert_path) {
+    match load_certs(cert_path) {
         Ok(r) => Ok(r),
         Err(e) => Err(e.into()),
     }

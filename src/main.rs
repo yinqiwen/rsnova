@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time;
-use tracing_subscriber;
+
 use url::Url;
 use veil::Redact;
 
@@ -19,14 +19,14 @@ mod utils;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Protocol {
-    TLS,
-    QUIC,
+    Tls,
+    Quic,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Role {
-    CLIENT,
-    SERVER,
+    Client,
+    Server,
 }
 
 #[derive(Parser, Redact)]
@@ -38,7 +38,7 @@ struct Args {
     #[structopt(long = "listen", default_value = "127.0.0.1:48100")]
     listen: SocketAddr,
 
-    #[clap(long, value_enum, default_value_t=Protocol::TLS)]
+    #[clap(long, value_enum, default_value_t=Protocol::Tls)]
     protocol: Protocol,
 
     #[structopt(long = "remote")]
@@ -54,7 +54,7 @@ struct Args {
     #[clap(long = "cert", default_value = "cert.pem")]
     cert: Option<PathBuf>,
 
-    #[clap(long, value_enum, default_value_t=Role::CLIENT)]
+    #[clap(long, value_enum, default_value_t=Role::Client)]
     role: Role,
 
     #[clap(default_value = "5", long)]
@@ -88,13 +88,12 @@ fn rcgen(tls_host: &String) {
     let cert = cert.serialize_pem().unwrap();
     // let cert = cert.serialize_pem().unwrap();
 
-    if let Err(e) = fs::write(&cert_path, &cert) {
+    if let Err(e) = fs::write(&cert_path, cert) {
         println!("failed to write certificate:{}", e);
         return;
     }
-    if let Err(e) = fs::write(&key_path, &key) {
+    if let Err(e) = fs::write(&key_path, key) {
         println!("failed to write certificate:{}", e);
-        return;
     }
 }
 
@@ -120,32 +119,33 @@ async fn main() -> anyhow::Result<()> {
     metrics::set_boxed_recorder(Box::new(recorder)).unwrap();
 
     match args.role {
-        Role::CLIENT => {
-            let tunnel_sender: UnboundedSender<tunnel::Message>;
-            match args.remote.as_ref().unwrap().scheme() {
-                "quic" => {
-                    tunnel_sender = tunnel::new_quic_client(
-                        &args.remote.as_ref().unwrap(),
-                        &args.cert.as_ref().unwrap(),
-                        &args.tls_host,
-                        args.concurrent,
-                    )
-                    .await?;
-                }
-                "tls" => {
-                    tunnel_sender = tunnel::new_tls_client(
-                        &args.remote.as_ref().unwrap(),
-                        &args.cert.as_ref().unwrap(),
-                        &args.tls_host,
-                        args.concurrent,
-                    )
-                    .await?;
-                }
-                _ => {
-                    tracing::error!("unsupported");
-                    return Err(anyhow!("unsupported"));
-                }
-            };
+        Role::Client => {
+            let tunnel_sender: UnboundedSender<tunnel::Message> =
+                match args.remote.as_ref().unwrap().scheme() {
+                    "quic" => {
+                        tunnel::new_quic_client(
+                            args.remote.as_ref().unwrap(),
+                            args.cert.as_ref().unwrap(),
+                            &args.tls_host,
+                            args.concurrent,
+                        )
+                        .await?
+                    }
+                    "tls" => {
+                        tunnel::new_tls_client(
+                            args.remote.as_ref().unwrap(),
+                            args.cert.as_ref().unwrap(),
+                            &args.tls_host,
+                            args.concurrent,
+                        )
+                        .await?
+                    }
+                    _ => {
+                        tracing::error!("unsupported");
+                        return Err(anyhow!("unsupported"));
+                    }
+                };
+
             let health_checker = tunnel_sender.clone();
             tokio::spawn(async move {
                 let mut interval = time::interval(Duration::from_secs(1));
@@ -165,8 +165,8 @@ async fn main() -> anyhow::Result<()> {
                 return Err(e);
             }
         }
-        Role::SERVER => match args.protocol {
-            Protocol::QUIC => {
+        Role::Server => match args.protocol {
+            Protocol::Quic => {
                 if let Err(e) = tunnel::start_quic_remote_server(
                     &args.listen,
                     args.cert.as_ref().unwrap(),
@@ -177,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!("{e:?}");
                 }
             }
-            Protocol::TLS => {
+            Protocol::Tls => {
                 if let Err(e) = tunnel::start_tls_remote_server(
                     &args.listen,
                     args.cert.as_ref().unwrap(),

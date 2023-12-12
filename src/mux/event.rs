@@ -76,7 +76,7 @@ pub struct Event {
 impl Event {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.header.flags() == 0 as u8
+        self.header.flags() == 0_u8
     }
 }
 
@@ -145,7 +145,7 @@ pub fn new_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> Event {
     ev
 }
 
-pub async fn write_event<'a, T>(writer: &'a mut T, ev: Event) -> anyhow::Result<()>
+pub async fn write_event<T>(writer: &mut T, ev: Event) -> anyhow::Result<()>
 where
     T: AsyncWriteExt + Unpin,
 {
@@ -160,7 +160,7 @@ where
     Ok(())
 }
 
-pub async fn read_event<'a, T>(reader: &'a mut T) -> Result<Event, std::io::Error>
+pub async fn read_event<T>(reader: &mut T) -> Result<Event, std::io::Error>
 where
     T: AsyncReadExt + Unpin + ?Sized,
 {

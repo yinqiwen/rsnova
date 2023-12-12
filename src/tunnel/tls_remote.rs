@@ -10,7 +10,7 @@ use pki_types::PrivateKeyDer;
 use rustls_pemfile::certs;
 use std::fs::File;
 use std::io::{self, BufReader};
-use std::{collections::VecDeque, net::SocketAddr, path::PathBuf, sync::Arc, sync::Mutex};
+use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Arc, sync::Mutex};
 
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -21,8 +21,8 @@ fn load_certs(path: &std::path::Path) -> io::Result<Vec<CertificateDer<'static>>
 
 pub async fn start_tls_remote_server(
     listen: &SocketAddr,
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
+    cert_path: &Path,
+    key_path: &Path,
 ) -> Result<()> {
     // let key = fs::read(key_path.clone()).context("failed to read private key")?;
     // let key = rsa_private_keys(&mut BufReader::new(File::open(key_path)?))
@@ -31,7 +31,7 @@ pub async fn start_tls_remote_server(
     //     .map(Into::into)?;
 
     let key = {
-        let key = std::fs::read(key_path.clone()).context("failed to read private key")?;
+        let key = std::fs::read(key_path).context("failed to read private key")?;
         match rustls_pemfile::read_one(&mut &*key) {
             Ok(x) => match x.unwrap() {
                 rustls_pemfile::Item::Pkcs1Key(key) => {
@@ -59,7 +59,7 @@ pub async fn start_tls_remote_server(
         }
     };
 
-    let certs = load_certs(&cert_path)?;
+    let certs = load_certs(cert_path)?;
 
     let mut server_crypto = tokio_rustls::rustls::ServerConfig::builder()
         // .with_safe_defaults()

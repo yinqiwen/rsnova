@@ -1,7 +1,7 @@
 use anyhow::Result;
 // use quinn::ConnectionError;
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::Path};
 
 use crate::tunnel::stream::handle_server_stream;
 
@@ -11,14 +11,14 @@ use crate::tunnel::stream::handle_server_stream;
 
 pub async fn start_quic_remote_server(
     listen: &SocketAddr,
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
+    cert_path: &Path,
+    key_path: &Path,
 ) -> Result<()> {
     let io = s2n_quic::provider::io::tokio::Builder::default()
-        .with_receive_address(listen.clone())?
+        .with_receive_address(*listen)?
         .build()?;
     let mut server = s2n_quic::Server::builder()
-        .with_tls((cert_path.as_path(), key_path.as_path()))?
+        .with_tls((cert_path, key_path))?
         .with_io(io)?
         .start()?;
 
