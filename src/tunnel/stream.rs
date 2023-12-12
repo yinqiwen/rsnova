@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use futures::future::try_join;
+use once_cell::sync::Lazy;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
@@ -13,6 +14,16 @@ use tokio::time::timeout;
 use crate::mux::event::{self, OpenStreamEvent};
 use crate::tunnel::CHECK_TIMEOUT_SECS;
 use crate::tunnel::DEFAULT_TIMEOUT_SECS;
+
+static STREAM_BUFFER_POOL: Lazy<lockfree_object_pool::LinearObjectPool<[u8; 8192]>> =
+    Lazy::new(|| {
+        lockfree_object_pool::LinearObjectPool::<[u8; 8192]>::new(
+            || [0u8; 8192],
+            |_| {
+                //*v = 0;
+            },
+        )
+    });
 
 struct TransferState {
     abort: AtomicBool,
@@ -41,13 +52,14 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     timeout_sec: u64,
     state: Arc<TransferState>,
 ) -> Result<()> {
-    let mut buf = [0u8; 8192];
+    //let mut buf = [0u8; 8192];
+    let mut buf = STREAM_BUFFER_POOL.pull();
     let check_timeout_secs = Duration::from_secs(CHECK_TIMEOUT_SECS);
     loop {
         if state.abort.load(SeqCst) {
             return Err(anyhow!("abort"));
         }
-        match timeout(check_timeout_secs, r.read(&mut buf)).await {
+        match timeout(check_timeout_secs, r.read(buf.as_mut())).await {
             Err(_) => {
                 let now_secs = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
