@@ -130,13 +130,12 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let ev_writer = ev_writer_orig.clone();
     let read_ctrl_fut = async move {
-        let labels: [(&str, String); 1] = [("idx", format!("{}", conn_id))];
+        //let labels: [(&str, String); 1] = [("idx", format!("{}", conn_id))];
         let mut incoming_streams: VecDeque<MuxStream> = VecDeque::new();
         let mut accept_callback: Option<oneshot::Sender<Result<MuxStream>>> = None;
         let mut stream_senders: HashMap<u32, mpsc::Sender<Option<Vec<u8>>>> = HashMap::new();
 
         while let Some(ctrl) = ev_reader.recv().await {
-            metrics::gauge!("mux.streams", stream_senders.len() as f64, &labels);
             match ctrl {
                 Control::AcceptStream(callback) => {
                     if accept_callback.is_some() {
@@ -152,6 +151,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let _ = e.value.send(Some(Vec::new())).await;
                         }
                         _ => {
+                            metrics::increment_gauge!("mux.streams", 1.0);
                             if receiver.is_some() {
                                 let stream =
                                     MuxStream::new(sid, ev_writer.clone(), receiver.unwrap());
@@ -223,6 +223,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     tracing::info!("[{}/{}]Stream close.", conn_id, sid);
                     match stream_senders.remove_entry(&sid) {
                         Some((_, sender)) => {
+                            metrics::decrement_gauge!("mux.streams", 1.0);
                             let _ = sender.send(None).await;
                         }
                         None => {
@@ -250,6 +251,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
 
         //close streams
+        metrics::decrement_gauge!("mux.streams", stream_senders.len() as f64);
         for (_, sender) in stream_senders.drain().take(1) {
             let _ = sender.send(None).await;
         }
