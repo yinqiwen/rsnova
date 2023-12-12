@@ -13,6 +13,7 @@ pub async fn start_quic_remote_server(
     listen: &SocketAddr,
     cert_path: &Path,
     key_path: &Path,
+    idle_timeout_secs: usize,
 ) -> Result<()> {
     let io = s2n_quic::provider::io::tokio::Builder::default()
         .with_receive_address(*listen)?
@@ -30,7 +31,10 @@ pub async fn start_quic_remote_server(
                 metrics::increment_gauge!("quic_server_proxy_streams", 1.0);
                 let (mut recv_stream, mut send_stream) = stream.split();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_server_stream(&mut recv_stream, &mut send_stream).await {
+                    if let Err(e) =
+                        handle_server_stream(&mut recv_stream, &mut send_stream, idle_timeout_secs)
+                            .await
+                    {
                         tracing::error!("failed: {reason}", reason = e.to_string());
                     }
                     metrics::decrement_gauge!("quic_server_proxy_streams", 1.0);

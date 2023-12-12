@@ -23,6 +23,7 @@ pub async fn start_tls_remote_server(
     listen: &SocketAddr,
     cert_path: &Path,
     key_path: &Path,
+    idle_timeout_secs: usize,
 ) -> Result<()> {
     // let key = fs::read(key_path.clone()).context("failed to read private key")?;
     // let key = rsa_private_keys(&mut BufReader::new(File::open(key_path)?))
@@ -86,7 +87,7 @@ pub async fn start_tls_remote_server(
         let fut = async move {
             let stream = acceptor.accept(stream).await?;
             tracing::info!("TLS connection incoming");
-            handle_tls_connection(stream, conn_id).await?;
+            handle_tls_connection(stream, conn_id, idle_timeout_secs).await?;
             Ok(()) as Result<()>
         };
 
@@ -102,6 +103,7 @@ pub async fn start_tls_remote_server(
 async fn handle_tls_connection(
     conn: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     id: u32,
+    idle_timeout_secs: usize,
 ) -> Result<()> {
     let (r, w) = tokio::io::split(conn);
     let mux_conn = mux::Connection::new(r, w, mux::Mode::Server, id);
@@ -112,7 +114,10 @@ async fn handle_tls_connection(
         tokio::spawn(async move {
             let stream_id = stream.id();
             let (mut stream_reader, mut stream_writer) = tokio::io::split(stream);
-            if let Err(e) = handle_server_stream(&mut stream_reader, &mut stream_writer).await {
+            if let Err(e) =
+                handle_server_stream(&mut stream_reader, &mut stream_writer, idle_timeout_secs)
+                    .await
+            {
                 tracing::error!(
                     "[{}/{}]failed: {reason}",
                     id,

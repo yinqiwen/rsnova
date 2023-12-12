@@ -17,6 +17,10 @@ mod mux;
 mod tunnel;
 mod utils;
 
+#[cfg(not(target_arch = "arm"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(ValueEnum, Clone, Debug)]
 enum Protocol {
     Tls,
@@ -65,6 +69,9 @@ struct Args {
 
     #[clap(default_value = "1048576", long)]
     thread_stack_size: usize,
+
+    #[clap(default_value = "30", long)]
+    idle_timeout_secs: usize,
 
     #[clap(default_value = "mydomain.io", long)]
     tls_host: String,
@@ -117,6 +124,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             args.cert.as_ref().unwrap(),
                             &args.tls_host,
                             args.concurrent,
+                            args.idle_timeout_secs,
                         )
                         .await?
                     }
@@ -126,6 +134,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             args.cert.as_ref().unwrap(),
                             &args.tls_host,
                             args.concurrent,
+                            args.idle_timeout_secs,
                         )
                         .await?
                     }
@@ -160,6 +169,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     &args.listen,
                     args.cert.as_ref().unwrap(),
                     args.key.as_ref().unwrap(),
+                    args.idle_timeout_secs,
                 )
                 .await
                 {
@@ -171,6 +181,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     &args.listen,
                     args.cert.as_ref().unwrap(),
                     args.key.as_ref().unwrap(),
+                    args.idle_timeout_secs,
                 )
                 .await
                 {

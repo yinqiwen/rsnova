@@ -70,6 +70,7 @@ impl MuxClient<TlsConnection> {
         cert_path: &Path,
         host: &String,
         count: usize,
+        idle_timeout_secs: usize,
     ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
         match url.scheme() {
             "tls" => {
@@ -98,7 +99,7 @@ impl MuxClient<TlsConnection> {
                     }
                     client.conns.push(tls_conn);
                 }
-                tokio::spawn(mux_client_loop(client, receiver));
+                tokio::spawn(mux_client_loop(client, receiver, idle_timeout_secs));
                 Ok(sender)
             }
             _ => Err(anyhow!("unsupported schema:{:?}", url.scheme())),
@@ -147,6 +148,7 @@ pub async fn new_tls_client(
     cert_path: &Path,
     host: &String,
     count: usize,
+    idle_timeout_secs: usize,
 ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
-    MuxClient::<TlsConnection>::from(url, cert_path, host, count).await
+    MuxClient::<TlsConnection>::from(url, cert_path, host, count, idle_timeout_secs).await
 }

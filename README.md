@@ -2,8 +2,8 @@ Rust practice project
 
 ## Features
 
-- QUIC/TLS Transport
-- HTTP/Socks5 Proxy
+-   QUIC/TLS Transport
+-   HTTP/Socks5 Proxy
 
 
 # Getting Started
@@ -41,4 +41,3 @@ $ ./rsnova --role client  --cert ./cert.pem --listen 127.0.0.1:48100 --remote tl
 
 **Use Proxy**    
 Now you can configure `socks5://127.0.0.1:48100` or `http://127.0.0.1:48100` as the proxy for your browser/tools. 
-

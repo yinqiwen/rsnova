@@ -101,6 +101,7 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
 pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
     mut client: T,
     mut receiver: mpsc::UnboundedReceiver<Message>,
+    idle_timeout_secs: usize,
 ) where
     <T as MuxClientTrait>::SendStream: 'static,
     <T as MuxClientTrait>::RecvStream: 'static,
@@ -130,7 +131,7 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                                 &mut recv,
                                 &mut send,
                             );
-                            if let Err(e) = stream.transfer().await {
+                            if let Err(e) = stream.transfer(idle_timeout_secs).await {
                                 tracing::error!("transfer finish:{}", e);
                             }
                         }

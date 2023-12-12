@@ -13,8 +13,6 @@ use super::client::MuxConnection;
 use super::Message;
 
 pub struct S2NQuicConnection {
-    // inner: Option<quinn::Connection>,
-    // endpoint: Arc<quinn::Endpoint>,
     inner: Option<s2n_quic::Connection>,
     endpoint: Arc<s2n_quic::client::Client>,
 }
@@ -77,6 +75,7 @@ impl MuxClient<S2NQuicConnection> {
         cert_path: &Path,
         host: &String,
         count: usize,
+        idle_timeout_secs: usize,
     ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
         match url.scheme() {
             "quic" => {
@@ -107,7 +106,7 @@ impl MuxClient<S2NQuicConnection> {
                     }
                     client.conns.push(quic_conn);
                 }
-                tokio::spawn(mux_client_loop(client, receiver));
+                tokio::spawn(mux_client_loop(client, receiver, idle_timeout_secs));
                 Ok(sender)
             }
             _ => Err(anyhow!("unsupported schema:{:?}", url.scheme())),
@@ -145,6 +144,7 @@ pub async fn new_quic_client(
     cert_path: &Path,
     host: &String,
     count: usize,
+    idle_timeout_secs: usize,
 ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
-    MuxClient::<S2NQuicConnection>::from(url, cert_path, host, count).await
+    MuxClient::<S2NQuicConnection>::from(url, cert_path, host, count, idle_timeout_secs).await
 }

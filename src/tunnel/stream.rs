@@ -114,18 +114,18 @@ where
         }
     }
 
-    pub async fn transfer(&mut self) -> Result<()> {
+    pub async fn transfer(&mut self, idle_timeout_secs: usize) -> Result<()> {
         let state = Arc::new(TransferState::new());
         let client_to_server = timeout_copy(
             &mut self.local_reader,
             &mut self.remote_writer,
-            DEFAULT_TIMEOUT_SECS,
+            idle_timeout_secs as u64,
             state.clone(),
         );
         let server_to_client = timeout_copy(
             &mut self.remote_reader,
             &mut self.local_writer,
-            DEFAULT_TIMEOUT_SECS,
+            idle_timeout_secs as u64,
             state.clone(),
         );
         try_join(client_to_server, server_to_client).await?;
@@ -136,6 +136,7 @@ where
 pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteExt + Unpin>(
     mut lr: &'a mut LR,
     lw: &'a mut LW,
+    idle_timeout_secs: usize,
 ) -> Result<()> {
     let timeout_secs = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     match timeout(timeout_secs, event::read_event(&mut lr)).await? {
@@ -163,7 +164,7 @@ pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteEx
                 tokio::net::tcp::ReadHalf<'_>,
                 tokio::net::tcp::WriteHalf<'_>,
             > = Stream::new(lr, lw, &mut remote_receiver, &mut remote_sender);
-            stream.transfer().await
+            stream.transfer(idle_timeout_secs).await
         }
     }
 }
