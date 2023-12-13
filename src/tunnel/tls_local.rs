@@ -130,10 +130,12 @@ pub async fn handle_tls(
         Err(_) => String::from(""),
     };
     if target_addr.is_empty() {
-        return Err(anyhow!("no sni found"));
+        tracing::error!("[{}]no sni found ", tunnel_id);
+        super::transparent::handle_transparent(tunnel_id, inbound, sender).await
+    } else {
+        tracing::info!("[{}]Handle TLS proxy to {} ", tunnel_id, target_addr);
+        let msg = Message::open_stream(inbound, target_addr, None);
+        sender.send(msg)?;
+        Ok(())
     }
-    tracing::info!("[{}]Handle TLS proxy to {} ", tunnel_id, target_addr);
-    let msg = Message::open_stream(inbound, target_addr, None);
-    sender.send(msg)?;
-    Ok(())
 }

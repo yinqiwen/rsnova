@@ -36,6 +36,9 @@ pki-types = { package = "rustls-pki-types", version = "1" }
 s2n-quic = { version = "1", optional = true }
 quinn = { version = "0.10", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 aws-lc-rs = { version = "1.5", features = ["bindgen"], optional = true }
 

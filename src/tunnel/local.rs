@@ -59,7 +59,11 @@ async fn handle_local_tunnel(
             }
         };
     }
-    Ok(())
+    tracing::info!(
+        "[{}]Accept client with non socks5/tls/http traffic.",
+        tunnel_id
+    );
+    super::transparent::handle_transparent(tunnel_id, inbound, sender).await
 }
 
 pub async fn start_local_tunnel_server(

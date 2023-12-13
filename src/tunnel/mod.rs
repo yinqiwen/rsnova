@@ -8,6 +8,8 @@ mod tls_client;
 mod tls_local;
 mod tls_remote;
 
+mod transparent;
+
 #[cfg(all(feature = "quinn", not(feature = "s2n_quic")))]
 mod quinn_quic_client;
 #[cfg(all(feature = "quinn", not(feature = "s2n_quic")))]
