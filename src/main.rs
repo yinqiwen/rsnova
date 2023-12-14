@@ -111,6 +111,16 @@ fn rcgen(tls_host: &String) {
 }
 
 async fn service_main(args: &Args) -> anyhow::Result<()> {
+    if args.log.is_empty() {
+        tracing_subscriber::fmt::init();
+    } else {
+        let file_appender = tracing_appender::rolling::daily("./", args.log.as_str());
+        //let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
+        tracing_subscriber::fmt().with_writer(file_appender).init();
+        tokio::spawn(utils::clean_rotate_logs(format!("./{}", args.log.as_str())));
+    }
+    tracing::info!("{args:?}");
+
     let recorder = utils::MetricsLogRecorder::new(Duration::from_secs(10));
     metrics::set_boxed_recorder(Box::new(recorder)).unwrap();
 
@@ -195,15 +205,6 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 
 fn main() {
     let args: Args = Args::parse();
-    if args.log.is_empty() {
-        tracing_subscriber::fmt::init();
-    } else {
-        let file_appender = tracing_appender::rolling::daily("./", args.log.as_str());
-        //let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
-        tracing_subscriber::fmt().with_writer(file_appender).init();
-        tokio::spawn(utils::clean_rotate_logs(format!("./{}", args.log.as_str())));
-    }
-    tracing::info!("{args:?}");
 
     if args.rcgen {
         rcgen(&args.tls_host);
