@@ -20,14 +20,14 @@ mod quinn_quic_remote;
 #[cfg(all(feature = "quinn", not(feature = "s2n_quic")))]
 pub use self::quinn_quic_remote::start_quic_remote_server;
 
-#[cfg(all(feature = "s2n_quic", not(feature = "quinn")))]
+#[cfg(feature = "s2n_quic")]
 mod s2n_quic_client;
-#[cfg(all(feature = "s2n_quic", not(feature = "quinn")))]
+#[cfg(feature = "s2n_quic")]
 pub use self::s2n_quic_client::new_quic_client;
 
-#[cfg(all(feature = "s2n_quic", not(feature = "quinn")))]
+#[cfg(feature = "s2n_quic")]
 mod s2n_quic_remote;
-#[cfg(all(feature = "s2n_quic", not(feature = "quinn")))]
+#[cfg(feature = "s2n_quic")]
 pub use self::s2n_quic_remote::start_quic_remote_server;
 
 // pub const DEFAULT_TLS_HOST: &str = "google.com";

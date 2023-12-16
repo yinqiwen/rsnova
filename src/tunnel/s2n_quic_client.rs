@@ -135,6 +135,7 @@ async fn new_s2n_quic_connection(
     let connect = s2n_quic::client::Connect::new(remote).with_server_name(host);
     let mut connection = endpoint.connect(connect).await?;
     // ensure the connection doesn't time out with inactivity
+    tracing::info!("conncect s2n quic success");
     connection.keep_alive(true)?;
     Ok(connection)
 }

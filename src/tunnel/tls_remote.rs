@@ -1,23 +1,23 @@
-use anyhow::Context;
+// use anyhow::Context;
 use anyhow::Result;
 // use pki_types::{CertificateDer, PrivateKeyDer};
 use crate::tunnel::stream::handle_server_stream;
 
 use crate::{mux, tunnel::ALPN_QUIC_HTTP};
-use pki_types::CertificateDer;
-use pki_types::PrivateKeyDer;
+// use pki_types::CertificateDer;
+// use pki_types::PrivateKeyDer;
 
-use rustls_pemfile::certs;
-use std::fs::File;
-use std::io::{self, BufReader};
 use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Arc, sync::Mutex};
 
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-fn load_certs(path: &std::path::Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    certs(&mut BufReader::new(File::open(path)?)).collect()
-}
+use crate::utils::read_pem_private_key;
+use crate::utils::read_tokio_tls_certs;
+
+// fn load_certs(path: &std::path::Path) -> io::Result<Vec<CertificateDer<'static>>> {
+//     certs(&mut BufReader::new(File::open(path)?)).collect()
+// }
 
 pub async fn start_tls_remote_server(
     listen: &SocketAddr,
@@ -31,39 +31,11 @@ pub async fn start_tls_remote_server(
     //     .unwrap()
     //     .map(Into::into)?;
 
-    let key = {
-        let key = std::fs::read(key_path).context("failed to read private key")?;
-        match rustls_pemfile::read_one(&mut &*key) {
-            Ok(x) => match x.unwrap() {
-                rustls_pemfile::Item::Pkcs1Key(key) => {
-                    tracing::debug!("private key with PKCS #1 format");
-                    PrivateKeyDer::Pkcs1(key)
-                }
-                rustls_pemfile::Item::Pkcs8Key(key) => {
-                    tracing::debug!("private key with PKCS #8 format");
-                    PrivateKeyDer::Pkcs8(key)
-                }
-                rustls_pemfile::Item::Sec1Key(key) => {
-                    tracing::debug!("private key with SEC1 format");
-                    PrivateKeyDer::Sec1(key)
-                }
-                rustls_pemfile::Item::X509Certificate(_) => {
-                    anyhow::bail!("you should provide a key file instead of cert");
-                }
-                _ => {
-                    anyhow::bail!("no private keys found");
-                }
-            },
-            Err(_) => {
-                anyhow::bail!("malformed private key");
-            }
-        }
-    };
+    let key = read_pem_private_key(key_path)?;
 
-    let certs = load_certs(cert_path)?;
-
+    let certs = read_tokio_tls_certs(cert_path)?;
     let mut server_crypto = tokio_rustls::rustls::ServerConfig::builder()
-        // .with_safe_defaults()
+        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     server_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();

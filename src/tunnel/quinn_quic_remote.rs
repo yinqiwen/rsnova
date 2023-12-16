@@ -1,13 +1,14 @@
-use anyhow::Context;
+// use anyhow::Context;
 use anyhow::Result;
 // use quinn::ConnectionError;
 
-use pki_types::PrivateKeyDer;
+// use pki_types::PrivateKeyDer;
 use std::sync::Arc;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::Path};
 
 use crate::tunnel::stream::handle_server_stream;
 use crate::tunnel::ALPN_QUIC_HTTP;
+use crate::utils::read_pem_private_key;
 use crate::utils::read_tokio_tls_certs;
 
 // fn print_type_of<T>(_: &T) {
@@ -16,41 +17,15 @@ use crate::utils::read_tokio_tls_certs;
 
 pub async fn start_quic_remote_server(
     listen: &SocketAddr,
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
+    cert_path: &Path,
+    key_path: &Path,
+    idle_timeout_secs: usize,
 ) -> Result<()> {
-    let key = {
-        let key = std::fs::read(key_path).context("failed to read private key")?;
-        match rustls_pemfile::read_one(&mut &*key) {
-            Ok(x) => match x.unwrap() {
-                rustls_pemfile::Item::Pkcs1Key(key) => {
-                    tracing::debug!("private key with PKCS #1 format");
-                    PrivateKeyDer::Pkcs1(key)
-                }
-                rustls_pemfile::Item::Pkcs8Key(key) => {
-                    tracing::debug!("private key with PKCS #8 format");
-                    PrivateKeyDer::Pkcs8(key)
-                }
-                rustls_pemfile::Item::Sec1Key(key) => {
-                    tracing::debug!("private key with SEC1 format");
-                    PrivateKeyDer::Sec1(key)
-                }
-                rustls_pemfile::Item::X509Certificate(_) => {
-                    anyhow::bail!("you should provide a key file instead of cert");
-                }
-                _ => {
-                    anyhow::bail!("no private keys found");
-                }
-            },
-            Err(_) => {
-                anyhow::bail!("malformed private key");
-            }
-        }
-    };
-    let certs = read_tokio_tls_certs(&cert_path)?;
+    let key = read_pem_private_key(key_path)?;
+    let certs = read_tokio_tls_certs(cert_path)?;
 
     let mut server_crypto = rustls::ServerConfig::builder()
-        // .with_safe_defaults()
+        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     server_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
@@ -59,19 +34,16 @@ pub async fn start_quic_remote_server(
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(0_u8.into());
 
-    let endpoint = quinn::Endpoint::server(server_config, listen.clone())?;
+    let endpoint = quinn::Endpoint::server(server_config, *listen)?;
     tracing::info!("QUIC server listening on {}", endpoint.local_addr()?);
 
     while let Some(conn) = endpoint.accept().await {
         tracing::info!("QUIC connection incoming");
 
-        let fut = handle_quic_connection(conn);
+        let fut = handle_quic_connection(conn, idle_timeout_secs);
         tokio::spawn(async move {
-            match fut.await {
-                Err(e) => {
-                    tracing::error!("connection failed: {reason}", reason = e.to_string())
-                }
-                _ => {}
+            if let Err(e) = fut.await {
+                tracing::error!("connection failed: {reason}", reason = e.to_string())
             }
         });
     }
@@ -79,7 +51,7 @@ pub async fn start_quic_remote_server(
     Ok(())
 }
 
-async fn handle_quic_connection(conn: quinn::Connecting) -> Result<()> {
+async fn handle_quic_connection(conn: quinn::Connecting, idle_timeout_secs: usize) -> Result<()> {
     let connection = conn.await?;
 
     async {
@@ -101,7 +73,10 @@ async fn handle_quic_connection(conn: quinn::Connecting) -> Result<()> {
             };
             tokio::spawn(async move {
                 //tracing::info!("handle quic stream");
-                if let Err(e) = handle_server_stream(&mut recv_stream, &mut send_stream).await {
+                if let Err(e) =
+                    handle_server_stream(&mut recv_stream, &mut send_stream, idle_timeout_secs)
+                        .await
+                {
                     //print_type_of(&e);
                     tracing::error!("failed: {reason}", reason = e.to_string());
                 }

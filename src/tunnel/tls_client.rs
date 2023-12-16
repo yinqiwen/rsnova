@@ -121,11 +121,11 @@ async fn new_tls_connection(
 
     let mut roots = rustls::RootCertStore::empty();
     for cert in certs {
-        roots.add(cert).unwrap();
+        roots.add(&cert).unwrap();
     }
 
     let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder()
-        // .with_safe_defaults()
+        .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
 
@@ -134,7 +134,10 @@ async fn new_tls_connection(
     let connector = TlsConnector::from(Arc::new(client_crypto));
     let stream = TcpStream::connect(&remote).await?;
 
-    let domain = pki_types::ServerName::try_from(domain)
+    // let domain = pki_types::ServerName::try_from(domain)
+    //     .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?
+    //     .to_owned();
+    let domain = rustls::ServerName::try_from(domain)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?
         .to_owned();
 

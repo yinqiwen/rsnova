@@ -23,7 +23,7 @@ impl MuxConnection for QuinnConnection {
     type SendStream = quinn::SendStream;
     type RecvStream = quinn::RecvStream;
     fn is_valid(&self) -> bool {
-        !self.inner.is_none()
+        self.inner.is_some()
     }
     async fn ping(&mut self) -> anyhow::Result<()> {
         match &mut self.inner {
@@ -52,7 +52,7 @@ impl MuxConnection for QuinnConnection {
             None => Err(anyhow!("null connection")),
             Some(c) => match c.open_bi().await {
                 Err(e) => {
-                    let _ = c.close(
+                    c.close(
                         quinn::VarInt::from_u32(48100),
                         "open stream failed".as_bytes(),
                     );
@@ -70,6 +70,7 @@ impl MuxClient<QuinnConnection> {
         cert_path: &Path,
         host: &str,
         count: usize,
+        idle_timeout_secs: usize,
     ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
         match url.scheme() {
             "quic" => {
@@ -88,7 +89,7 @@ impl MuxClient<QuinnConnection> {
                         endpoint: endpoint.clone(),
                         inner: None,
                     };
-                    match quic_conn.connect(url, cert_path, &host).await {
+                    match quic_conn.connect(url, cert_path, host).await {
                         Err(e) => {
                             if i == 0 {
                                 return Err(e);
@@ -100,27 +101,25 @@ impl MuxClient<QuinnConnection> {
                     }
                     client.conns.push(quic_conn);
                 }
-                tokio::spawn(mux_client_loop(client, receiver));
-                return Ok(sender);
+                tokio::spawn(mux_client_loop(client, receiver, idle_timeout_secs));
+                Ok(sender)
             }
             _ => {
-                return Err(anyhow!("unsupported schema:{:?}", url.scheme()));
+                Err(anyhow!("unsupported schema:{:?}", url.scheme()))
             }
         }
     }
 }
 
 fn new_quic_endpoint(_url: &Url, cert_path: &Path) -> anyhow::Result<quinn::Endpoint> {
-    let certs = read_tokio_tls_certs(&cert_path)?;
-
     let certs = read_tokio_tls_certs(cert_path)?;
     let mut roots = rustls::RootCertStore::empty();
     for cert in certs {
-        roots.add(cert).unwrap();
+        roots.add(&cert).unwrap();
     }
 
     let mut client_crypto = rustls::ClientConfig::builder()
-        // .with_safe_defaults()
+        .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
 
@@ -153,6 +152,7 @@ pub async fn new_quic_client(
     cert_path: &Path,
     host: &str,
     count: usize,
+    idle_timeout_secs: usize,
 ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
-    MuxClient::<QuinnConnection>::from(url, cert_path, host, count).await
+    MuxClient::<QuinnConnection>::from(url, cert_path, host, count, idle_timeout_secs).await
 }

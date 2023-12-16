@@ -217,6 +217,8 @@ fn main() {
         .build()
         .unwrap()
         .block_on(async {
-            let _ = service_main(&args).await;
+            if let Err(e) = service_main(&args).await{
+                tracing::error!("service_main error:{e:?}");
+            }
         });
 }

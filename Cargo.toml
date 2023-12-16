@@ -17,13 +17,13 @@ tracing-appender = "0.2"
 veil = "0.1"
 tokio = { version = "1.0", features = ["full"] }
 rcgen = "0.11"
-rustls = { version = "0.22" }
-rustls-pemfile = "2"
+rustls = { version = "0.21" }
+rustls-pemfile = "1"
 # rustls-native-certs = "0.7"
 anyhow = "1.0"
 url = "2.5.0"
 bincode = "2.0.0-rc.3"
-tokio-rustls = "0.25.0"
+tokio-rustls = "0.24"
 tokio-util = { version = "0.7", features = ["compat"] }
 # pki-types = { package = "rustls-pki-types", version = "1" }
 httparse = "1.8.0"
@@ -33,7 +33,7 @@ metrics = "0.21"
 metrics-util = "0.15"
 time = "0.3"
 pki-types = { package = "rustls-pki-types", version = "1" }
-s2n-quic = { version = "1", optional = true }
+s2n-quic = { version = "1.31.0", optional = true }
 quinn = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -47,6 +47,6 @@ mimalloc = { version = "*" }
 
 
 [features]
-default = ["s2n_quic"]
+default = ["quinn"]
 s2n_quic = ["dep:s2n-quic", "dep:aws-lc-rs"]
 quinn = ["dep:quinn"]
