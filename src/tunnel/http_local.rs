@@ -14,7 +14,7 @@ async fn read_http_headers(inbound: &mut TcpStream) -> Result<Vec<u8>> {
         let mut tmp_buf = [0; 4096];
         let n = inbound.read(&mut tmp_buf).await?;
         buf.extend_from_slice(&tmp_buf[0..n]);
-        if let Some(pos) = buf.windows(crlf2.len()).position(|window| window == crlf2) {
+        if let Some(_pos) = buf.windows(crlf2.len()).position(|window| window == crlf2) {
             return Ok(buf);
         }
     }
@@ -31,12 +31,9 @@ fn extract_target(headers_buf: &Vec<u8>, default_port: &str) -> Result<String> {
             if url.has_host() {
                 target_addr.push_str(url.host_str().unwrap());
             }
-            match url.port() {
-                Some(p) => {
-                    target_addr.push(':');
-                    target_addr.push_str(p.to_string().as_str());
-                }
-                None => {}
+            if let Some(p) = url.port() {
+                target_addr.push(':');
+                target_addr.push_str(p.to_string().as_str());
             }
         }
     }
@@ -58,7 +55,7 @@ fn extract_target(headers_buf: &Vec<u8>, default_port: &str) -> Result<String> {
 }
 
 pub async fn handle_http(
-    tunnel_id: u32,
+    _tunnel_id: u32,
     mut inbound: TcpStream,
     sender: mpsc::UnboundedSender<Message>,
 ) -> Result<()> {

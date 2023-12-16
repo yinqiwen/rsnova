@@ -1,33 +1,36 @@
 #![feature(map_try_insert)]
 
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use clap::{Parser, ValueEnum};
 
-use metrics::gauge;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::{task, time};
-use tracing_subscriber;
-use url::{ParseError, Url};
-use veil::Redact; // 1.3.0
+use tokio::time;
+
+use url::Url;
+use veil::Redact;
 
 mod mux;
 mod tunnel;
 mod utils;
 
+#[cfg(not(target_arch = "arm"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(ValueEnum, Clone, Debug)]
 enum Protocol {
-    TLS,
-    QUIC,
+    Tls,
+    Quic,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Role {
-    CLIENT,
-    SERVER,
+    Client,
+    Server,
 }
 
 #[derive(Parser, Redact)]
@@ -39,7 +42,7 @@ struct Args {
     #[structopt(long = "listen", default_value = "127.0.0.1:48100")]
     listen: SocketAddr,
 
-    #[clap(long, value_enum, default_value_t=Protocol::TLS)]
+    #[clap(long, value_enum, default_value_t=Protocol::Tls)]
     protocol: Protocol,
 
     #[structopt(long = "remote")]
@@ -48,18 +51,27 @@ struct Args {
     #[clap(default_value = "127.0.0.1:48101", long, env)]
     admin: String,
 
-    #[clap(long = "key", requires = "cert", default_value = "key.der")]
+    #[clap(long = "key", requires = "cert", default_value = "key.pem")]
     #[redact(partial)]
     key: Option<PathBuf>,
     /// TLS certificate in PEM format
-    #[clap(long = "cert", default_value = "cert.der")]
+    #[clap(long = "cert", default_value = "cert.pem")]
     cert: Option<PathBuf>,
 
-    #[clap(long, value_enum, default_value_t=Role::CLIENT)]
+    #[clap(long, value_enum, default_value_t=Role::Client)]
     role: Role,
 
     #[clap(default_value = "5", long)]
     concurrent: usize,
+
+    #[clap(default_value = "2", long)]
+    threads: usize,
+
+    #[clap(default_value = "1048576", long)]
+    thread_stack_size: usize,
+
+    #[clap(default_value = "30", long)]
+    idle_timeout_secs: usize,
 
     #[clap(default_value = "mydomain.io", long)]
     tls_host: String,
@@ -76,8 +88,8 @@ struct Args {
 // }
 
 fn rcgen(tls_host: &String) {
-    let cert_path = std::path::PathBuf::from(r"./cert.der");
-    let key_path = std::path::PathBuf::from(r"./key.der");
+    let cert_path = std::path::PathBuf::from(r"./cert.pem");
+    let key_path = std::path::PathBuf::from(r"./key.pem");
     // let cert_der_path = std::path::PathBuf::from(r"./cert.der");
 
     println!(
@@ -85,23 +97,20 @@ fn rcgen(tls_host: &String) {
         cert_path, key_path, tls_host,
     );
     let cert = rcgen::generate_simple_self_signed(vec![tls_host.into()]).unwrap();
-    let key = cert.serialize_private_key_der();
-    let cert = cert.serialize_der().unwrap();
+    let key = cert.serialize_private_key_pem();
+    let cert = cert.serialize_pem().unwrap();
     // let cert = cert.serialize_pem().unwrap();
 
-    if let Err(e) = fs::write(&cert_path, &cert) {
+    if let Err(e) = fs::write(&cert_path, cert) {
         println!("failed to write certificate:{}", e);
         return;
     }
-    if let Err(e) = fs::write(&key_path, &key) {
+    if let Err(e) = fs::write(&key_path, key) {
         println!("failed to write certificate:{}", e);
-        return;
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args: Args = Args::parse();
+async fn service_main(args: &Args) -> anyhow::Result<()> {
     if args.log.is_empty() {
         tracing_subscriber::fmt::init();
     } else {
@@ -112,41 +121,39 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("{args:?}");
 
-    if args.rcgen {
-        rcgen(&args.tls_host);
-        return Ok(());
-    }
-
     let recorder = utils::MetricsLogRecorder::new(Duration::from_secs(10));
     metrics::set_boxed_recorder(Box::new(recorder)).unwrap();
 
     match args.role {
-        Role::CLIENT => {
-            let tunnel_sender: UnboundedSender<tunnel::Message>;
-            match args.remote.as_ref().unwrap().scheme() {
-                "quic" => {
-                    tunnel_sender = tunnel::MuxClient::<tunnel::QuicInnerConnection>::from(
-                        &args.remote.as_ref().unwrap(),
-                        &args.cert.as_ref().unwrap(),
-                        &args.tls_host,
-                        args.concurrent,
-                    )
-                    .await?;
-                }
-                "tls" => {
-                    tunnel_sender = tunnel::MuxClient::<tunnel::TlsInnerConnection>::from(
-                        &args.remote.as_ref().unwrap(),
-                        &args.cert.as_ref().unwrap(),
-                        &args.tls_host,
-                        args.concurrent,
-                    )
-                    .await?;
-                }
-                _ => {
-                    tracing::error!("unsupported");
-                    return Err(anyhow!("unsupported"));
-                }
-            };
+        Role::Client => {
+            let tunnel_sender: UnboundedSender<tunnel::Message> =
+                match args.remote.as_ref().unwrap().scheme() {
+                    "quic" => {
+                        tunnel::new_quic_client(
+                            args.remote.as_ref().unwrap(),
+                            args.cert.as_ref().unwrap(),
+                            &args.tls_host,
+                            args.concurrent,
+                            args.idle_timeout_secs,
+                        )
+                        .await?
+                    }
+                    "tls" => {
+                        tunnel::new_tls_client(
+                            args.remote.as_ref().unwrap(),
+                            args.cert.as_ref().unwrap(),
+                            &args.tls_host,
+                            args.concurrent,
+                            args.idle_timeout_secs,
+                        )
+                        .await?
+                    }
+                    _ => {
+                        tracing::error!("unsupported");
+                        return Err(anyhow!("unsupported"));
+                    }
+                };
+
             let health_checker = tunnel_sender.clone();
             tokio::spawn(async move {
                 let mut interval = time::interval(Duration::from_secs(1));
@@ -166,23 +173,25 @@ async fn main() -> anyhow::Result<()> {
                 return Err(e);
             }
         }
-        Role::SERVER => match args.protocol {
-            Protocol::QUIC => {
+        Role::Server => match args.protocol {
+            Protocol::Quic => {
                 if let Err(e) = tunnel::start_quic_remote_server(
                     &args.listen,
                     args.cert.as_ref().unwrap(),
                     args.key.as_ref().unwrap(),
+                    args.idle_timeout_secs,
                 )
                 .await
                 {
                     tracing::error!("{e:?}");
                 }
             }
-            Protocol::TLS => {
+            Protocol::Tls => {
                 if let Err(e) = tunnel::start_tls_remote_server(
                     &args.listen,
                     args.cert.as_ref().unwrap(),
                     args.key.as_ref().unwrap(),
+                    args.idle_timeout_secs,
                 )
                 .await
                 {
@@ -192,4 +201,24 @@ async fn main() -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+fn main() {
+    let args: Args = Args::parse();
+
+    if args.rcgen {
+        rcgen(&args.tls_host);
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.threads)
+        .enable_all()
+        .thread_stack_size(args.thread_stack_size)
+        .build()
+        .unwrap()
+        .block_on(async {
+            if let Err(e) = service_main(&args).await{
+                tracing::error!("service_main error:{e:?}");
+            }
+        });
 }

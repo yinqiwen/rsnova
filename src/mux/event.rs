@@ -1,9 +1,8 @@
 //use tokio::codec::{Decoder, Encoder};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bincode::{config, Decode, Encode};
-use bytes::{Buf, BufMut, BytesMut};
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::oneshot;
+use bytes::{BufMut, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const FLAG_OPEN: u8 = 1;
 pub const FLAG_FIN: u8 = 2;
@@ -17,18 +16,18 @@ pub const FLAG_PING: u8 = 5;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 
-pub fn get_event_type_str(flags: u8) -> &'static str {
-    match flags {
-        FLAG_OPEN => "FLAG_SYN",
-        // FLAG_FIN => "FLAG_FIN",
-        // FLAG_DATA => "FLAG_DATA",
-        // FLAG_WIN_UPDATE => "FLAG_WIN_UPDATE",
-        // FLAG_PING => "FLAG_PING",
-        // FLAG_SHUTDOWN => "FLAG_SHUTDOWN",
-        // FLAG_PONG => "FLAG_PONG",
-        _ => "INVALID",
-    }
-}
+// pub fn get_event_type_str(flags: u8) -> &'static str {
+//     match flags {
+//         FLAG_OPEN => "FLAG_SYN",
+//         // FLAG_FIN => "FLAG_FIN",
+//         // FLAG_DATA => "FLAG_DATA",
+//         // FLAG_WIN_UPDATE => "FLAG_WIN_UPDATE",
+//         // FLAG_PING => "FLAG_PING",
+//         // FLAG_SHUTDOWN => "FLAG_SHUTDOWN",
+//         // FLAG_PONG => "FLAG_PONG",
+//         _ => "INVALID",
+//     }
+// }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
@@ -49,7 +48,7 @@ impl Header {
         (self.flag_len & 0xFF) as u8
     }
     pub fn len(&self) -> u32 {
-        (self.flag_len >> 8)
+        self.flag_len >> 8
     }
     #[allow(dead_code)]
     pub fn set_len(&mut self, v: u32) {
@@ -77,12 +76,12 @@ pub struct Event {
 impl Event {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.header.flags() == 0 as u8
+        self.header.flags() == 0_u8
     }
 }
 
 #[allow(dead_code)]
-pub fn new_empty_event(inbound: bool) -> Event {
+pub fn new_empty_event() -> Event {
     Event {
         header: Header {
             flag_len: get_flag_len(0, 0),
@@ -146,7 +145,7 @@ pub fn new_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> Event {
     ev
 }
 
-pub async fn write_event<'a, T>(writer: &'a mut T, ev: Event) -> anyhow::Result<()>
+pub async fn write_event<T>(writer: &mut T, ev: Event) -> anyhow::Result<()>
 where
     T: AsyncWriteExt + Unpin,
 {
@@ -161,7 +160,7 @@ where
     Ok(())
 }
 
-pub async fn read_event<'a, T>(reader: &'a mut T) -> Result<Event, std::io::Error>
+pub async fn read_event<T>(reader: &mut T) -> Result<Event, std::io::Error>
 where
     T: AsyncReadExt + Unpin + ?Sized,
 {

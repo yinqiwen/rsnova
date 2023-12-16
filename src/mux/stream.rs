@@ -1,5 +1,5 @@
 use crate::utils;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bytes::Buf;
 use bytes::BytesMut;
 use futures::ready;
@@ -21,13 +21,15 @@ pub struct MuxStream {
     close_by_remote: bool,
 }
 
+type StreamDataReceiver = mpsc::Receiver<Option<Vec<u8>>>;
+
 pub enum Control {
     AcceptStream(oneshot::Sender<Result<MuxStream>>),
     NewStream(
         (
             u32,
             mpsc::Sender<Option<Vec<u8>>>,
-            Option<mpsc::Receiver<Option<Vec<u8>>>>,
+            Option<StreamDataReceiver>,
         ),
     ),
     StreamData(u32, Vec<u8>, bool),
@@ -130,7 +132,7 @@ impl AsyncWrite for MuxStream {
         let ctrl = Control::StreamData(self.id, Vec::from(buf), false);
         match ready!(self.ev_writer.poll_reserve(cx)) {
             Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
-            Ok(v) => match self.ev_writer.send_item(ctrl) {
+            Ok(_v) => match self.ev_writer.send_item(ctrl) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
                 Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
             },
@@ -148,7 +150,7 @@ impl AsyncWrite for MuxStream {
             let ctrl = Control::StreamShutdown(self.id, false);
             match ready!(self.ev_writer.poll_reserve(cx)) {
                 Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
-                Ok(v) => match self.ev_writer.send_item(ctrl) {
+                Ok(_) => match self.ev_writer.send_item(ctrl) {
                     Ok(()) => Poll::Ready(Ok(())),
                     Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
                 },
@@ -161,24 +163,21 @@ impl AsyncWrite for MuxStream {
 
 impl Drop for MuxStream {
     fn drop(&mut self) {
-        match self.ev_writer.get_ref() {
-            Some(sender) => {
-                if !self.initial_close {
-                    let ctrl_sender = sender.clone();
-                    let stream_close = Control::StreamShutdown(self.id, false);
-                    tokio::spawn(async move {
-                        let _ = ctrl_sender.send(stream_close).await;
-                    });
-                }
-                if !self.close_by_remote {
-                    let ctrl_sender = sender.clone();
-                    let stream_drop = Control::StreamClose(self.id);
-                    tokio::spawn(async move {
-                        let _ = ctrl_sender.send(stream_drop).await;
-                    });
-                }
+        if let Some(sender) = self.ev_writer.get_ref() {
+            if !self.initial_close {
+                let ctrl_sender = sender.clone();
+                let stream_close = Control::StreamShutdown(self.id, false);
+                tokio::spawn(async move {
+                    let _ = ctrl_sender.send(stream_close).await;
+                });
             }
-            None => {}
+            if !self.close_by_remote {
+                let ctrl_sender = sender.clone();
+                let stream_drop = Control::StreamClose(self.id);
+                tokio::spawn(async move {
+                    let _ = ctrl_sender.send(stream_drop).await;
+                });
+            }
         }
     }
 }

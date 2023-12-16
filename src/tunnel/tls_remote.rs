@@ -1,62 +1,39 @@
-use anyhow::{Context, Result};
+// use anyhow::Context;
+use anyhow::Result;
 // use pki_types::{CertificateDer, PrivateKeyDer};
-use crate::mux;
 use crate::tunnel::stream::handle_server_stream;
-use rustls_pemfile::Item;
-use std::{collections::VecDeque, fs, io, net::SocketAddr, path::PathBuf, sync::Arc, sync::Mutex};
+
+use crate::{mux, tunnel::ALPN_QUIC_HTTP};
+// use pki_types::CertificateDer;
+// use pki_types::PrivateKeyDer;
+
+use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Arc, sync::Mutex};
 
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-pub const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
+use crate::utils::read_pem_private_key;
+use crate::utils::read_tokio_tls_certs;
+
+// fn load_certs(path: &std::path::Path) -> io::Result<Vec<CertificateDer<'static>>> {
+//     certs(&mut BufReader::new(File::open(path)?)).collect()
+// }
+
 pub async fn start_tls_remote_server(
     listen: &SocketAddr,
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
+    cert_path: &Path,
+    key_path: &Path,
+    idle_timeout_secs: usize,
 ) -> Result<()> {
-    let key = fs::read(key_path.clone()).context("failed to read private key")?;
-    let key = if key_path.extension().map_or(false, |x| x == "der") {
-        tracing::debug!("private key with DER format");
-        tokio_rustls::rustls::PrivateKey(key)
-    } else {
-        match rustls_pemfile::read_one(&mut &*key) {
-            Ok(x) => match x.unwrap() {
-                Item::RSAKey(key) => {
-                    tracing::debug!("private key with PKCS #1 format");
-                    tokio_rustls::rustls::PrivateKey(key)
-                }
-                Item::PKCS8Key(key) => {
-                    tracing::debug!("private key with PKCS #8 format");
-                    tokio_rustls::rustls::PrivateKey(key)
-                }
-                Item::ECKey(key) => {
-                    tracing::debug!("private key with SEC1 format");
-                    tokio_rustls::rustls::PrivateKey(key)
-                }
-                Item::X509Certificate(_) => {
-                    anyhow::bail!("you should provide a key file instead of cert");
-                }
-                _ => {
-                    anyhow::bail!("no private keys found");
-                }
-            },
-            Err(_) => {
-                anyhow::bail!("malformed private key");
-            }
-        }
-    };
+    // let key = fs::read(key_path.clone()).context("failed to read private key")?;
+    // let key = rsa_private_keys(&mut BufReader::new(File::open(key_path)?))
+    //     .next()
+    //     .unwrap()
+    //     .map(Into::into)?;
 
-    let certs = fs::read(cert_path.clone()).context("failed to read certificate chain")?;
-    let certs = if cert_path.extension().map_or(false, |x| x == "der") {
-        vec![tokio_rustls::rustls::Certificate(certs)]
-    } else {
-        rustls_pemfile::certs(&mut &*certs)
-            .context("invalid PEM-encoded certificate")?
-            .into_iter()
-            .map(tokio_rustls::rustls::Certificate)
-            .collect()
-    };
+    let key = read_pem_private_key(key_path)?;
 
+    let certs = read_tokio_tls_certs(cert_path)?;
     let mut server_crypto = tokio_rustls::rustls::ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
@@ -82,7 +59,7 @@ pub async fn start_tls_remote_server(
         let fut = async move {
             let stream = acceptor.accept(stream).await?;
             tracing::info!("TLS connection incoming");
-            handle_tls_connection(stream, conn_id).await?;
+            handle_tls_connection(stream, conn_id, idle_timeout_secs).await?;
             Ok(()) as Result<()>
         };
 
@@ -98,6 +75,7 @@ pub async fn start_tls_remote_server(
 async fn handle_tls_connection(
     conn: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     id: u32,
+    idle_timeout_secs: usize,
 ) -> Result<()> {
     let (r, w) = tokio::io::split(conn);
     let mux_conn = mux::Connection::new(r, w, mux::Mode::Server, id);
@@ -108,7 +86,10 @@ async fn handle_tls_connection(
         tokio::spawn(async move {
             let stream_id = stream.id();
             let (mut stream_reader, mut stream_writer) = tokio::io::split(stream);
-            if let Err(e) = handle_server_stream(&mut stream_reader, &mut stream_writer).await {
+            if let Err(e) =
+                handle_server_stream(&mut stream_reader, &mut stream_writer, idle_timeout_secs)
+                    .await
+            {
                 tracing::error!(
                     "[{}/{}]failed: {reason}",
                     id,

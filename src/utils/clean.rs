@@ -8,7 +8,7 @@ pub async fn clean_rotate_logs(path: String) {
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         let now = time::OffsetDateTime::now_utc();
         for i in 7..=30 {
-            let check_date = now.clone();
+            let check_date = now;
             match check_date.checked_sub(time::Duration::days(i)) {
                 Some(date) => {
                     let suffix = date

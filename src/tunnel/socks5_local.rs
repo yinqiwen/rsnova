@@ -11,12 +11,12 @@ mod v5 {
     pub const VERSION: u8 = 5;
 
     pub const METH_NO_AUTH: u8 = 0;
-    pub const METH_GSSAPI: u8 = 1;
-    pub const METH_USER_PASS: u8 = 2;
+    // pub const METH_GSSAPI: u8 = 1;
+    // pub const METH_USER_PASS: u8 = 2;
 
     pub const CMD_CONNECT: u8 = 1;
-    pub const CMD_BIND: u8 = 2;
-    pub const CMD_UDP_ASSOCIATE: u8 = 3;
+    // pub const CMD_BIND: u8 = 2;
+    // pub const CMD_UDP_ASSOCIATE: u8 = 3;
 
     pub const ATYP_IPV4: u8 = 1;
     pub const ATYP_IPV6: u8 = 4;
@@ -73,7 +73,7 @@ pub async fn handle_socks5(
             inbound.read_exact(&mut addr_buf).await?;
             let addr = Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
             let port = ((addr_buf[4] as u16) << 8) | (addr_buf[5] as u16);
-            format!("{}:{}", addr.to_string(), port)
+            format!("{}:{}", addr, port)
         }
         v5::ATYP_IPV6 => {
             let mut addr_buf = [0u8; 18];
@@ -88,7 +88,7 @@ pub async fn handle_socks5(
             let h = ((addr_buf[14] as u16) << 8) | (addr_buf[15] as u16);
             let addr = Ipv6Addr::new(a, b, c, d, e, f, g, h);
             let port = ((addr_buf[16] as u16) << 8) | (addr_buf[17] as u16);
-            format!("{}:{}", addr.to_string(), port)
+            format!("{}:{}", addr, port)
         }
         v5::ATYP_DOMAIN => {
             //

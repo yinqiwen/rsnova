@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tracing_subscriber::fmt::format;
 
 use super::event;
 
 use super::stream::Control;
 
-const DefaultStreamChannelSize: usize = 16;
+const DEFAULT_STREAM_CHANNEL_SIZE: usize = 16;
 
 pub struct Connection {
     ev_writer: mpsc::Sender<Control>,
@@ -53,7 +52,7 @@ impl Connection {
         Ok(())
     }
     pub async fn open_stream(&self) -> Result<MuxStream> {
-        let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>(DefaultStreamChannelSize);
+        let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>(DEFAULT_STREAM_CHANNEL_SIZE);
         let id = self.stream_id_seed.fetch_add(2, Ordering::SeqCst);
         let stream = MuxStream::new(id, self.ev_writer.clone(), receiver);
         if let Err(e) = self
@@ -91,7 +90,8 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             match ev.header.flags() {
                 event::FLAG_SYN => {
                     //tracing::info!("recv syn:{}", ev.header.stream_id);
-                    let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>(DefaultStreamChannelSize);
+                    let (sender, receiver) =
+                        mpsc::channel::<Option<Vec<u8>>>(DEFAULT_STREAM_CHANNEL_SIZE);
                     let _ = ev_writer
                         .send(Control::NewStream((
                             ev.header.stream_id,
@@ -130,13 +130,12 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let ev_writer = ev_writer_orig.clone();
     let read_ctrl_fut = async move {
-        let labels: [(&str, String); 1] = [("idx", format!("{}", conn_id))];
+        //let labels: [(&str, String); 1] = [("idx", format!("{}", conn_id))];
         let mut incoming_streams: VecDeque<MuxStream> = VecDeque::new();
         let mut accept_callback: Option<oneshot::Sender<Result<MuxStream>>> = None;
         let mut stream_senders: HashMap<u32, mpsc::Sender<Option<Vec<u8>>>> = HashMap::new();
 
         while let Some(ctrl) = ev_reader.recv().await {
-            metrics::gauge!("mux.streams", stream_senders.len() as f64, &labels);
             match ctrl {
                 Control::AcceptStream(callback) => {
                     if accept_callback.is_some() {
@@ -152,6 +151,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let _ = e.value.send(Some(Vec::new())).await;
                         }
                         _ => {
+                            metrics::increment_gauge!("mux.streams", 1.0);
                             if receiver.is_some() {
                                 let stream =
                                     MuxStream::new(sid, ev_writer.clone(), receiver.unwrap());
@@ -190,7 +190,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             }
                         }
                         None => {
-                            if data.len() > 0 {
+                            if !data.is_empty() {
                                 tracing::error!(
                                     "No stream:{}/{} found for for data incoming:{} with data len:{}",
                                     conn_id,sid,
@@ -201,8 +201,8 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         }
                     }
                 }
-                Control::StreamShutdown(sid, remote) => match stream_senders.get(&sid) {
-                    Some(sender) => {
+                Control::StreamShutdown(sid, remote) => {
+                    if let Some(sender) = stream_senders.get(&sid) {
                         if !remote {
                             tracing::info!("[{}/{}]Stream shutdown write.", conn_id, sid);
                             //stream_senders.remove(&sid);
@@ -217,12 +217,12 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             //stream_senders.remove(&sid);
                         }
                     }
-                    None => {}
-                },
+                }
                 Control::StreamClose(sid) => {
                     tracing::info!("[{}/{}]Stream close.", conn_id, sid);
                     match stream_senders.remove_entry(&sid) {
                         Some((_, sender)) => {
+                            metrics::decrement_gauge!("mux.streams", 1.0);
                             let _ = sender.send(None).await;
                         }
                         None => {
@@ -250,12 +250,15 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
 
         //close streams
+        metrics::decrement_gauge!("mux.streams", stream_senders.len() as f64);
         for (_, sender) in stream_senders.drain().take(1) {
-            let _ = sender.send(Some(Vec::new())).await;
+            let _ = sender.send(None).await;
         }
-        if accept_callback.is_some(){
-            let _ = accept_callback.unwrap().send(Err(anyhow!("connection closed")));
-            accept_callback = None;
+        if accept_callback.is_some() {
+            let _ = accept_callback
+                .unwrap()
+                .send(Err(anyhow!("connection closed")));
+            //accept_callback = None;
         }
     };
     tokio::join!(read_connection_fut, read_ctrl_fut);

@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use tokio::io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::mux::event::{self, OpenStreamEvent};
-use crate::tunnel::CheckTimeoutSecs;
-use crate::tunnel::DefaultTimeoutSecs;
+use crate::tunnel::CHECK_TIMEOUT_SECS;
+use crate::tunnel::DEFAULT_TIMEOUT_SECS;
 
 struct TransferState {
     abort: AtomicBool,
@@ -42,7 +42,8 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     state: Arc<TransferState>,
 ) -> Result<()> {
     let mut buf = [0u8; 8192];
-    let check_timeout_secs = Duration::from_secs(CheckTimeoutSecs);
+
+    let check_timeout_secs = Duration::from_secs(CHECK_TIMEOUT_SECS);
     loop {
         if state.abort.load(SeqCst) {
             return Err(anyhow!("abort"));
@@ -54,8 +55,11 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
                     .unwrap()
                     .as_secs();
                 if now_secs > (state.io_active_timestamp_secs.load(SeqCst) + timeout_sec) {
-                    return Err(anyhow!(format!("timeout after inactive {}secs", now_secs- state.io_active_timestamp_secs.load(SeqCst))));
-                }else{
+                    return Err(anyhow!(format!(
+                        "timeout after inactive {}secs",
+                        now_secs - state.io_active_timestamp_secs.load(SeqCst)
+                    )));
+                } else {
                     continue;
                 }
             }
@@ -110,18 +114,18 @@ where
         }
     }
 
-    pub async fn transfer(&mut self) -> Result<()> {
+    pub async fn transfer(&mut self, idle_timeout_secs: usize) -> Result<()> {
         let state = Arc::new(TransferState::new());
         let client_to_server = timeout_copy(
             &mut self.local_reader,
             &mut self.remote_writer,
-            DefaultTimeoutSecs,
+            idle_timeout_secs as u64,
             state.clone(),
         );
         let server_to_client = timeout_copy(
             &mut self.remote_reader,
             &mut self.local_writer,
-            DefaultTimeoutSecs,
+            idle_timeout_secs as u64,
             state.clone(),
         );
         try_join(client_to_server, server_to_client).await?;
@@ -131,9 +135,10 @@ where
 
 pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteExt + Unpin>(
     mut lr: &'a mut LR,
-    mut lw: &'a mut LW,
+    lw: &'a mut LW,
+    idle_timeout_secs: usize,
 ) -> Result<()> {
-    let timeout_secs = Duration::from_secs(DefaultTimeoutSecs);
+    let timeout_secs = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     match timeout(timeout_secs, event::read_event(&mut lr)).await? {
         Err(e) => match e.kind() {
             std::io::ErrorKind::UnexpectedEof => Ok(()),
@@ -144,7 +149,7 @@ pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteEx
                 return Err(anyhow!("unexpected flag:{}", ev.header.flags()));
             }
             let config = bincode::config::standard();
-            let (open_event, len): (OpenStreamEvent, usize) =
+            let (open_event, _len): (OpenStreamEvent, usize) =
                 bincode::decode_from_slice(&ev.body[..], config)?;
             tracing::info!("[{}]recv open event:{:?}", ev.header.stream_id, open_event);
             let mut remote_stream = timeout(
@@ -158,8 +163,8 @@ pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteEx
                 LW,
                 tokio::net::tcp::ReadHalf<'_>,
                 tokio::net::tcp::WriteHalf<'_>,
-            > = Stream::new(&mut lr, &mut lw, &mut remote_receiver, &mut remote_sender);
-            stream.transfer().await
+            > = Stream::new(lr, lw, &mut remote_receiver, &mut remote_sender);
+            stream.transfer(idle_timeout_secs).await
         }
     }
 }
