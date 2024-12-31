@@ -1,10 +1,12 @@
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::tunnel::http_local::{handle_http, handle_https};
 use crate::tunnel::socks5_local::handle_socks5;
 use crate::tunnel::tls_local::{handle_tls, valid_tls_version};
 use crate::tunnel::Message;
+use crate::utils::set_ip_transparent;
 use anyhow::{anyhow, Result};
+use time::util;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -69,8 +71,19 @@ async fn handle_local_tunnel(
 pub async fn start_local_tunnel_server(
     addr: &SocketAddr,
     sender: mpsc::UnboundedSender<Message>,
+    tproxy: bool,
 ) -> Result<(), std::io::Error> {
-    let listener = TcpListener::bind(addr).await?;
+    let socket2_addr = socket2::SockAddr::from(addr.clone());
+    let domain = socket2::Domain::IPV4;
+    let listen_tcp_socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    if tproxy {
+        set_ip_transparent(&listen_tcp_socket)?;
+    }
+    listen_tcp_socket.bind(&socket2_addr.into())?;
+
+    let listener: std::net::TcpListener = listen_tcp_socket.into();
+    let listener = TcpListener::from_std(listener)?;
+
     tracing::info!("Start local TCP listen at {}", addr);
     let mut tunnel_id_seed: u32 = 0;
     while let Ok((inbound, _)) = listener.accept().await {

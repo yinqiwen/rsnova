@@ -198,7 +198,6 @@ impl AsyncWrite for MuxStream {
 
 impl Drop for MuxStream {
     fn drop(&mut self) {
-        tracing::info!("Stream:{} drop!", self.id);
         if let Some(sender) = self.ev_writer.get_ref() {
             if !self.close_by_remote {
                 let ctrl_sender = sender.clone();

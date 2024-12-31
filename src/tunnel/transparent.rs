@@ -1,5 +1,5 @@
 use crate::tunnel::Message;
-use crate::utils::get_original_dst;
+use crate::utils::{get_original_dst, get_tproxy_original_dst};
 use anyhow::Result;
 
 use tokio::net::TcpStream;
@@ -10,7 +10,15 @@ pub async fn handle_transparent(
     inbound: TcpStream,
     sender: mpsc::UnboundedSender<Message>,
 ) -> Result<()> {
-    let target_addr = get_original_dst(&inbound)?;
+    let target_addr = match get_original_dst(&inbound) {
+        Ok(addr) => addr,
+        Err(_) => match get_tproxy_original_dst(&inbound) {
+            Ok(addr) => addr,
+            Err(e) => {
+                return Err(e.into());
+            }
+        },
+    };
 
     let target_addr = target_addr.to_string();
     tracing::info!(

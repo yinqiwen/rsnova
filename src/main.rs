@@ -77,6 +77,9 @@ struct Args {
     tls_host: String,
 
     #[clap(default_value = "false", long)]
+    tproxy: bool,
+
+    #[clap(default_value = "false", long)]
     rcgen: bool,
 
     #[clap(default_value = "", long)]
@@ -165,9 +168,10 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 }
             });
 
-            if let Err(e) = tunnel::start_local_tunnel_server(&args.listen, tunnel_sender)
-                .await
-                .map_err(anyhow::Error::from)
+            if let Err(e) =
+                tunnel::start_local_tunnel_server(&args.listen, tunnel_sender, args.tproxy)
+                    .await
+                    .map_err(anyhow::Error::from)
             {
                 tracing::error!("{e:?}");
                 return Err(e);
