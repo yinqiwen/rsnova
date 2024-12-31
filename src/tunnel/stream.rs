@@ -102,9 +102,9 @@ async fn timeout_copy<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     state: Arc<TransferState>,
 ) -> Result<()> {
     let result = timeout_copy_impl(r, w, timeout_sec, state).await;
-    if result.is_err() {
-        w.shutdown().await?;
-    }
+    // if result.is_err() {
+    w.shutdown().await?;
+    // }
     result
 }
 
