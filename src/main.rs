@@ -1,4 +1,4 @@
-#![feature(map_try_insert)]
+// #![feature(map_try_insert)]
 
 use anyhow::anyhow;
 use clap::{Parser, ValueEnum};
@@ -96,10 +96,10 @@ fn rcgen(tls_host: &String) {
         "generating self-signed certificate at {:?}  & {:?} with host:{}",
         cert_path, key_path, tls_host,
     );
-    let cert = rcgen::generate_simple_self_signed(vec![tls_host.into()]).unwrap();
-    let key = cert.serialize_private_key_pem();
-    let cert = cert.serialize_pem().unwrap();
-    // let cert = cert.serialize_pem().unwrap();
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec![tls_host.into()]).unwrap();
+    let key = key_pair.serialize_pem();
+    let cert = cert.pem();
 
     if let Err(e) = fs::write(&cert_path, cert) {
         println!("failed to write certificate:{}", e);
@@ -217,7 +217,7 @@ fn main() {
         .build()
         .unwrap()
         .block_on(async {
-            if let Err(e) = service_main(&args).await{
+            if let Err(e) = service_main(&args).await {
                 tracing::error!("service_main error:{e:?}");
             }
         });

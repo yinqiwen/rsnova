@@ -1,5 +1,6 @@
 use crate::mux::stream::MuxStream;
 use anyhow::{anyhow, Result};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -102,6 +103,11 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
                 event::FLAG_FIN => {
                     let _ = ev_writer
+                        .send(Control::StreamClose(ev.header.stream_id, true))
+                        .await;
+                }
+                event::FLAG_SHUTDOWN => {
+                    let _ = ev_writer
                         .send(Control::StreamShutdown(ev.header.stream_id, true))
                         .await;
                 }
@@ -144,28 +150,26 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     }
                     accept_callback = Some(callback);
                 }
-                Control::NewStream((sid, sender, receiver)) => {
-                    match stream_senders.try_insert(sid, sender) {
-                        Err(e) => {
-                            tracing::error!("Duplicate stream id:{}", sid);
-                            let _ = e.value.send(Some(Vec::new())).await;
-                        }
-                        _ => {
-                            metrics::increment_gauge!("mux.streams", 1.0);
-                            if receiver.is_some() {
-                                let stream =
-                                    MuxStream::new(sid, ev_writer.clone(), receiver.unwrap());
-                                incoming_streams.push_back(stream);
-                            } else {
-                                let ev = event::new_syn_event(sid);
-                                if let Err(e) = event::write_event(&mut w, ev).await {
-                                    tracing::error!("write syn failed:{}", e);
-                                    break;
-                                }
+                Control::NewStream((sid, sender, receiver)) => match stream_senders.entry(sid) {
+                    Entry::Occupied(e) => {
+                        tracing::error!("Duplicate stream id:{}", sid);
+                        let _ = e.get().send(Some(Vec::new())).await;
+                    }
+                    Entry::Vacant(v) => {
+                        v.insert(sender);
+                        metrics::increment_gauge!("mux.streams", 1.0);
+                        if receiver.is_some() {
+                            let stream = MuxStream::new(sid, ev_writer.clone(), receiver.unwrap());
+                            incoming_streams.push_back(stream);
+                        } else {
+                            let ev = event::new_syn_event(sid);
+                            if let Err(e) = event::write_event(&mut w, ev).await {
+                                tracing::error!("write syn failed:{}", e);
+                                break;
                             }
                         }
                     }
-                }
+                },
                 Control::StreamData(sid, data, incoming) => {
                     match stream_senders.get(&sid) {
                         Some(stream_sender) => {
@@ -202,28 +206,35 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     }
                 }
                 Control::StreamShutdown(sid, remote) => {
+                    tracing::info!(
+                        "[{}/{}]Stream shutdown write from remote:{}",
+                        conn_id,
+                        sid,
+                        remote
+                    );
                     if let Some(sender) = stream_senders.get(&sid) {
                         if !remote {
-                            tracing::info!("[{}/{}]Stream shutdown write.", conn_id, sid);
-                            //stream_senders.remove(&sid);
-                            let ev = event::new_fin_event(sid);
+                            let ev = event::new_shutdown_event(sid);
                             if let Err(e) = event::write_event(&mut w, ev).await {
                                 tracing::error!("write fin failed:{}", e);
                                 break;
                             }
                         } else {
-                            tracing::info!("[{}/{}]Stream shutdown read.", conn_id, sid);
                             let _ = sender.send(Some(Vec::new())).await;
-                            //stream_senders.remove(&sid);
                         }
                     }
                 }
-                Control::StreamClose(sid) => {
-                    tracing::info!("[{}/{}]Stream close.", conn_id, sid);
+                Control::StreamClose(sid, remote) => {
+                    tracing::info!("[{}/{}]Stream close from remote:{}", conn_id, sid, remote);
                     match stream_senders.remove_entry(&sid) {
                         Some((_, sender)) => {
                             metrics::decrement_gauge!("mux.streams", 1.0);
-                            let _ = sender.send(None).await;
+                            if !remote {
+                                let ev = event::new_fin_event(sid);
+                                let _ = event::write_event(&mut w, ev).await;
+                            } else {
+                                let _ = sender.send(None).await;
+                            }
                         }
                         None => {
                             //

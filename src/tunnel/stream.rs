@@ -26,6 +26,22 @@ impl TransferState {
             io_active_timestamp_secs: AtomicU64::new(0),
         }
     }
+    fn touch(&self) {
+        self.io_active_timestamp_secs.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            SeqCst,
+        );
+    }
+    fn idle_since_last_active(&self) -> u64 {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        now_secs - self.io_active_timestamp_secs.load(SeqCst)
+    }
 }
 
 pub struct Stream<'a, LR, LW, RR, RW> {
@@ -44,36 +60,28 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     let mut buf = [0u8; 8192];
 
     let check_timeout_secs = Duration::from_secs(CHECK_TIMEOUT_SECS);
+    state.touch();
     loop {
         if state.abort.load(SeqCst) {
             return Err(anyhow!("abort"));
         }
         match timeout(check_timeout_secs, r.read(&mut buf)).await {
             Err(_) => {
-                let now_secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                if now_secs > (state.io_active_timestamp_secs.load(SeqCst) + timeout_sec) {
+                if state.idle_since_last_active() >= timeout_sec {
                     return Err(anyhow!(format!(
-                        "timeout after inactive {}secs",
-                        now_secs - state.io_active_timestamp_secs.load(SeqCst)
+                        "timeout after inactive {}secs, io active time:{}",
+                        state.idle_since_last_active(),
+                        state.io_active_timestamp_secs.load(SeqCst)
                     )));
                 } else {
                     continue;
                 }
             }
             Ok(Ok(n)) => {
+                state.touch();
                 if n == 0 {
                     break;
                 };
-                state.io_active_timestamp_secs.store(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    SeqCst,
-                );
                 if let Err(ex) = w.write_all(&buf[0..n]).await {
                     state.abort.store(true, SeqCst);
                     return Err(ex.into());
@@ -94,7 +102,9 @@ async fn timeout_copy<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     state: Arc<TransferState>,
 ) -> Result<()> {
     let result = timeout_copy_impl(r, w, timeout_sec, state).await;
-    w.shutdown().await?;
+    if result.is_err() {
+        w.shutdown().await?;
+    }
     result
 }
 

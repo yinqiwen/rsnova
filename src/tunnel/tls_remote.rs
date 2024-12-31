@@ -1,18 +1,17 @@
 // use anyhow::Context;
 use anyhow::Result;
+
 // use pki_types::{CertificateDer, PrivateKeyDer};
 use crate::tunnel::stream::handle_server_stream;
 
 use crate::{mux, tunnel::ALPN_QUIC_HTTP};
-// use pki_types::CertificateDer;
-// use pki_types::PrivateKeyDer;
 
 use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Arc, sync::Mutex};
 
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use crate::utils::read_pem_private_key;
+use crate::utils::read_private_key;
 use crate::utils::read_tokio_tls_certs;
 
 // fn load_certs(path: &std::path::Path) -> io::Result<Vec<CertificateDer<'static>>> {
@@ -25,17 +24,11 @@ pub async fn start_tls_remote_server(
     key_path: &Path,
     idle_timeout_secs: usize,
 ) -> Result<()> {
-    // let key = fs::read(key_path.clone()).context("failed to read private key")?;
-    // let key = rsa_private_keys(&mut BufReader::new(File::open(key_path)?))
-    //     .next()
-    //     .unwrap()
-    //     .map(Into::into)?;
-
-    let key = read_pem_private_key(key_path)?;
-
     let certs = read_tokio_tls_certs(cert_path)?;
+    let key = read_private_key(key_path)?;
+
     let mut server_crypto = tokio_rustls::rustls::ServerConfig::builder()
-        .with_safe_defaults()
+        // .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     server_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();

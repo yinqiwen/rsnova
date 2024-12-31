@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use quinn::crypto::rustls::QuicClientConfig;
 use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -104,9 +105,7 @@ impl MuxClient<QuinnConnection> {
                 tokio::spawn(mux_client_loop(client, receiver, idle_timeout_secs));
                 Ok(sender)
             }
-            _ => {
-                Err(anyhow!("unsupported schema:{:?}", url.scheme()))
-            }
+            _ => Err(anyhow!("unsupported schema:{:?}", url.scheme())),
         }
     }
 }
@@ -114,18 +113,21 @@ impl MuxClient<QuinnConnection> {
 fn new_quic_endpoint(_url: &Url, cert_path: &Path) -> anyhow::Result<quinn::Endpoint> {
     let certs = read_tokio_tls_certs(cert_path)?;
     let mut roots = rustls::RootCertStore::empty();
+    // roots.add(CertificateDer::from(std::fs::read(cert_path)?))?;
     for cert in certs {
-        roots.add(&cert).unwrap();
+        roots.add(cert).unwrap();
     }
 
     let mut client_crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
+        // .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
 
     client_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
 
-    let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    // let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    let client_config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
     let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)

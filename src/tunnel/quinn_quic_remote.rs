@@ -1,19 +1,14 @@
 // use anyhow::Context;
 use anyhow::Result;
-// use quinn::ConnectionError;
+use quinn::crypto::rustls::QuicServerConfig;
 
-// use pki_types::PrivateKeyDer;
 use std::sync::Arc;
 use std::{net::SocketAddr, path::Path};
 
 use crate::tunnel::stream::handle_server_stream;
 use crate::tunnel::ALPN_QUIC_HTTP;
-use crate::utils::read_pem_private_key;
-use crate::utils::read_tokio_tls_certs;
 
-// fn print_type_of<T>(_: &T) {
-//     println!("{}", std::any::type_name::<T>())
-// }
+use crate::utils::{read_private_key, read_tokio_tls_certs};
 
 pub async fn start_quic_remote_server(
     listen: &SocketAddr,
@@ -21,16 +16,17 @@ pub async fn start_quic_remote_server(
     key_path: &Path,
     idle_timeout_secs: usize,
 ) -> Result<()> {
-    let key = read_pem_private_key(key_path)?;
     let certs = read_tokio_tls_certs(cert_path)?;
+    let key = read_private_key(key_path)?;
 
     let mut server_crypto = rustls::ServerConfig::builder()
-        .with_safe_defaults()
+        // .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     server_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
 
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
+    let mut server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(0_u8.into());
 
@@ -51,7 +47,7 @@ pub async fn start_quic_remote_server(
     Ok(())
 }
 
-async fn handle_quic_connection(conn: quinn::Connecting, idle_timeout_secs: usize) -> Result<()> {
+async fn handle_quic_connection(conn: quinn::Incoming, idle_timeout_secs: usize) -> Result<()> {
     let connection = conn.await?;
 
     async {

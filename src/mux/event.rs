@@ -1,7 +1,10 @@
+// use std::io::IoSlice;
+
 //use tokio::codec::{Decoder, Encoder};
 use anyhow::Result;
 use bincode::{config, Decode, Encode};
-use bytes::{BufMut, BytesMut};
+// use bytes::{BufMut, BytesMut};
+// use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const FLAG_OPEN: u8 = 1;
@@ -10,7 +13,7 @@ pub const FLAG_SYN: u8 = 4;
 pub const FLAG_DATA: u8 = 3;
 // pub const FLAG_WIN_UPDATE: u8 = 4;
 pub const FLAG_PING: u8 = 5;
-// pub const FLAG_SHUTDOWN: u8 = 7;
+pub const FLAG_SHUTDOWN: u8 = 7;
 // pub const FLAG_PONG: u8 = 8;
 // pub const FLAG_ROUTINE: u8 = 9;
 
@@ -118,6 +121,15 @@ pub fn new_fin_event(sid: u32) -> Event {
         body: Vec::new(),
     }
 }
+pub fn new_shutdown_event(sid: u32) -> Event {
+    Event {
+        header: Header {
+            flag_len: get_flag_len(0, FLAG_SHUTDOWN),
+            stream_id: sid,
+        },
+        body: Vec::new(),
+    }
+}
 pub fn new_syn_event(sid: u32) -> Event {
     Event {
         header: Header {
@@ -149,14 +161,35 @@ pub async fn write_event<T>(writer: &mut T, ev: Event) -> anyhow::Result<()>
 where
     T: AsyncWriteExt + Unpin,
 {
-    let mut out = BytesMut::new();
-    out.reserve(EVENT_HEADER_LEN + ev.body.len());
-    out.put_u32_le(ev.header.flag_len);
-    out.put_u32_le(ev.header.stream_id);
+    let mut hbuf = [0u8; 8];
+    hbuf[0..4].copy_from_slice(&ev.header.flag_len.to_le_bytes());
+    hbuf[4..8].copy_from_slice(&ev.header.stream_id.to_le_bytes());
+    writer.write_all(&hbuf).await?;
     if !ev.body.is_empty() {
-        out.put_slice(&ev.body[..]);
+        writer.write_all(&ev.body).await?;
     }
-    writer.write_all(&out).await?;
+    // if !ev.body.is_empty() {
+    //     let all = [IoSlice::new(&hbuf), IoSlice::new(&ev.body)];
+    //     writer.write_vectored(&all).await?;
+    // } else {
+    //     writer.write_all(&hbuf).await?;
+    // }
+
+    // let all = if !ev.body.is_empty() {
+    //     vec![IoSlice::new(&hbuf), IoSlice::new(&ev.body)]
+    // } else {
+    //     vec![IoSlice::new(&hbuf)]
+    // };
+    // writer.write_vectored(&all).await?;
+    // Ok(())
+    // let mut out = BytesMut::new();
+    // out.reserve(EVENT_HEADER_LEN + ev.body.len());
+    // out.put_u32_le(ev.header.flag_len);
+    // out.put_u32_le(ev.header.stream_id);
+    // if !ev.body.is_empty() {
+    //     out.put_slice(&ev.body[..]);
+    // }
+    // writer.write_all(&out).await?;
     Ok(())
 }
 
@@ -164,17 +197,12 @@ pub async fn read_event<T>(reader: &mut T) -> Result<Event, std::io::Error>
 where
     T: AsyncReadExt + Unpin + ?Sized,
 {
-    let mut hbuf = vec![0; EVENT_HEADER_LEN];
-    let _ = reader.read_exact(&mut hbuf).await?;
+    let mut hbuf = [0; EVENT_HEADER_LEN];
+    reader.read_exact(&mut hbuf).await?;
 
-    let mut xbuf: [u8; 4] = Default::default();
-    xbuf.copy_from_slice(&hbuf[0..4]);
-    let e1 = u32::from_le_bytes(xbuf);
-    xbuf.copy_from_slice(&hbuf[4..8]);
-    let e2 = u32::from_le_bytes(xbuf);
     let header = Header {
-        flag_len: e1,
-        stream_id: e2,
+        flag_len: u32::from_le_bytes(hbuf[0..4].try_into().unwrap()),
+        stream_id: u32::from_le_bytes(hbuf[4..8].try_into().unwrap()),
     };
     let body_data_len = header.len();
     let mut dbuf = vec![0; body_data_len as usize];

@@ -3,6 +3,7 @@ use anyhow::Result;
 use bytes::Buf;
 use bytes::BytesMut;
 use futures::ready;
+use futures::SinkExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::AsyncRead;
@@ -19,6 +20,7 @@ pub struct MuxStream {
     recv_buf: BytesMut,
     initial_close: bool,
     close_by_remote: bool,
+    read_eof: bool,
 }
 
 type StreamDataReceiver = mpsc::Receiver<Option<Vec<u8>>>;
@@ -34,7 +36,7 @@ pub enum Control {
     ),
     StreamData(u32, Vec<u8>, bool),
     StreamShutdown(u32, bool),
-    StreamClose(u32),
+    StreamClose(u32, bool),
     Ping,
     Close,
 }
@@ -69,6 +71,7 @@ impl MuxStream {
             recv_buf: BytesMut::new(),
             initial_close: false,
             close_by_remote: false,
+            read_eof: false,
         }
     }
 
@@ -89,11 +92,15 @@ impl AsyncRead for MuxStream {
                 return Poll::Ready(Ok(()));
             }
         };
+        if self.read_eof {
+            return Poll::Ready(Ok(()));
+        }
         match self.inbound_reader.poll_recv(cx) {
             Poll::Ready(Some(data)) => match data {
                 Some(b) => {
                     let mut copy_n: usize = b.len();
                     if 0 == copy_n {
+                        self.read_eof = true;
                         return Poll::Ready(Ok(()));
                     }
                     if copy_n > buf.remaining() {
@@ -129,6 +136,12 @@ impl AsyncWrite for MuxStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
+        if self.close_by_remote {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "close by remote",
+            )));
+        }
         let ctrl = Control::StreamData(self.id, Vec::from(buf), false);
         match ready!(self.ev_writer.poll_reserve(cx)) {
             Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
@@ -138,8 +151,15 @@ impl AsyncWrite for MuxStream {
             },
         }
     }
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match ready!(self.ev_writer.poll_flush_unpin(cx)) {
+            Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
+            Ok(_v) => Poll::Ready(Ok(())),
+        }
+        //Poll::Ready(Ok(()))
     }
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
@@ -163,6 +183,7 @@ impl AsyncWrite for MuxStream {
 
 impl Drop for MuxStream {
     fn drop(&mut self) {
+        tracing::info!("Stream:{} drop!", self.id);
         if let Some(sender) = self.ev_writer.get_ref() {
             if !self.initial_close {
                 let ctrl_sender = sender.clone();
@@ -173,7 +194,7 @@ impl Drop for MuxStream {
             }
             if !self.close_by_remote {
                 let ctrl_sender = sender.clone();
-                let stream_drop = Control::StreamClose(self.id);
+                let stream_drop = Control::StreamClose(self.id, false);
                 tokio::spawn(async move {
                     let _ = ctrl_sender.send(stream_drop).await;
                 });
