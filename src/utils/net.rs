@@ -31,6 +31,30 @@ fn sockaddr_storage_to_socketaddr(
         )),
     }
 }
+
+#[cfg(target_os = "linux")]
+pub async fn new_tcp_listener(
+    addr: &SocketAddr,
+    transparent: bool,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let socket2_addr = socket2::SockAddr::from(addr.clone());
+    let domain = socket2::Domain::IPV4;
+    let listen_tcp_socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    if transparent {
+        set_ip_transparent(&listen_tcp_socket)?;
+    }
+    listen_tcp_socket.bind(&socket2_addr.into())?;
+    listen_tcp_socket.listen(128)?;
+    tokio::net::TcpListener::from_std(listen_tcp_socket.into())
+}
+#[cfg(not(target_os = "linux"))]
+pub async fn new_tcp_listener(
+    addr: &SocketAddr,
+    transparent: bool,
+) -> std::io::Result<tokio::net::TcpListener> {
+    TcpListener::bind(addr).await?
+}
+
 #[cfg(target_os = "linux")]
 pub fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
     // use std::os::fd::FromRawFd;
