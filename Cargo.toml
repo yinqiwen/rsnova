@@ -39,8 +39,11 @@ socket2 = "0.5"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-aws-lc-rs = { version = "1", features = ["bindgen"], optional = true }
+# [target.'cfg(not(target_os = "windows"))'.dependencies]
+# aws-lc-rs = { version = "1", features = ["bindgen"], optional = true }
+[target.'cfg(target_arch = "arm")'.dependencies]
+aws-lc-rs = { version = "1", features = ["bindgen"] }
+
 
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
 mimalloc = { version = "*" }

@@ -56,15 +56,11 @@ pub async fn new_tcp_listener(
 }
 
 #[cfg(target_os = "linux")]
-pub fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
-    // use std::os::fd::FromRawFd;
-    // use std::os::unix::io::AsRawFd;
-    // let fd = socket.as_raw_fd();
-    // let s = unsafe { socket2::Socket::from_raw_fd(fd) };
+fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
     socket.set_ip_transparent(true)
 }
 #[cfg(not(target_os = "linux"))]
-pub fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
+fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
     Ok(())
 }
 
