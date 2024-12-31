@@ -122,13 +122,7 @@ pub async fn handle_socks5(
     resp[3] = 1; // socksAtypeV4         = 0x01
     inbound.write_all(&resp).await?;
 
-    tracing::info!(
-        "[{}]Handle SOCKS5 proxy to {} with local:{} remote:{}",
-        tunnel_id,
-        target_addr,
-        inbound.local_addr().unwrap(),
-        inbound.peer_addr().unwrap()
-    );
+    tracing::info!("[{}]Handle SOCKS5 proxy to {}", tunnel_id, target_addr);
 
     let msg = Message::open_stream(inbound, target_addr, None);
     sender.send(msg)?;

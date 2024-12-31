@@ -52,7 +52,7 @@ pub async fn new_tcp_listener(
     addr: &SocketAddr,
     transparent: bool,
 ) -> std::io::Result<tokio::net::TcpListener> {
-    tokio::net::TcpListener::bind(addr).await?
+    tokio::net::TcpListener::bind(addr).await
 }
 
 #[cfg(target_os = "linux")]
