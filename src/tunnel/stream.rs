@@ -105,6 +105,7 @@ async fn timeout_copy<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     // if result.is_err() {
     w.shutdown().await?;
     // }
+
     result
 }
 

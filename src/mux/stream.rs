@@ -88,13 +88,12 @@ impl AsyncRead for MuxStream {
     ) -> Poll<std::io::Result<()>> {
         if !self.recv_buf.is_empty() {
             fill_read_buf(&mut self.recv_buf, buf);
-            if buf.remaining() == 0 {
-                return Poll::Ready(Ok(()));
-            }
+            return Poll::Ready(Ok(()));
         };
         if self.read_eof {
             return Poll::Ready(Ok(()));
         }
+
         match self.inbound_reader.poll_recv(cx) {
             Poll::Ready(Some(data)) => match data {
                 Some(b) => {
@@ -121,11 +120,24 @@ impl AsyncRead for MuxStream {
                 }
             },
             Poll::Ready(None) => {
-                // self.eof_close = true;
-                //error!("[{}]####3 Close", state.stream_id);
-                Poll::Ready(Ok(()))
+                // Poll::Ready(Ok(()))
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "close by remote",
+                )))
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                if self.read_eof {
+                    return Poll::Ready(Ok(()));
+                }
+                if self.close_by_remote {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "close by remote",
+                    )));
+                }
+                Poll::Pending
+            }
         }
     }
 }
@@ -165,7 +177,10 @@ impl AsyncWrite for MuxStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        if !self.initial_close {
+        if self.read_eof {
+            // do nothing
+            Poll::Ready(Ok(()))
+        } else if !self.initial_close {
             self.initial_close = true;
             let ctrl = Control::StreamShutdown(self.id, false);
             match ready!(self.ev_writer.poll_reserve(cx)) {
@@ -185,13 +200,6 @@ impl Drop for MuxStream {
     fn drop(&mut self) {
         tracing::info!("Stream:{} drop!", self.id);
         if let Some(sender) = self.ev_writer.get_ref() {
-            if !self.initial_close {
-                let ctrl_sender = sender.clone();
-                let stream_close = Control::StreamShutdown(self.id, false);
-                tokio::spawn(async move {
-                    let _ = ctrl_sender.send(stream_close).await;
-                });
-            }
             if !self.close_by_remote {
                 let ctrl_sender = sender.clone();
                 let stream_drop = Control::StreamClose(self.id, false);
