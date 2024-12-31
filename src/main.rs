@@ -82,6 +82,9 @@ struct Args {
     #[clap(default_value = "false", long)]
     rcgen: bool,
 
+    #[clap(default_value = "false", long)]
+    profile: bool,
+
     #[clap(default_value = "", long)]
     log: String,
 }
@@ -114,14 +117,19 @@ fn rcgen(tls_host: &String) {
 }
 
 async fn service_main(args: &Args) -> anyhow::Result<()> {
-    if args.log.is_empty() {
-        tracing_subscriber::fmt::init();
+    if args.profile {
+        console_subscriber::init();
     } else {
-        let file_appender = tracing_appender::rolling::daily("./", args.log.as_str());
-        //let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
-        tracing_subscriber::fmt().with_writer(file_appender).init();
-        tokio::spawn(utils::clean_rotate_logs(format!("./{}", args.log.as_str())));
+        if args.log.is_empty() {
+            tracing_subscriber::fmt::init();
+        } else {
+            let file_appender = tracing_appender::rolling::daily("./", args.log.as_str());
+            //let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
+            tracing_subscriber::fmt().with_writer(file_appender).init();
+            tokio::spawn(utils::clean_rotate_logs(format!("./{}", args.log.as_str())));
+        }
     }
+
     tracing::info!("{args:?}");
 
     let recorder = utils::MetricsLogRecorder::new(Duration::from_secs(10));
