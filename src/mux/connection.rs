@@ -11,7 +11,7 @@ use super::event;
 
 use super::stream::Control;
 
-const DEFAULT_STREAM_CHANNEL_SIZE: usize = 16;
+const DEFAULT_STREAM_CHANNEL_SIZE: usize = 4;
 
 pub struct Connection {
     ev_writer: mpsc::Sender<Control>,
