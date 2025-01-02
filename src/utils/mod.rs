@@ -9,6 +9,6 @@ pub use error::make_io_error;
 pub use metrics::MetricsLogRecorder;
 // pub use tls::read_tls_certs;
 pub use net::get_original_dst;
-pub use net::{get_tproxy_original_dst, new_tcp_listener};
+pub use net::new_tcp_listener;
 pub use tls::read_private_key;
 pub use tls::read_tokio_tls_certs;

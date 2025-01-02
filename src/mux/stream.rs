@@ -78,6 +78,10 @@ impl MuxStream {
     pub fn id(&self) -> u32 {
         self.id
     }
+
+    fn close_reader(&mut self) {
+        self.inbound_reader.close();
+    }
 }
 
 impl AsyncRead for MuxStream {
@@ -91,6 +95,7 @@ impl AsyncRead for MuxStream {
             return Poll::Ready(Ok(()));
         };
         if self.read_eof {
+            self.close_reader();
             return Poll::Ready(Ok(()));
         }
 
@@ -100,6 +105,7 @@ impl AsyncRead for MuxStream {
                     let mut copy_n: usize = b.len();
                     if 0 == copy_n {
                         self.read_eof = true;
+                        self.close_reader();
                         return Poll::Ready(Ok(()));
                     }
                     if copy_n > buf.remaining() {
@@ -113,6 +119,7 @@ impl AsyncRead for MuxStream {
                 }
                 None => {
                     self.close_by_remote = true;
+                    self.close_reader();
                     Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionReset,
                         "close by remote",
@@ -121,6 +128,7 @@ impl AsyncRead for MuxStream {
             },
             Poll::Ready(None) => {
                 // Poll::Ready(Ok(()))
+                self.close_reader();
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionReset,
                     "close by remote",
@@ -128,9 +136,11 @@ impl AsyncRead for MuxStream {
             }
             Poll::Pending => {
                 if self.read_eof {
+                    self.close_reader();
                     return Poll::Ready(Ok(()));
                 }
                 if self.close_by_remote {
+                    self.close_reader();
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionReset,
                         "close by remote",

@@ -8,6 +8,8 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use url::Url;
 
+use rustls::crypto::{aws_lc_rs as provider, CryptoProvider};
+
 use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
@@ -124,12 +126,25 @@ async fn new_tls_connection(
         roots.add(cert).unwrap();
     }
 
+    // let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder_with_provider(
+    //     CryptoProvider {
+    //         cipher_suites: vec![provider::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256],
+    //         kx_groups: vec![provider::kx_group::X25519],
+    //         ..provider::default_provider()
+    //     }
+    //     .into(),
+    // )
+    // .with_protocol_versions(&[&rustls::version::TLS13])
+    // .unwrap()
+    // .with_root_certificates(roots)
+    // .with_no_client_auth();
     let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder()
         // .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
 
     client_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    client_crypto.enable_early_data = true;
 
     let connector = TlsConnector::from(Arc::new(client_crypto));
     let stream = TcpStream::connect(&remote).await?;
@@ -143,6 +158,8 @@ async fn new_tls_connection(
 
     let stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream> =
         connector.connect(domain, stream).await?;
+    // let ciphersuite = stream.get_ref().1.negotiated_cipher_suite().unwrap();
+    // tracing::info!("Current ciphersuite: {:?}", ciphersuite.suite());
     Ok(stream)
 }
 

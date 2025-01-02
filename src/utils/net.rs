@@ -64,32 +64,32 @@ fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-pub fn get_tproxy_original_dst(s: &TcpStream) -> std::io::Result<SocketAddr> {
-    use std::os::fd::FromRawFd;
-    use std::os::unix::io::AsRawFd;
-    let fd = s.as_raw_fd();
-    let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
+// #[cfg(target_os = "linux")]
+// pub fn get_tproxy_original_dst(s: &TcpStream) -> std::io::Result<SocketAddr> {
+//     use std::os::fd::FromRawFd;
+//     use std::os::unix::io::AsRawFd;
+//     let fd = s.as_raw_fd();
+//     let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
 
-    match socket.original_dst() {
-        Ok(addr) => {
-            return sockaddr_storage_to_socketaddr(addr.as_storage());
-        }
-        Err(_) => match socket.original_dst_ipv6() {
-            Ok(addr6) => {
-                return sockaddr_storage_to_socketaddr(addr6.as_storage());
-            }
-            Err(_e) => Err(std::io::Error::last_os_error()),
-        },
-    }
-}
-#[cfg(not(target_os = "linux"))]
-pub fn get_tproxy_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "not supported in current os",
-    ))
-}
+//     match socket.original_dst() {
+//         Ok(addr) => {
+//             return sockaddr_storage_to_socketaddr(addr.as_storage());
+//         }
+//         Err(_) => match socket.original_dst_ipv6() {
+//             Ok(addr6) => {
+//                 return sockaddr_storage_to_socketaddr(addr6.as_storage());
+//             }
+//             Err(_e) => Err(std::io::Error::last_os_error()),
+//         },
+//     }
+// }
+// #[cfg(not(target_os = "linux"))]
+// pub fn get_tproxy_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
+//     Err(std::io::Error::new(
+//         std::io::ErrorKind::Other,
+//         "not supported in current os",
+//     ))
+// }
 
 #[cfg(target_os = "linux")]
 pub fn get_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
