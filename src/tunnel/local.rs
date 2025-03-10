@@ -73,7 +73,14 @@ pub async fn start_local_tunnel_server(
     tproxy: bool,
 ) -> Result<(), std::io::Error> {
     let listener = new_tcp_listener(addr, tproxy).await?;
-    // let listener = TcpListener::bind(addr).await?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use crate::tunnel::udp_local::start_local_udp_tunnel_server;
+        if tproxy {
+            start_local_udp_tunnel_server(addr, sender.clone())?;
+        }
+    }
 
     tracing::info!("Start local TCP listen at {}", addr);
     let mut tunnel_id_seed: u32 = 0;

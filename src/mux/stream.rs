@@ -1,6 +1,6 @@
 use crate::utils;
+use crate::utils::fill_read_buf;
 use anyhow::Result;
-use bytes::Buf;
 use bytes::BytesMut;
 use futures::ready;
 use futures::SinkExt;
@@ -39,23 +39,6 @@ pub enum Control {
     StreamClose(u32, bool),
     Ping,
     Close,
-}
-
-fn fill_read_buf(src: &mut BytesMut, dst: &mut ReadBuf<'_>) -> usize {
-    if src.is_empty() {
-        return 0;
-    }
-    let mut n = src.len();
-    if n > dst.remaining() {
-        n = dst.remaining();
-    }
-
-    dst.put_slice(&src[0..n]);
-    src.advance(n);
-    if src.is_empty() {
-        src.clear();
-    }
-    n
 }
 
 impl MuxStream {
@@ -181,7 +164,6 @@ impl AsyncWrite for MuxStream {
             Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
             Ok(_v) => Poll::Ready(Ok(())),
         }
-        //Poll::Ready(Ok(()))
     }
     fn poll_shutdown(
         mut self: Pin<&mut Self>,

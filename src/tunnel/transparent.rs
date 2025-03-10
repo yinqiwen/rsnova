@@ -21,7 +21,7 @@ pub async fn handle_transparent(
         tunnel_id,
         target_addr
     );
-    let msg = Message::open_stream(inbound, target_addr, None);
+    let msg = Message::open_tcp_stream(inbound, target_addr, None);
     sender.send(msg)?;
 
     Ok(())

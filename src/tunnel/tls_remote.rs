@@ -1,9 +1,12 @@
 // use anyhow::Context;
 use anyhow::Result;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 
-// use pki_types::{CertificateDer, PrivateKeyDer};
+use crate::tunnel::client::{mux_client_loop, MuxClient};
 use crate::tunnel::stream::handle_server_stream;
-
+use crate::tunnel::tls_client::TlsConnection;
+use crate::tunnel::Message;
 use crate::{mux, tunnel::ALPN_QUIC_HTTP};
 
 use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Arc, sync::Mutex};
@@ -13,10 +16,6 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::utils::read_private_key;
 use crate::utils::read_tokio_tls_certs;
-
-// fn load_certs(path: &std::path::Path) -> io::Result<Vec<CertificateDer<'static>>> {
-//     certs(&mut BufReader::new(File::open(path)?)).collect()
-// }
 
 pub async fn start_tls_remote_server(
     listen: &SocketAddr,
@@ -65,8 +64,8 @@ pub async fn start_tls_remote_server(
     }
 }
 
-async fn handle_tls_connection(
-    conn: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    conn: T,
     id: u32,
     idle_timeout_secs: usize,
 ) -> Result<()> {

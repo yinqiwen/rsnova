@@ -38,7 +38,11 @@ pub async fn new_tcp_listener(
     transparent: bool,
 ) -> std::io::Result<tokio::net::TcpListener> {
     let socket2_addr = socket2::SockAddr::from(addr.clone());
-    let domain = socket2::Domain::IPV4;
+    let domain = if socket2_addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
     let listen_tcp_socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
     if transparent {
         set_ip_transparent(&listen_tcp_socket)?;
@@ -54,6 +58,33 @@ pub async fn new_tcp_listener(
 ) -> std::io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::bind(addr).await
 }
+#[cfg(target_os = "linux")]
+pub fn new_udp_listener(
+    addr: &SocketAddr,
+    transparent: bool,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket2_addr = socket2::SockAddr::from(addr.clone());
+    let domain = if socket2_addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let listen_udp_socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+    if transparent {
+        set_ip_transparent(&listen_udp_socket)?;
+    }
+    // Ok(listen_udp_socket)
+    listen_udp_socket.bind(&socket2_addr.into())?;
+    tokio::net::UdpSocket::from_std(listen_udp_socket.into())
+}
+
+// #[cfg(not(target_os = "linux"))]
+// pub async fn new_udp_listener(
+//     addr: &SocketAddr,
+//     transparent: bool,
+// ) -> std::io::Result<tokio::net::UdpSocket> {
+//     tokio::net::UdpSocket::bind(addr).await
+// }
 
 #[cfg(target_os = "linux")]
 fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
@@ -135,4 +166,50 @@ pub fn get_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
         std::io::ErrorKind::Other,
         "not supported in current os",
     ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_destination_addr(msg: &libc::msghdr) -> std::io::Result<SocketAddr> {
+    use std::{io::Error, io::ErrorKind, mem, ptr};
+
+    use socket2::SockAddr;
+    unsafe {
+        let (_, addr) = SockAddr::try_init(|dst_addr, dst_addr_len| {
+            let mut cmsg: *mut libc::cmsghdr = libc::CMSG_FIRSTHDR(msg);
+            while !cmsg.is_null() {
+                let rcmsg = &*cmsg;
+                match (rcmsg.cmsg_level, rcmsg.cmsg_type) {
+                    (libc::SOL_IP, libc::IP_RECVORIGDSTADDR) => {
+                        ptr::copy(
+                            libc::CMSG_DATA(cmsg),
+                            dst_addr as *mut _,
+                            mem::size_of::<libc::sockaddr_in>(),
+                        );
+                        *dst_addr_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+                        return Ok(());
+                    }
+                    (libc::SOL_IPV6, libc::IPV6_RECVORIGDSTADDR) => {
+                        ptr::copy(
+                            libc::CMSG_DATA(cmsg),
+                            dst_addr as *mut _,
+                            mem::size_of::<libc::sockaddr_in6>(),
+                        );
+                        *dst_addr_len = mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+            }
+            let err = Error::new(
+                ErrorKind::InvalidData,
+                "missing destination address in msghdr",
+            );
+            Err(err)
+        })?;
+
+        Ok(addr.as_socket().expect("SocketAddr"))
+    }
 }

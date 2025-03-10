@@ -8,11 +8,12 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use url::Url;
 
-use rustls::crypto::{aws_lc_rs as provider, CryptoProvider};
+// use rustls::crypto::{aws_lc_rs as provider, CryptoProvider};
 
 use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
+use super::tls_remote::handle_tls_connection;
 use super::Message;
 use crate::mux::MuxStream;
 use crate::mux::{self};
@@ -20,8 +21,8 @@ use crate::tunnel::ALPN_QUIC_HTTP;
 use crate::utils::read_tokio_tls_certs;
 
 pub struct TlsConnection {
-    inner: Option<mux::Connection>,
-    id: u32,
+    pub(crate) inner: Option<mux::Connection>,
+    pub(crate) id: u32,
 }
 
 impl MuxConnection for TlsConnection {
@@ -63,6 +64,10 @@ impl MuxConnection for TlsConnection {
                 }
             },
         }
+    }
+
+    fn set_connection(&mut self, new_c: Self) {
+        *self = new_c;
     }
 }
 
@@ -126,18 +131,6 @@ async fn new_tls_connection(
         roots.add(cert).unwrap();
     }
 
-    // let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder_with_provider(
-    //     CryptoProvider {
-    //         cipher_suites: vec![provider::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256],
-    //         kx_groups: vec![provider::kx_group::X25519],
-    //         ..provider::default_provider()
-    //     }
-    //     .into(),
-    // )
-    // .with_protocol_versions(&[&rustls::version::TLS13])
-    // .unwrap()
-    // .with_root_certificates(roots)
-    // .with_no_client_auth();
     let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder()
         // .with_safe_defaults()
         .with_root_certificates(roots)

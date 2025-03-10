@@ -1,6 +1,8 @@
 mod client;
 mod http_local;
 mod local;
+#[cfg(target_os = "linux")]
+mod udp_local;
 
 mod socks5_local;
 mod stream;

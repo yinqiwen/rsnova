@@ -63,7 +63,7 @@ pub async fn handle_http(
     let target_addr = extract_target(&headers_buf, ":80")?;
 
     tracing::info!("{}", target_addr);
-    let msg = Message::open_stream(inbound, target_addr, Some(headers_buf));
+    let msg = Message::open_tcp_stream(inbound, target_addr, Some(headers_buf));
     sender.send(msg)?;
     Ok(())
 }
@@ -84,7 +84,7 @@ pub async fn handle_https(
         Err(_) => extract_target(&headers_buf, ":443")?,
     };
     tracing::info!("[{}]Handle HTTPS proxy to {} ", tunnel_id, target_addr);
-    let msg = Message::open_stream(inbound, target_addr, None);
+    let msg = Message::open_tcp_stream(inbound, target_addr, None);
     sender.send(msg)?;
     Ok(())
 }

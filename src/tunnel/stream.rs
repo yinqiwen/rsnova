@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
+
 use futures::future::try_join;
+
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
@@ -13,6 +15,7 @@ use tokio::time::timeout;
 use crate::mux::event::{self, OpenStreamEvent};
 use crate::tunnel::CHECK_TIMEOUT_SECS;
 use crate::tunnel::DEFAULT_TIMEOUT_SECS;
+use crate::utils::UdpClientStream;
 
 struct TransferState {
     abort: AtomicBool,
@@ -102,10 +105,7 @@ async fn timeout_copy<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     state: Arc<TransferState>,
 ) -> Result<()> {
     let result = timeout_copy_impl(r, w, timeout_sec, state).await;
-    // if result.is_err() {
     w.shutdown().await?;
-    // }
-
     result
 }
 
@@ -163,19 +163,23 @@ pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteEx
             let (open_event, _len): (OpenStreamEvent, usize) =
                 bincode::decode_from_slice(&ev.body[..], config)?;
             tracing::info!("[{}]recv open event:{:?}", ev.header.stream_id, open_event);
-            let mut remote_stream = timeout(
-                timeout_secs,
-                tokio::net::TcpStream::connect(&open_event.addr),
-            )
-            .await??;
-            let (mut remote_receiver, mut remote_sender) = remote_stream.split();
-            let mut stream: Stream<
-                LR,
-                LW,
-                tokio::net::tcp::ReadHalf<'_>,
-                tokio::net::tcp::WriteHalf<'_>,
-            > = Stream::new(lr, lw, &mut remote_receiver, &mut remote_sender);
-            stream.transfer(idle_timeout_secs).await
+            if open_event.proto == "udp" {
+                let udp_socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+                udp_socket.connect(&open_event.addr).await?;
+                let udp_stream = UdpClientStream::new(udp_socket);
+                let (mut remote_receiver, mut remote_sender) = tokio::io::split(udp_stream);
+                let mut stream = Stream::new(lr, lw, &mut remote_receiver, &mut remote_sender);
+                stream.transfer(idle_timeout_secs).await
+            } else {
+                let mut remote_stream = timeout(
+                    timeout_secs,
+                    tokio::net::TcpStream::connect(&open_event.addr),
+                )
+                .await??;
+                let (mut remote_receiver, mut remote_sender) = remote_stream.split();
+                let mut stream = Stream::new(lr, lw, &mut remote_receiver, &mut remote_sender);
+                stream.transfer(idle_timeout_secs).await
+            }
         }
     }
 }

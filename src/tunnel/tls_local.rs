@@ -134,7 +134,7 @@ pub async fn handle_tls(
         super::transparent::handle_transparent(tunnel_id, inbound, sender).await
     } else {
         tracing::info!("[{}]Handle TLS proxy to {} ", tunnel_id, target_addr);
-        let msg = Message::open_stream(inbound, target_addr, None);
+        let msg = Message::open_tcp_stream(inbound, target_addr, None);
         sender.send(msg)?;
         Ok(())
     }

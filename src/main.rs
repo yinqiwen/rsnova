@@ -13,9 +13,6 @@ use tokio::time;
 use url::Url;
 use veil::Redact;
 
-// use axum::http::StatusCode;
-// use axum::response::IntoResponse;
-
 mod mux;
 mod tunnel;
 mod utils;
@@ -45,7 +42,7 @@ enum Protocol {
     Quic,
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum Role {
     Client,
     Server,
@@ -107,10 +104,6 @@ struct Args {
     log: String,
 }
 
-// async fn handler() -> Html<&'static str> {
-//     Html("<h1>Hello, World!</h1>")
-// }
-
 fn rcgen(tls_host: &String) {
     let cert_path = std::path::PathBuf::from(r"./cert.pem");
     let key_path = std::path::PathBuf::from(r"./key.pem");
@@ -133,29 +126,6 @@ fn rcgen(tls_host: &String) {
         println!("failed to write certificate:{}", e);
     }
 }
-
-// pub async fn profile_get_heap() -> Result<impl IntoResponse, (StatusCode, String)> {
-//     let mut prof_ctl = jemalloc_pprof::PROF_CTL.as_ref().unwrap().lock().await;
-//     require_profiling_activated(&prof_ctl)?;
-//     let pprof = prof_ctl
-//         .dump_pprof()
-//         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-//     Ok(pprof)
-// }
-
-// /// Checks whether jemalloc profiling is activated an returns an error response if not.
-// fn require_profiling_activated(
-//     prof_ctl: &jemalloc_pprof::JemallocProfCtl,
-// ) -> Result<(), (StatusCode, String)> {
-//     if prof_ctl.activated() {
-//         Ok(())
-//     } else {
-//         Err((
-//             axum::http::StatusCode::FORBIDDEN,
-//             "heap profiling not activated".into(),
-//         ))
-//     }
-// }
 
 async fn service_main(args: &Args) -> anyhow::Result<()> {
     if args.profile {
@@ -264,6 +234,8 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[macro_use]
+extern crate cfg_if;
 fn main() {
     let args: Args = Args::parse();
 

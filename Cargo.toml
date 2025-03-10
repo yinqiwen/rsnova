@@ -25,8 +25,8 @@ anyhow = "1.0"
 url = "2.5.0"
 bincode = "2.0.0-rc.3"
 tokio-rustls = "0.26"
-tokio-util = { version = "0.7", features = ["compat"] }
-httparse = "1.8.0"
+tokio-util = { version = "0.7", features = ["compat", "io", "codec", "net"] }
+httparse = "1.9"
 bytes = "1"
 futures = "0.3"
 metrics = "0.21"
@@ -36,6 +36,8 @@ pki-types = { package = "rustls-pki-types", version = "1" }
 s2n-quic = { version = "1", optional = true }
 quinn = { version = "0.11", optional = true }
 socket2 = "0.5"
+cfg-if = "1.0"
+lru = "0.12.5"
 # axum = "0.7.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]

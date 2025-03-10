@@ -11,10 +11,11 @@ use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
 use super::Message;
+use crate::tunnel::stream::handle_server_stream;
 
 pub struct S2NQuicConnection {
-    inner: Option<s2n_quic::Connection>,
-    endpoint: Arc<s2n_quic::client::Client>,
+    pub(crate) inner: Option<s2n_quic::Connection>,
+    pub(crate) endpoint: Arc<s2n_quic::client::Client>,
 }
 
 impl MuxConnection for S2NQuicConnection {
@@ -66,6 +67,10 @@ impl MuxConnection for S2NQuicConnection {
                 }
             },
         }
+    }
+
+    fn set_connection(&mut self, new_c: Self) {
+        *self = new_c;
     }
 }
 
