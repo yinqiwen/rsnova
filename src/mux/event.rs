@@ -18,6 +18,7 @@ pub const FLAG_SHUTDOWN: u8 = 7;
 // pub const FLAG_ROUTINE: u8 = 9;
 
 pub const EVENT_HEADER_LEN: usize = 8;
+pub const MAX_EVENT_BODY_LEN: u32 = 16 * 1024 * 1024; // 16MB
 
 // pub fn get_event_type_str(flags: u8) -> &'static str {
 //     match flags {
@@ -205,6 +206,12 @@ where
         stream_id: u32::from_le_bytes(hbuf[4..8].try_into().unwrap()),
     };
     let body_data_len = header.len();
+    if body_data_len > MAX_EVENT_BODY_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("event body too large: {}", body_data_len),
+        ));
+    }
     let mut dbuf = vec![0; body_data_len as usize];
     if body_data_len > 0 {
         let _ = reader.read_exact(&mut dbuf).await?;

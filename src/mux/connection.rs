@@ -90,34 +90,27 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         while let Ok(ev) = event::read_event(&mut buf_reader).await {
             match ev.header.flags() {
                 event::FLAG_SYN => {
-                    //tracing::info!("recv syn:{}", ev.header.stream_id);
                     let (sender, receiver) =
                         mpsc::channel::<Option<Vec<u8>>>(DEFAULT_STREAM_CHANNEL_SIZE);
-                    let _ = ev_writer
-                        .send(Control::NewStream((
-                            ev.header.stream_id,
-                            sender,
-                            Some(receiver),
-                        )))
-                        .await;
+                    let ctrl = Control::NewStream((ev.header.stream_id, sender, Some(receiver)));
+                    if ev_writer.send(ctrl).await.is_err() {
+                        break;
+                    }
                 }
                 event::FLAG_FIN => {
-                    let _ = ev_writer
-                        .send(Control::StreamClose(ev.header.stream_id, true))
-                        .await;
+                    if ev_writer.send(Control::StreamClose(ev.header.stream_id, true)).await.is_err() {
+                        break;
+                    }
                 }
                 event::FLAG_SHUTDOWN => {
-                    let _ = ev_writer
-                        .send(Control::StreamShutdown(ev.header.stream_id, true))
-                        .await;
+                    if ev_writer.send(Control::StreamShutdown(ev.header.stream_id, true)).await.is_err() {
+                        break;
+                    }
                 }
                 event::FLAG_DATA => {
-                    // if ev.header.flags() == event::FLAG_FIN {
-                    //     tracing::info!("recv fin:{}", ev.header.stream_id);
-                    // }
-                    let _ = ev_writer
-                        .send(Control::StreamData(ev.header.stream_id, ev.body, true))
-                        .await;
+                    if ev_writer.send(Control::StreamData(ev.header.stream_id, ev.body, true)).await.is_err() {
+                        break;
+                    }
                 }
                 event::FLAG_PING => {
                     //
@@ -145,7 +138,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             match ctrl {
                 Control::AcceptStream(callback) => {
                     if accept_callback.is_some() {
-                        let _ = callback.send(Err(anyhow!("duplocate accept")));
+                        let _ = callback.send(Err(anyhow!("duplicate accept")));
                         continue;
                     }
                     accept_callback = Some(callback);
@@ -262,7 +255,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
         //close streams
         metrics::decrement_gauge!("mux.streams", stream_senders.len() as f64);
-        for (_, sender) in stream_senders.drain().take(1) {
+        for (_, sender) in stream_senders.drain() {
             let _ = sender.send(None).await;
         }
         if accept_callback.is_some() {
