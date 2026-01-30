@@ -217,9 +217,10 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                     Some(obj) => {
                         let _ = client.add_connection(*obj);
                     }
-                    None => {}
+                    None => {
+                        tracing::error!("AddConnection failed: connection type mismatch");
+                    }
                 }
-                //client.add_connection(c.into());
             }
         }
     }

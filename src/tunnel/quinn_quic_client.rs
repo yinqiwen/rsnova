@@ -30,7 +30,10 @@ impl MuxConnection for QuinnConnection {
         match &mut self.inner {
             None => Err(anyhow!("null connection")),
             Some(_) => {
-                let _ = self.open_stream().await?;
+                let (mut send, recv) = self.open_stream().await?;
+                // 显式关闭流，避免资源泄漏
+                let _ = send.finish();
+                drop(recv);
                 Ok(())
             }
         }

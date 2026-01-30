@@ -119,7 +119,8 @@ async fn new_tls_connection(
     cert_path: &Path,
     domain: &str,
 ) -> anyhow::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
-    let remote = (url.host_str().unwrap(), url.port().unwrap_or(4433))
+    let host = url.host_str().ok_or_else(|| anyhow!("url has no host"))?;
+    let remote = (host, url.port().unwrap_or(443))
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
