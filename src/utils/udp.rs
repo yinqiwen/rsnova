@@ -1,24 +1,31 @@
 use std::{
     future::Future,
-    io::{self, Error, ErrorKind},
-    mem::{self},
+    io::{self},
     net::SocketAddr,
-    os::fd::AsRawFd,
     pin::Pin,
-    ptr,
     task::{Context, Poll},
 };
 
+#[cfg(target_os = "linux")]
+use std::{
+    io::{Error, ErrorKind},
+    mem,
+    os::fd::AsRawFd,
+    ptr,
+};
+
 use bytes::{Bytes, BytesMut};
+#[cfg(target_os = "linux")]
 use futures::ready;
-use lru::LruCache;
+#[cfg(target_os = "linux")]
 use socket2::SockAddr;
 use tokio::{
-    io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::UdpSocket,
     sync::mpsc,
 };
 
+#[cfg(target_os = "linux")]
 use crate::utils::net::get_destination_addr;
 
 use super::fill_read_buf;
