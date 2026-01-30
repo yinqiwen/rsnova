@@ -5,6 +5,221 @@ use tokio::sync::mpsc;
 
 use crate::tunnel::Message;
 
+/// TLS record and handshake constants (RFC 5246, RFC 6066)
+mod tls {
+    pub const RECORD_TYPE_HANDSHAKE: u8 = 0x16;
+    pub const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
+    pub const EXT_TYPE_SNI: u16 = 0x0000;
+    pub const SNI_NAME_TYPE_HOSTNAME: u8 = 0x00;
+}
+
+/// A simple cursor for parsing binary data with bounds checking
+struct Parser<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        if self.pos >= self.data.len() {
+            return Err(anyhow!("unexpected end of data"));
+        }
+        let val = self.data[self.pos];
+        self.pos += 1;
+        Ok(val)
+    }
+
+    fn read_u16_be(&mut self) -> Result<u16> {
+        if self.pos + 2 > self.data.len() {
+            return Err(anyhow!("unexpected end of data"));
+        }
+        let val = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+        self.pos += 2;
+        Ok(val)
+    }
+
+    fn read_u24_be(&mut self) -> Result<u32> {
+        if self.pos + 3 > self.data.len() {
+            return Err(anyhow!("unexpected end of data"));
+        }
+        let val = ((self.data[self.pos] as u32) << 16)
+            | ((self.data[self.pos + 1] as u32) << 8)
+            | (self.data[self.pos + 2] as u32);
+        self.pos += 3;
+        Ok(val)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        if self.pos + len > self.data.len() {
+            return Err(anyhow!("unexpected end of data"));
+        }
+        let slice = &self.data[self.pos..self.pos + len];
+        self.pos += len;
+        Ok(slice)
+    }
+
+    fn skip(&mut self, len: usize) -> Result<()> {
+        if self.pos + len > self.data.len() {
+            return Err(anyhow!("unexpected end of data"));
+        }
+        self.pos += len;
+        Ok(())
+    }
+}
+
+/// Extract SNI hostname from TLS ClientHello message
+///
+/// TLS Record Layer (RFC 5246 Section 6.2.1):
+/// ```text
+/// struct {
+///     ContentType type;           // 1 byte
+///     ProtocolVersion version;    // 2 bytes
+///     uint16 length;              // 2 bytes
+///     opaque fragment[length];
+/// } TLSPlaintext;
+/// ```
+///
+/// Handshake Protocol (RFC 5246 Section 7.4):
+/// ```text
+/// struct {
+///     HandshakeType msg_type;     // 1 byte
+///     uint24 length;              // 3 bytes
+///     ClientHello body;
+/// } Handshake;
+/// ```
+///
+/// ClientHello (RFC 5246 Section 7.4.1.2):
+/// ```text
+/// struct {
+///     ProtocolVersion client_version;     // 2 bytes
+///     Random random;                      // 32 bytes
+///     SessionID session_id;               // 1 byte length + variable
+///     CipherSuite cipher_suites<2..2^16-2>;
+///     CompressionMethod compression_methods<1..2^8-1>;
+///     Extension extensions<0..2^16-1>;    // optional
+/// } ClientHello;
+/// ```
+///
+/// SNI Extension (RFC 6066 Section 3):
+/// ```text
+/// struct {
+///     NameType name_type;         // 1 byte
+///     opaque HostName<1..2^16-1>; // 2 bytes length + hostname
+/// } ServerName;
+///
+/// struct {
+///     ServerName server_name_list<1..2^16-1>;
+/// } ServerNameList;
+/// ```
+pub async fn peek_sni_v2(stream: &TcpStream) -> Result<String> {
+    // Peek data from socket without consuming
+    let mut buf = vec![0u8; 4096];
+    let n = stream.peek(&mut buf).await?;
+    if n == 0 {
+        return Err(anyhow!("connection closed"));
+    }
+    let buf = &buf[..n];
+
+    let mut p = Parser::new(buf);
+
+    // --- TLS Record Layer ---
+    let content_type = p.read_u8()?;
+    if content_type != tls::RECORD_TYPE_HANDSHAKE {
+        return Err(anyhow!("not a TLS handshake record"));
+    }
+
+    let _record_version = p.read_u16_be()?;
+    let record_length = p.read_u16_be()? as usize;
+
+    if p.remaining() < record_length {
+        return Err(anyhow!("incomplete TLS record"));
+    }
+
+    // --- Handshake Protocol ---
+    let handshake_type = p.read_u8()?;
+    if handshake_type != tls::HANDSHAKE_TYPE_CLIENT_HELLO {
+        return Err(anyhow!("not a ClientHello message"));
+    }
+
+    let handshake_length = p.read_u24_be()? as usize;
+    if p.remaining() < handshake_length {
+        return Err(anyhow!("incomplete ClientHello"));
+    }
+
+    // --- ClientHello ---
+    let _client_version = p.read_u16_be()?;
+    p.skip(32)?; // random
+
+    // Session ID (variable length)
+    let session_id_len = p.read_u8()? as usize;
+    p.skip(session_id_len)?;
+
+    // Cipher Suites (2 bytes length prefix)
+    let cipher_suites_len = p.read_u16_be()? as usize;
+    p.skip(cipher_suites_len)?;
+
+    // Compression Methods (1 byte length prefix)
+    let compression_len = p.read_u8()? as usize;
+    p.skip(compression_len)?;
+
+    // Extensions (optional, 2 bytes length prefix)
+    if p.remaining() < 2 {
+        return Err(anyhow!("no extensions present"));
+    }
+    let extensions_len = p.read_u16_be()? as usize;
+    if p.remaining() < extensions_len {
+        return Err(anyhow!("incomplete extensions data"));
+    }
+
+    // --- Parse Extensions ---
+    let extensions_end = p.pos + extensions_len;
+    while p.pos + 4 <= extensions_end {
+        let ext_type = p.read_u16_be()?;
+        let ext_len = p.read_u16_be()? as usize;
+
+        if p.pos + ext_len > extensions_end {
+            return Err(anyhow!("malformed extension"));
+        }
+
+        if ext_type == tls::EXT_TYPE_SNI {
+            // --- SNI Extension ---
+            let sni_list_len = p.read_u16_be()? as usize;
+            let sni_list_end = p.pos + sni_list_len;
+
+            while p.pos + 3 <= sni_list_end {
+                let name_type = p.read_u8()?;
+                let name_len = p.read_u16_be()? as usize;
+
+                if p.pos + name_len > sni_list_end {
+                    return Err(anyhow!("malformed server name"));
+                }
+
+                let name_bytes = p.read_bytes(name_len)?;
+
+                if name_type == tls::SNI_NAME_TYPE_HOSTNAME {
+                    let hostname = std::str::from_utf8(name_bytes)
+                        .map_err(|_| anyhow!("invalid UTF-8 in SNI hostname"))?;
+                    return Ok(hostname.to_string());
+                }
+            }
+            return Err(anyhow!("no hostname in SNI extension"));
+        }
+
+        // Skip this extension
+        p.skip(ext_len)?;
+    }
+
+    Err(anyhow!("SNI extension not found"))
+}
+
 pub fn valid_tls_version(buf: &[u8]) -> bool {
     if buf.len() < 3 {
         return false;
@@ -27,102 +242,121 @@ pub fn valid_tls_version(buf: &[u8]) -> bool {
 
 pub async fn peek_sni(inbound: &mut TcpStream) -> Result<String> {
     let mut peek_buf: Vec<u8> = vec![0; 4096];
-    let ver_len: usize = 5;
-    let mut peek_cursor: usize = 0;
     let peek_n = inbound.peek(peek_buf.as_mut_slice()).await?;
-    if peek_n < ver_len {
-        return Err(anyhow!("no sufficient peek space for sni"));
+
+    // TLS record header: type(1) + version(2) + length(2) = 5 bytes
+    const TLS_HEADER_LEN: usize = 5;
+    if peek_n < TLS_HEADER_LEN {
+        return Err(anyhow!("insufficient data for TLS header"));
     }
-    let mut n = peek_buf[3] as u16;
-    n = (n << 8) + peek_buf[4] as u16;
-    if n < 42 {
-        return Err(anyhow!("no sufficient space for sni"));
+
+    let record_len = u16::from_be_bytes([peek_buf[3], peek_buf[4]]) as usize;
+    if record_len < 42 {
+        return Err(anyhow!("TLS record too short for ClientHello"));
     }
-    peek_cursor += ver_len;
-    if peek_n < (peek_cursor + n as usize) {
-        return Err(anyhow!("no sufficient peek buffer space for sni"));
+    if peek_n < TLS_HEADER_LEN + record_len {
+        return Err(anyhow!("insufficient peek buffer for TLS record"));
     }
-    if peek_buf[peek_cursor] != 0x01 {
-        return Err(anyhow!("not clienthello handshake"));
+
+    // Handshake header: type(1) + length(3) + version(2) + random(32) = 38 bytes
+    let handshake_start = TLS_HEADER_LEN;
+    if peek_buf[handshake_start] != 0x01 {
+        return Err(anyhow!("not ClientHello handshake"));
     }
-    let rest_buf = &peek_buf.as_slice()[peek_cursor + 38..];
-    let sid_len = rest_buf[0] as usize;
-    let rest_buf = &rest_buf[(1 + sid_len)..];
-    if rest_buf.len() < 2 {
-        return Err(anyhow!("no sufficient space for sni"));
+
+    // Skip to session_id (after handshake header)
+    const HANDSHAKE_HEADER_LEN: usize = 38;
+    let mut pos = handshake_start + HANDSHAKE_HEADER_LEN;
+    if pos >= peek_n {
+        return Err(anyhow!("insufficient data for session_id"));
     }
-    let mut cipher_len = rest_buf[0] as usize;
-    cipher_len = (cipher_len << 8) + rest_buf[1] as usize;
-    if cipher_len % 2 == 1 || rest_buf.len() < 3 + cipher_len {
-        return Err(anyhow!("invalid cipher_len"));
+
+    // Session ID
+    let sid_len = peek_buf[pos] as usize;
+    pos += 1 + sid_len;
+    if pos + 2 > peek_n {
+        return Err(anyhow!("insufficient data for cipher_suites"));
     }
-    let rest_buf = &rest_buf[(2 + cipher_len)..];
-    let compress_method_len = rest_buf[0] as usize;
-    if rest_buf.len() < 1 + compress_method_len {
-        return Err(anyhow!("invalid compress_method_len"));
+
+    // Cipher suites
+    let cipher_len = u16::from_be_bytes([peek_buf[pos], peek_buf[pos + 1]]) as usize;
+    if cipher_len % 2 != 0 {
+        return Err(anyhow!("invalid cipher_suites length"));
     }
-    let rest_buf = &rest_buf[(1 + compress_method_len)..];
-    if rest_buf.len() < 2 {
-        return Err(anyhow!("invalid after compress_method"));
+    pos += 2 + cipher_len;
+    if pos + 1 > peek_n {
+        return Err(anyhow!("insufficient data for compression_methods"));
     }
-    let mut ext_len = rest_buf[0] as usize;
-    ext_len = (ext_len << 8) + rest_buf[1] as usize;
-    let rest_buf = &rest_buf[2..];
-    if rest_buf.len() < ext_len {
-        return Err(anyhow!("invalid ext_len"));
+
+    // Compression methods
+    let compress_len = peek_buf[pos] as usize;
+    pos += 1 + compress_len;
+    if pos + 2 > peek_n {
+        return Err(anyhow!("insufficient data for extensions"));
     }
-    if ext_len == 0 {
-        return Err(anyhow!("no extension in client_hello"));
+
+    // Extensions
+    let ext_total_len = u16::from_be_bytes([peek_buf[pos], peek_buf[pos + 1]]) as usize;
+    pos += 2;
+    if ext_total_len == 0 {
+        return Err(anyhow!("no extensions in ClientHello"));
     }
-    let mut ext_buf = rest_buf;
-    loop {
-        if ext_buf.len() < 4 {
-            return Err(anyhow!("invalid ext buf len"));
+    if pos + ext_total_len > peek_n {
+        return Err(anyhow!("insufficient data for extensions content"));
+    }
+
+    let ext_end = pos + ext_total_len;
+    while pos + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([peek_buf[pos], peek_buf[pos + 1]]);
+        let ext_len = u16::from_be_bytes([peek_buf[pos + 2], peek_buf[pos + 3]]) as usize;
+        pos += 4;
+
+        if pos + ext_len > ext_end {
+            return Err(anyhow!("invalid extension length"));
         }
-        let mut extension = ext_buf[0] as usize;
-        extension = (extension << 8) + ext_buf[1] as usize;
-        let mut length = ext_buf[2] as usize;
-        length = (length << 8) + ext_buf[3] as usize;
-        ext_buf = &ext_buf[4..];
-        if ext_buf.len() < length {
-            return Err(anyhow!("invalid ext buf content"));
-        }
-        if extension == 0 {
-            if length < 2 {
-                return Err(anyhow!("invalid ext buf length"));
+
+        // SNI extension type = 0
+        if ext_type == 0 {
+            if ext_len < 2 {
+                return Err(anyhow!("invalid SNI extension"));
             }
-            let mut num_names = ext_buf[0] as usize;
-            num_names = (num_names << 8) + ext_buf[1] as usize;
-            let mut data = &ext_buf[2..];
-            for _ in 0..num_names {
-                if data.len() < 3 {
-                    return Err(anyhow!("invalid ext data length"));
+            let list_len = u16::from_be_bytes([peek_buf[pos], peek_buf[pos + 1]]) as usize;
+            if list_len + 2 > ext_len {
+                return Err(anyhow!("invalid server_name_list length"));
+            }
+
+            let mut sni_pos = pos + 2;
+            let sni_end = pos + 2 + list_len;
+            while sni_pos + 3 <= sni_end {
+                let name_type = peek_buf[sni_pos];
+                let name_len = u16::from_be_bytes([peek_buf[sni_pos + 1], peek_buf[sni_pos + 2]]) as usize;
+                sni_pos += 3;
+
+                if sni_pos + name_len > sni_end {
+                    return Err(anyhow!("invalid ServerName length"));
                 }
-                let name_type = data[0];
-                let mut name_len = data[1] as usize;
-                name_len = (name_len << 8) + data[2] as usize;
-                data = &data[3..];
-                if data.len() < name_len {
-                    return Err(anyhow!("invalid ext name data"));
-                }
+
+                // name_type 0 = host_name
                 if name_type == 0 {
-                    let server_name = String::from_utf8_lossy(&data[0..name_len]);
+                    let server_name = String::from_utf8_lossy(&peek_buf[sni_pos..sni_pos + name_len]);
                     tracing::info!("Peek SNI:{}", server_name);
                     return Ok(String::from(server_name));
                 }
-                data = &data[name_len..];
+                sni_pos += name_len;
             }
         }
-        ext_buf = &ext_buf[length..];
+        pos += ext_len;
     }
+
+    Err(anyhow!("SNI extension not found"))
 }
 
 pub async fn handle_tls(
     tunnel_id: u32,
-    mut inbound: TcpStream,
+    inbound: TcpStream,
     sender: mpsc::UnboundedSender<Message>,
 ) -> Result<()> {
-    let target_addr = match peek_sni(&mut inbound).await {
+    let target_addr = match peek_sni_v2(&inbound).await {
         Ok(mut sni) => {
             sni.push_str(":443");
             sni

@@ -150,12 +150,13 @@ pub fn new_ping_event() -> Event {
     }
 }
 
-pub fn new_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> Event {
+pub fn new_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> anyhow::Result<Event> {
     let config = config::standard();
-    let data: Vec<u8> = bincode::encode_to_vec(msg, config).unwrap();
+    let data: Vec<u8> = bincode::encode_to_vec(msg, config)
+        .map_err(|e| anyhow::anyhow!("encode open stream event failed: {}", e))?;
     let mut ev = new_event(sid, &data[..]);
     ev.header.set_flag(FLAG_OPEN);
-    ev
+    Ok(ev)
 }
 
 pub async fn write_event<T>(writer: &mut T, ev: Event) -> anyhow::Result<()>
@@ -202,8 +203,8 @@ where
     reader.read_exact(&mut hbuf).await?;
 
     let header = Header {
-        flag_len: u32::from_le_bytes(hbuf[0..4].try_into().unwrap()),
-        stream_id: u32::from_le_bytes(hbuf[4..8].try_into().unwrap()),
+        flag_len: u32::from_le_bytes([hbuf[0], hbuf[1], hbuf[2], hbuf[3]]),
+        stream_id: u32::from_le_bytes([hbuf[4], hbuf[5], hbuf[6], hbuf[7]]),
     };
     let body_data_len = header.len();
     if body_data_len > MAX_EVENT_BODY_LEN {

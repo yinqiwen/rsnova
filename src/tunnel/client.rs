@@ -160,47 +160,65 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                     tokio::spawn(async move {
                         if let Some(mut tcp_stream) = event.tcp_stream {
                             let (mut local_reader, mut local_writer) = tcp_stream.split();
-                            let ev = event::new_open_stream_event(0, &event.event);
+                            let ev = match event::new_open_stream_event(0, &event.event) {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    tracing::error!("create open stream event failed:{}", e);
+                                    decrement_gauge!("client_proxy_streams", 1.0);
+                                    return;
+                                }
+                            };
                             if let Err(e) = event::write_event(&mut send, ev).await {
                                 tracing::error!("write open stream event failed:{}", e);
-                            } else {
-                                if let Some(payload) = event.payload {
-                                    if let Err(e) = send.write_all(&payload).await {
-                                        tracing::error!("write payload failed:{}", e);
-                                        return;
-                                    }
+                                decrement_gauge!("client_proxy_streams", 1.0);
+                                return;
+                            }
+                            if let Some(payload) = event.payload {
+                                if let Err(e) = send.write_all(&payload).await {
+                                    tracing::error!("write payload failed:{}", e);
+                                    decrement_gauge!("client_proxy_streams", 1.0);
+                                    return;
                                 }
-                                let mut stream = Stream::new(
-                                    &mut local_reader,
-                                    &mut local_writer,
-                                    &mut recv,
-                                    &mut send,
-                                );
-                                if let Err(e) = stream.transfer(idle_timeout_secs).await {
-                                    tracing::error!("transfer finish:{}", e);
-                                }
+                            }
+                            let mut stream = Stream::new(
+                                &mut local_reader,
+                                &mut local_writer,
+                                &mut recv,
+                                &mut send,
+                            );
+                            if let Err(e) = stream.transfer(idle_timeout_secs).await {
+                                tracing::error!("transfer finish:{}", e);
                             }
                         } else if let Some(udp_stream) = event.udp_stream {
                             let (mut local_reader, mut local_writer) = tokio::io::split(udp_stream);
-                            let ev = event::new_open_stream_event(0, &event.event);
+                            let ev = match event::new_open_stream_event(0, &event.event) {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    tracing::error!("create open stream event failed:{}", e);
+                                    decrement_gauge!("client_proxy_streams", 1.0);
+                                    return;
+                                }
+                            };
                             if let Err(e) = event::write_event(&mut send, ev).await {
                                 tracing::error!("write open stream event failed:{}", e);
-                            } else {
-                                if let Some(payload) = event.payload {
-                                    if let Err(e) = send.write_all(&payload).await {
-                                        tracing::error!("write payload failed:{}", e);
-                                        return;
-                                    }
+                                decrement_gauge!("client_proxy_streams", 1.0);
+                                return;
+                            }
+                            if let Some(payload) = event.payload {
+                                if let Err(e) = send.write_all(&payload).await {
+                                    tracing::error!("write payload failed:{}", e);
+                                    decrement_gauge!("client_proxy_streams", 1.0);
+                                    return;
                                 }
-                                let mut stream = Stream::new(
-                                    &mut local_reader,
-                                    &mut local_writer,
-                                    &mut recv,
-                                    &mut send,
-                                );
-                                if let Err(e) = stream.transfer(idle_timeout_secs).await {
-                                    tracing::error!("transfer finish:{}", e);
-                                }
+                            }
+                            let mut stream = Stream::new(
+                                &mut local_reader,
+                                &mut local_writer,
+                                &mut recv,
+                                &mut send,
+                            );
+                            if let Err(e) = stream.transfer(idle_timeout_secs).await {
+                                tracing::error!("transfer finish:{}", e);
                             }
                         }
                         decrement_gauge!("client_proxy_streams", 1.0);

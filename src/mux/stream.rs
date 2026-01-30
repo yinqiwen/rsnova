@@ -192,11 +192,11 @@ impl Drop for MuxStream {
     fn drop(&mut self) {
         if let Some(sender) = self.ev_writer.get_ref() {
             if !self.close_by_remote {
-                let ctrl_sender = sender.clone();
-                let stream_drop = Control::StreamClose(self.id, false);
-                tokio::spawn(async move {
-                    let _ = ctrl_sender.send(stream_drop).await;
-                });
+                let stream_close = Control::StreamClose(self.id, false);
+                // 使用 try_send 避免在 Drop 中 spawn 异步任务
+                if let Err(e) = sender.try_send(stream_close) {
+                    tracing::debug!("stream {} drop send close failed: {}", self.id, e);
+                }
             }
         }
     }

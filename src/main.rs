@@ -104,27 +104,24 @@ struct Args {
     log: String,
 }
 
-fn rcgen(tls_host: &String) {
+fn rcgen(tls_host: &String) -> anyhow::Result<()> {
     let cert_path = std::path::PathBuf::from(r"./cert.pem");
     let key_path = std::path::PathBuf::from(r"./key.pem");
-    // let cert_der_path = std::path::PathBuf::from(r"./cert.der");
 
     println!(
         "generating self-signed certificate at {:?}  & {:?} with host:{}",
         cert_path, key_path, tls_host,
     );
     let rcgen::CertifiedKey { cert, key_pair } =
-        rcgen::generate_simple_self_signed(vec![tls_host.into()]).unwrap();
+        rcgen::generate_simple_self_signed(vec![tls_host.into()])
+            .map_err(|e| anyhow!("generate cert failed: {}", e))?;
     let key = key_pair.serialize_pem();
     let cert = cert.pem();
 
-    if let Err(e) = fs::write(&cert_path, cert) {
-        println!("failed to write certificate:{}", e);
-        return;
-    }
-    if let Err(e) = fs::write(&key_path, key) {
-        println!("failed to write certificate:{}", e);
-    }
+    fs::write(&cert_path, cert).map_err(|e| anyhow!("write cert failed: {}", e))?;
+    fs::write(&key_path, key).map_err(|e| anyhow!("write key failed: {}", e))?;
+    println!("certificate generated successfully");
+    Ok(())
 }
 
 async fn service_main(args: &Args) -> anyhow::Result<()> {
@@ -152,7 +149,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
     tracing::info!("{args:?}");
 
     let recorder = utils::MetricsLogRecorder::new(Duration::from_secs(10));
-    metrics::set_boxed_recorder(Box::new(recorder)).unwrap();
+    if let Err(e) = metrics::set_boxed_recorder(Box::new(recorder)) {
+        tracing::warn!("set metrics recorder failed: {}", e);
+    }
 
     match args.role {
         Role::Client => {
@@ -240,16 +239,18 @@ fn main() {
     let args: Args = Args::parse();
 
     if args.rcgen {
-        rcgen(&args.tls_host);
+        if let Err(e) = rcgen(&args.tls_host) {
+            eprintln!("rcgen failed: {}", e);
+        }
         return;
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.threads)
         .enable_all()
         .thread_stack_size(args.thread_stack_size)
         .build()
-        .unwrap()
-        .block_on(async {
+        .expect("failed to build tokio runtime");
+    runtime.block_on(async {
             if let Err(e) = service_main(&args).await {
                 tracing::error!("service_main error:{e:?}");
             }

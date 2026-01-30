@@ -129,7 +129,9 @@ async fn new_tls_connection(
 
     let mut roots = rustls::RootCertStore::empty();
     for cert in certs {
-        roots.add(cert).unwrap();
+        if let Err(e) = roots.add(cert) {
+            tracing::warn!("add cert to root store failed: {}", e);
+        }
     }
 
     let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder()

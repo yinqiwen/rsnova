@@ -1,0 +1,49 @@
+#!/usr/bin/env nft -f
+
+# 清除现有的规则和创建新的表
+flush chain inet global RSNOVA
+
+# 定义变量以简化维护
+define remote_servers = { 119.28.76.86, 43.155.93.10 }
+define local_networks = {
+    0.0.0.0/8,
+    10.0.0.0/8,
+    127.0.0.0/8,
+    169.254.0.0/16,
+    172.16.0.0/12,
+    192.168.0.0/16,
+    224.0.0.0/4,
+    240.0.0.0/4
+}
+
+# 创建一个新的表用于nat
+table inet global {
+
+    # 创建一个自定义链RSNOVA
+    chain RSNOVA {
+        type nat hook prerouting priority -100; policy accept;
+
+        ip daddr $remote_servers return
+
+        ip daddr $local_networks return
+
+        # 如果存在chnip集合，匹配并返回
+        ip daddr @chnip return
+        ip daddr @chnip6 return
+
+        # 匹配gfwip集合中的IPv4地址，并重定向到端口48100
+        ip daddr @gfwip tcp redirect to :48100
+
+        # # 匹配gfwip6集合中的IPv6地址，并重定向到端口48100
+        ip6 daddr @gfwip6 tcp redirect to 48100
+
+        # 所有其他TCP流量返回
+        return
+    }
+
+    # 将PREROUTING链中的TCP流量发送到RSNOVA链
+    chain PREROUTING {
+        type nat hook prerouting priority -100; policy accept;
+        ip protocol tcp jump RSNOVA
+    }
+}

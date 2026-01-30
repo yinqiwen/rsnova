@@ -1,19 +1,34 @@
 use crate::tunnel::Message;
 use anyhow::{anyhow, Result};
 
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 use crate::tunnel::tls_local;
 
+const MAX_HTTP_HEADER_SIZE: usize = 64 * 1024; // 64KB
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn read_http_headers(inbound: &mut TcpStream) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
-    let crlf2 = "\r\n\r\n".as_bytes();
+    let crlf2 = b"\r\n\r\n";
     loop {
         let mut tmp_buf = [0; 4096];
-        let n = inbound.read(&mut tmp_buf).await?;
+        let n = match timeout(HTTP_HEADER_READ_TIMEOUT, inbound.read(&mut tmp_buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(anyhow!("read http header timeout")),
+        };
+        if n == 0 {
+            return Err(anyhow!("connection closed before headers complete"));
+        }
         buf.extend_from_slice(&tmp_buf[0..n]);
+        if buf.len() > MAX_HTTP_HEADER_SIZE {
+            return Err(anyhow!("http header too large"));
+        }
         if let Some(_pos) = buf.windows(crlf2.len()).position(|window| window == crlf2) {
             return Ok(buf);
         }

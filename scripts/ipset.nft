@@ -1,0 +1,25 @@
+#!/usr/sbin/nft -f
+
+table ip mysets {
+    set gfwip {
+        type ipv4_addr
+    }
+    set chnip {
+        type ipv4_addr
+    }
+    set gfwip6 {
+        type ipv6_addr
+    }
+    set chnip6 {
+        type ipv6_addr
+    }
+}
+table inet global {
+    set chnroute {
+        type ipv4_addr
+    }
+    set chnroute6 {
+        type ipv6_addr
+    }
+}
+

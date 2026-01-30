@@ -116,22 +116,23 @@ impl MuxClient<QuinnConnection> {
 fn new_quic_endpoint(_url: &Url, cert_path: &Path) -> anyhow::Result<quinn::Endpoint> {
     let certs = read_tokio_tls_certs(cert_path)?;
     let mut roots = rustls::RootCertStore::empty();
-    // roots.add(CertificateDer::from(std::fs::read(cert_path)?))?;
     for cert in certs {
-        roots.add(cert).unwrap();
+        if let Err(e) = roots.add(cert) {
+            tracing::warn!("add cert to root store failed: {}", e);
+        }
     }
 
     let mut client_crypto = rustls::ClientConfig::builder()
-        // .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
 
     client_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
 
-    // let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
     let client_config =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+    let bind_addr: std::net::SocketAddr = "[::]:0".parse()
+        .map_err(|e| anyhow!("parse bind addr failed: {}", e))?;
+    let mut endpoint = quinn::Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
@@ -140,7 +141,8 @@ async fn new_quic_connection(
     url: &Url,
     host: &str,
 ) -> anyhow::Result<quinn::Connection> {
-    let remote = (url.host_str().unwrap(), url.port().unwrap_or(4433))
+    let url_host = url.host_str().ok_or_else(|| anyhow!("url has no host"))?;
+    let remote = (url_host, url.port().unwrap_or(443))
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
