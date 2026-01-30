@@ -1,19 +1,12 @@
 use anyhow::anyhow;
 use anyhow::Result;
-use tokio::sync::mpsc;
 use url::Url;
 
-use std::path::PathBuf;
 use std::{net::SocketAddr, path::Path};
 
-use crate::tunnel::{client::MuxClientTrait, stream::handle_server_stream};
+use crate::tunnel::stream::handle_server_stream;
 
-use super::client::mux_client_loop;
-use super::{
-    client::{MuxClient, MuxConnection},
-    s2n_quic_client::S2NQuicConnection,
-    Message,
-};
+use super::client::MuxConnection;
 
 pub async fn start_quic_remote_server(
     listen: &SocketAddr,
@@ -51,6 +44,7 @@ pub async fn start_quic_remote_server(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub struct S2NReverseQuicConnection {
     pub(crate) inner: Option<s2n_quic::Connection>,
 }
@@ -75,7 +69,7 @@ impl MuxConnection for S2NReverseQuicConnection {
             }
         }
     }
-    async fn connect(&mut self, _url: &Url, _key_path: &Path, host: &str) -> anyhow::Result<()> {
+    async fn connect(&mut self, _url: &Url, _key_path: &Path, _host: &str) -> anyhow::Result<()> {
         Err(anyhow!("unsupported connection"))
     }
     async fn open_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)> {

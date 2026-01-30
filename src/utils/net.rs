@@ -54,7 +54,7 @@ pub async fn new_tcp_listener(
 #[cfg(not(target_os = "linux"))]
 pub async fn new_tcp_listener(
     addr: &SocketAddr,
-    transparent: bool,
+    _transparent: bool,
 ) -> std::io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::bind(addr).await
 }
@@ -91,7 +91,8 @@ fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
     socket.set_ip_transparent(true)
 }
 #[cfg(not(target_os = "linux"))]
-fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
+#[allow(dead_code)]
+fn set_ip_transparent(_socket: &socket2::Socket) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -161,7 +162,7 @@ pub fn get_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn get_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
+pub fn get_original_dst(_stream: &TcpStream) -> std::io::Result<SocketAddr> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Other,
         "not supported in current os",

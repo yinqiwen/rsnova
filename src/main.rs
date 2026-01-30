@@ -233,7 +233,6 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[macro_use]
 extern crate cfg_if;
 fn main() {
     let args: Args = Args::parse();

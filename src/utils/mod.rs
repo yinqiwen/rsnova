@@ -21,4 +21,5 @@ pub use tls::read_private_key;
 pub use tls::read_tokio_tls_certs;
 pub use udp::{UdpClientStream, UdpServerStream};
 
+#[allow(dead_code)]
 pub const MAXIMUM_UDP_PAYLOAD_SIZE: usize = 65536;

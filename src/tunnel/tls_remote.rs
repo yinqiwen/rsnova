@@ -1,12 +1,8 @@
 // use anyhow::Context;
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
 
-use crate::tunnel::client::{mux_client_loop, MuxClient};
 use crate::tunnel::stream::handle_server_stream;
-use crate::tunnel::tls_client::TlsConnection;
-use crate::tunnel::Message;
 use crate::{mux, tunnel::ALPN_QUIC_HTTP};
 
 use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Arc, sync::Mutex};

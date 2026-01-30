@@ -11,7 +11,6 @@ use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
 use super::Message;
-use crate::tunnel::stream::handle_server_stream;
 
 pub struct S2NQuicConnection {
     pub(crate) inner: Option<s2n_quic::Connection>,

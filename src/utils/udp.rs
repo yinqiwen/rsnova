@@ -67,6 +67,7 @@ impl AsyncWrite for UdpClientStream {
     }
 }
 
+#[allow(dead_code)]
 pub struct UdpServerStream {
     recv_buf: BytesMut,
     receiver: mpsc::Receiver<Bytes>,
@@ -76,6 +77,7 @@ pub struct UdpServerStream {
 }
 
 impl UdpServerStream {
+    #[allow(dead_code)]
     pub fn new(
         receiver: mpsc::Receiver<Bytes>,
         tunnel_sender: mpsc::Sender<(Bytes, SocketAddr)>,
@@ -126,8 +128,8 @@ impl AsyncRead for UdpServerStream {
 impl AsyncWrite for UdpServerStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         todo!()
     }
@@ -141,6 +143,7 @@ impl AsyncWrite for UdpServerStream {
     }
 }
 
+#[allow(dead_code)]
 pub trait TproxyUdpSocket {
     /// Receive a single datagram from the socket.
     ///
@@ -197,6 +200,7 @@ impl TproxyUdpSocket for LinuxTproxyUdpSocket {
     }
 }
 
+#[allow(dead_code)]
 pub struct RecvDestFrom<'a, S: 'a> {
     socket: &'a S,
     buf: &'a mut [u8],

@@ -13,6 +13,7 @@ use crate::utils::UdpServerStream;
 
 pub struct OpenStreamRequest {
     tcp_stream: Option<tokio::net::TcpStream>,
+    #[allow(dead_code)]
     udp_stream: Option<UdpServerStream>,
     event: OpenStreamEvent,
     payload: Option<Vec<u8>>,
@@ -34,6 +35,7 @@ impl OpenStreamRequest {
             payload,
         }
     }
+    #[allow(dead_code)]
     pub fn from_udp(stream: UdpServerStream, target: String, payload: Option<Vec<u8>>) -> Self {
         Self {
             tcp_stream: None,
@@ -47,6 +49,7 @@ impl OpenStreamRequest {
     }
 }
 
+#[allow(dead_code)]
 pub enum Message {
     OpenStream(OpenStreamRequest),
     HealthCheck,
@@ -62,6 +65,7 @@ impl Message {
         Message::OpenStream(req)
     }
 
+    #[allow(dead_code)]
     pub fn open_udp_stream(
         stream: UdpServerStream,
         target: String,

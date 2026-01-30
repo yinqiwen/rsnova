@@ -13,7 +13,6 @@ use url::Url;
 use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
-use super::tls_remote::handle_tls_connection;
 use super::Message;
 use crate::mux::MuxStream;
 use crate::mux::{self};
