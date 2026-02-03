@@ -1,3 +1,4 @@
+mod autoproxy;
 mod clean;
 mod error;
 mod io;
@@ -6,6 +7,7 @@ mod net;
 mod tls;
 mod udp;
 
+pub use autoproxy::fetch_and_generate_pac;
 pub use clean::clean_rotate_logs;
 pub use error::make_io_error;
 pub use io::fill_read_buf;
