@@ -66,9 +66,6 @@ struct Args {
     #[structopt(long = "remote")]
     remote: Option<Url>,
 
-    #[clap(default_value = "127.0.0.1:48101", long, env)]
-    admin: String,
-
     #[clap(long = "key", requires = "cert", default_value = "key.pem")]
     #[redact(partial)]
     key: Option<PathBuf>,
@@ -110,9 +107,9 @@ struct Args {
     #[clap(long, conflicts_with = "autoproxy_url")]
     pac_file: Option<PathBuf>,
 
-    /// PAC server listen address
+    /// HTTP server listen address (serves /pac and /metrics)
     #[clap(long, default_value = "127.0.0.1:48102")]
-    pac_listen: SocketAddr,
+    admin_listen: SocketAddr,
 
     /// AutoProxy list URL for auto-generating PAC (e.g., gfwlist)
     #[clap(long, conflicts_with = "pac_file")]
@@ -151,43 +148,73 @@ fn rcgen(tls_host: &String) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn start_pac_server(listen: &SocketAddr, pac_content: Arc<RwLock<Vec<u8>>>) -> anyhow::Result<()> {
+async fn start_http_server(
+    listen: &SocketAddr,
+    pac_content: Arc<RwLock<Vec<u8>>>,
+    metrics_registry: utils::MetricsRegistry,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!("PAC server listening on {}", listen);
+    tracing::info!("HTTP server listening on {}", listen);
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
         let pac_content = pac_content.clone();
+        let registry = metrics_registry.clone();
+
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
-            // Read HTTP request (we don't need to parse it fully, just drain it)
-            if let Err(e) = stream.read(&mut buf).await {
-                tracing::warn!("PAC server read error from {}: {}", addr, e);
-                return;
-            }
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("HTTP server read error from {}: {}", addr, e);
+                    return;
+                }
+            };
 
-            // Read PAC content with lock
-            let content = pac_content.read().await;
+            // Parse HTTP request to get the path
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
 
-            // Build HTTP response with PAC content
+            tracing::debug!("HTTP request from {}: {}", addr, path);
+
+            let (status, content_type, body) = match path {
+                "/pac" | "/pac.js" | "/" => {
+                    let content = pac_content.read().await;
+                    ("200 OK", "application/x-ns-proxy-autoconfig", content.clone())
+                }
+                "/metrics" => {
+                    let metrics = utils::format_metrics(&registry);
+                    ("200 OK", "text/plain; charset=utf-8", metrics.into_bytes())
+                }
+                _ => {
+                    let body = "404 Not Found\n\nAvailable endpoints:\n  /pac - PAC file\n  /metrics - Server metrics\n";
+                    ("404 Not Found", "text/plain; charset=utf-8", body.as_bytes().to_vec())
+                }
+            };
+
             let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/x-ns-proxy-autoconfig\r\n\
+                "HTTP/1.1 {}\r\n\
+                 Content-Type: {}\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\
                  \r\n",
-                content.len()
+                status,
+                content_type,
+                body.len()
             );
 
             if let Err(e) = stream.write_all(response.as_bytes()).await {
-                tracing::warn!("PAC server write header error to {}: {}", addr, e);
+                tracing::warn!("HTTP server write header error to {}: {}", addr, e);
                 return;
             }
-            if let Err(e) = stream.write_all(&content).await {
-                tracing::warn!("PAC server write body error to {}: {}", addr, e);
+            if let Err(e) = stream.write_all(&body).await {
+                tracing::warn!("HTTP server write body error to {}: {}", addr, e);
                 return;
             }
-            tracing::debug!("PAC served to {}", addr);
         });
     }
 }
@@ -277,7 +304,8 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 
     tracing::info!("{args:?}");
 
-    let recorder = utils::MetricsLogRecorder::new(Duration::from_secs(10));
+    let recorder = utils::MetricsLogRecorder::new();
+    let metrics_registry = recorder.get_registry();
     if let Err(e) = metrics::set_boxed_recorder(Box::new(recorder)) {
         tracing::warn!("set metrics recorder failed: {}", e);
     }
@@ -287,7 +315,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
         let pac_content = fs::read(pac_file)
             .map_err(|e| anyhow!("failed to read PAC file {:?}: {}", pac_file, e))?;
         let pac_content = Arc::new(RwLock::new(pac_content));
-        let pac_listen = args.pac_listen;
+        let admin_listen = args.admin_listen;
 
         // Spawn PAC file watcher for hot reload
         let pac_file_clone = pac_file.clone();
@@ -296,10 +324,11 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
             watch_pac_file(pac_file_clone, pac_content_clone).await;
         });
 
-        // Spawn PAC server
+        // Spawn HTTP server
+        let registry = metrics_registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = start_pac_server(&pac_listen, pac_content).await {
-                tracing::error!("PAC server error: {}", e);
+            if let Err(e) = start_http_server(&admin_listen, pac_content, registry).await {
+                tracing::error!("HTTP server error: {}", e);
             }
         });
     }
@@ -371,7 +400,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 match utils::fetch_and_generate_pac(autoproxy_url, &pac_proxy, Some(&fetch_proxy)).await {
                     Ok(pac_content) => {
                         let pac_content = Arc::new(RwLock::new(pac_content));
-                        let pac_listen = args.pac_listen;
+                        let admin_listen = args.admin_listen;
 
                         // Spawn autoproxy updater if interval > 0
                         if args.autoproxy_update_secs > 0 {
@@ -391,10 +420,11 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             });
                         }
 
-                        // Spawn PAC server
+                        // Spawn HTTP server
+                        let registry = metrics_registry.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = start_pac_server(&pac_listen, pac_content).await {
-                                tracing::error!("PAC server error: {}", e);
+                            if let Err(e) = start_http_server(&admin_listen, pac_content, registry).await {
+                                tracing::error!("HTTP server error: {}", e);
                             }
                         });
                     }
@@ -441,6 +471,11 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 
 extern crate cfg_if;
 fn main() {
+    // Install rustls crypto provider (required for rustls 0.23+)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let args: Args = Args::parse();
 
     if args.rcgen {

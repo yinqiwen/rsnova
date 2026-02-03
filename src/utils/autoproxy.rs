@@ -18,7 +18,9 @@ pub struct AutoProxyList {
 
 impl AutoProxyList {
     pub fn parse(base64_content: &str) -> anyhow::Result<Self> {
-        let decoded = STANDARD.decode(base64_content.trim())?;
+        // Remove all whitespace (newlines, spaces) from base64 content
+        let cleaned: String = base64_content.chars().filter(|c| !c.is_whitespace()).collect();
+        let decoded = STANDARD.decode(&cleaned)?;
         let content = String::from_utf8(decoded)?;
         let mut result = AutoProxyList::default();
 
@@ -134,12 +136,12 @@ impl AutoProxyList {
         }
         pac.push_str("];\n\n");
 
-        // 正则表达式
+        // 正则表达式 - 使用 new RegExp() 避免斜杠转义问题
         pac.push_str("var regexps = [\n");
         for regex in &self.regexps {
-            // 转义正则中的特殊字符用于 JS
-            let escaped = regex.replace('\\', "\\\\");
-            pac.push_str(&format!("  /{}/i,\n", escaped));
+            // 转义反斜杠和引号用于字符串
+            let escaped = regex.replace('\\', "\\\\").replace('"', "\\\"");
+            pac.push_str(&format!("  new RegExp(\"{}\", \"i\"),\n", escaped));
         }
         pac.push_str("];\n\n");
 
