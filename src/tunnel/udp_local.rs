@@ -36,7 +36,7 @@ impl UdpAssociateManager {
 
 pub(crate) fn start_local_udp_tunnel_server(
     addr: &SocketAddr,
-    msg_sender: mpsc::UnboundedSender<Message>,
+    _msg_sender: mpsc::UnboundedSender<Message>,
 ) -> Result<(), std::io::Error> {
     let udp_socket = new_udp_listener(addr, true)?;
     let tproxy_udp_server = LinuxTproxyUdpSocket::new(udp_socket)?;
@@ -72,7 +72,7 @@ pub(crate) fn start_local_udp_tunnel_server(
                     let (sender, receiver) = manager.get(src);
                     if let Some(rx) = receiver{
                         let stream = UdpServerStream::new(rx, tunnel_data_sender.clone(), src);
-                        let msg = Message::open_udp_stream(stream, dst.to_string(), None);
+                        let _msg = Message::open_udp_stream(stream, dst.to_string(), None);
                     }else{
                         let _ = sender.send(data).await;
                     }
@@ -80,7 +80,7 @@ pub(crate) fn start_local_udp_tunnel_server(
                 }
                 to_write_back = tunnel_data_receiver.recv()=>{
                     match to_write_back{
-                        Some((data, addr))=>{
+                        Some((_data, _addr))=>{
 
                         }
                         None=>{

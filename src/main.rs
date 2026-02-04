@@ -148,13 +148,13 @@ fn rcgen(tls_host: &String) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn start_http_server(
+async fn start_admin_server(
     listen: &SocketAddr,
-    pac_content: Arc<RwLock<Vec<u8>>>,
+    pac_content: Arc<RwLock<Option<Vec<u8>>>>,
     metrics_registry: utils::MetricsRegistry,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!("HTTP server listening on {}", listen);
+    tracing::info!("Admin server listening on {}", listen);
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
@@ -166,7 +166,7 @@ async fn start_http_server(
             let n = match stream.read(&mut buf).await {
                 Ok(n) => n,
                 Err(e) => {
-                    tracing::warn!("HTTP server read error from {}: {}", addr, e);
+                    tracing::warn!("Admin server read error from {}: {}", addr, e);
                     return;
                 }
             };
@@ -179,16 +179,24 @@ async fn start_http_server(
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or("/");
 
-            tracing::debug!("HTTP request from {}: {}", addr, path);
+            tracing::debug!("Admin server request from {}: {}", addr, path);
 
             let (status, content_type, body) = match path {
-                "/pac" | "/pac.js" | "/" => {
+                "/pac" | "/pac.js" => {
                     let content = pac_content.read().await;
-                    ("200 OK", "application/x-ns-proxy-autoconfig", content.clone())
+                    if let Some(ref pac) = *content {
+                        ("200 OK", "application/x-ns-proxy-autoconfig", pac.clone())
+                    } else {
+                        ("404 Not Found", "text/plain; charset=utf-8", "PAC not configured\n".as_bytes().to_vec())
+                    }
                 }
                 "/metrics" => {
                     let metrics = utils::format_metrics(&registry);
                     ("200 OK", "text/plain; charset=utf-8", metrics.into_bytes())
+                }
+                "/" => {
+                    let body = "rsnova admin server\n\nEndpoints:\n  /pac - PAC file\n  /metrics - Server metrics\n";
+                    ("200 OK", "text/plain; charset=utf-8", body.as_bytes().to_vec())
                 }
                 _ => {
                     let body = "404 Not Found\n\nAvailable endpoints:\n  /pac - PAC file\n  /metrics - Server metrics\n";
@@ -208,18 +216,18 @@ async fn start_http_server(
             );
 
             if let Err(e) = stream.write_all(response.as_bytes()).await {
-                tracing::warn!("HTTP server write header error to {}: {}", addr, e);
+                tracing::warn!("Admin server write header error to {}: {}", addr, e);
                 return;
             }
             if let Err(e) = stream.write_all(&body).await {
-                tracing::warn!("HTTP server write body error to {}: {}", addr, e);
+                tracing::warn!("Admin server write body error to {}: {}", addr, e);
                 return;
             }
         });
     }
 }
 
-async fn watch_pac_file(pac_file: PathBuf, pac_content: Arc<RwLock<Vec<u8>>>) {
+async fn watch_pac_file(pac_file: PathBuf, pac_content: Arc<RwLock<Option<Vec<u8>>>>) {
     let mut last_modified = fs::metadata(&pac_file)
         .and_then(|m| m.modified())
         .ok();
@@ -240,7 +248,7 @@ async fn watch_pac_file(pac_file: PathBuf, pac_content: Arc<RwLock<Vec<u8>>>) {
             match fs::read(&pac_file) {
                 Ok(new_content) => {
                     let mut content = pac_content.write().await;
-                    *content = new_content;
+                    *content = Some(new_content);
                     last_modified = current_modified;
                     tracing::info!("PAC file {:?} reloaded", pac_file);
                 }
@@ -256,7 +264,7 @@ async fn watch_autoproxy(
     autoproxy_url: String,
     pac_proxy: String,
     fetch_proxy: Option<String>,
-    pac_content: Arc<RwLock<Vec<u8>>>,
+    pac_content: Arc<RwLock<Option<Vec<u8>>>>,
     update_secs: u64,
 ) {
     let mut interval = time::interval(Duration::from_secs(update_secs));
@@ -270,7 +278,7 @@ async fn watch_autoproxy(
         match utils::fetch_and_generate_pac(&autoproxy_url, &pac_proxy, fetch_proxy.as_deref()).await {
             Ok(new_content) => {
                 let mut content = pac_content.write().await;
-                *content = new_content;
+                *content = Some(new_content);
                 tracing::info!("AutoProxy PAC updated successfully");
             }
             Err(e) => {
@@ -310,31 +318,38 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
         tracing::warn!("set metrics recorder failed: {}", e);
     }
 
-    // Start PAC server from local file (no proxy needed)
-    if let Some(pac_file) = &args.pac_file {
-        let pac_content = fs::read(pac_file)
-            .map_err(|e| anyhow!("failed to read PAC file {:?}: {}", pac_file, e))?;
-        let pac_content = Arc::new(RwLock::new(pac_content));
-        let admin_listen = args.admin_listen;
+    // PAC content shared between admin server and client
+    let pac_content: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
 
-        // Spawn PAC file watcher for hot reload
-        let pac_file_clone = pac_file.clone();
-        let pac_content_clone = pac_content.clone();
-        tokio::spawn(async move {
-            watch_pac_file(pac_file_clone, pac_content_clone).await;
-        });
-
-        // Spawn HTTP server
-        let registry = metrics_registry.clone();
-        tokio::spawn(async move {
-            if let Err(e) = start_http_server(&admin_listen, pac_content, registry).await {
-                tracing::error!("HTTP server error: {}", e);
-            }
-        });
-    }
+    // Start admin server (always enabled)
+    let admin_listen = args.admin_listen;
+    let pac_content_for_admin = pac_content.clone();
+    let registry = metrics_registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_admin_server(&admin_listen, pac_content_for_admin, registry).await {
+            tracing::error!("Admin server error: {}", e);
+        }
+    });
 
     match args.role {
         Role::Client => {
+            // Initialize PAC content from file (can be updated later by autoproxy)
+            if let Some(pac_file) = &args.pac_file {
+                let content = fs::read(pac_file)
+                    .map_err(|e| anyhow!("failed to read PAC file {:?}: {}", pac_file, e))?;
+                {
+                    let mut pac = pac_content.write().await;
+                    *pac = Some(content);
+                }
+
+                // Spawn PAC file watcher for hot reload
+                let pac_file_clone = pac_file.clone();
+                let pac_content_clone = pac_content.clone();
+                tokio::spawn(async move {
+                    watch_pac_file(pac_file_clone, pac_content_clone).await;
+                });
+            }
+
             let tunnel_sender: UnboundedSender<tunnel::Message> =
                 match args.remote.as_ref().unwrap().scheme() {
                     "quic" => {
@@ -386,7 +401,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
             // Wait a moment for the proxy to start
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            // Start PAC server from autoproxy list (fetch through the proxy we just started)
+            // Setup PAC content from autoproxy list (fetch through the proxy we just started)
             if let Some(autoproxy_url) = &args.autoproxy_url {
                 let proxy_addr = if args.listen.ip().is_unspecified() {
                     let ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".parse().unwrap());
@@ -398,9 +413,12 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 let fetch_proxy = format!("socks5://{}", proxy_addr);
 
                 match utils::fetch_and_generate_pac(autoproxy_url, &pac_proxy, Some(&fetch_proxy)).await {
-                    Ok(pac_content) => {
-                        let pac_content = Arc::new(RwLock::new(pac_content));
-                        let admin_listen = args.admin_listen;
+                    Ok(content) => {
+                        // Update shared pac_content
+                        {
+                            let mut pac = pac_content.write().await;
+                            *pac = Some(content);
+                        }
 
                         // Spawn autoproxy updater if interval > 0
                         if args.autoproxy_update_secs > 0 {
@@ -419,14 +437,6 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                                 .await;
                             });
                         }
-
-                        // Spawn HTTP server
-                        let registry = metrics_registry.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = start_http_server(&admin_listen, pac_content, registry).await {
-                                tracing::error!("HTTP server error: {}", e);
-                            }
-                        });
                     }
                     Err(e) => {
                         tracing::error!("Failed to fetch autoproxy list: {}", e);
@@ -439,32 +449,34 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         }
-        Role::Server => match args.protocol {
-            Protocol::Quic => {
-                if let Err(e) = tunnel::start_quic_remote_server(
-                    &args.listen,
-                    args.cert.as_ref().unwrap(),
-                    args.key.as_ref().unwrap(),
-                    args.idle_timeout_secs,
-                )
-                .await
-                {
-                    tracing::error!("{e:?}");
+        Role::Server => {
+            match args.protocol {
+                Protocol::Quic => {
+                    if let Err(e) = tunnel::start_quic_remote_server(
+                        &args.listen,
+                        args.cert.as_ref().unwrap(),
+                        args.key.as_ref().unwrap(),
+                        args.idle_timeout_secs,
+                    )
+                    .await
+                    {
+                        tracing::error!("{e:?}");
+                    }
+                }
+                Protocol::Tls => {
+                    if let Err(e) = tunnel::start_tls_remote_server(
+                        &args.listen,
+                        args.cert.as_ref().unwrap(),
+                        args.key.as_ref().unwrap(),
+                        args.idle_timeout_secs,
+                    )
+                    .await
+                    {
+                        tracing::error!("{e:?}");
+                    }
                 }
             }
-            Protocol::Tls => {
-                if let Err(e) = tunnel::start_tls_remote_server(
-                    &args.listen,
-                    args.cert.as_ref().unwrap(),
-                    args.key.as_ref().unwrap(),
-                    args.idle_timeout_secs,
-                )
-                .await
-                {
-                    tracing::error!("{e:?}");
-                }
-            }
-        },
+        }
     }
     Ok(())
 }
