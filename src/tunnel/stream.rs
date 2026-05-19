@@ -4,11 +4,10 @@ use futures::future::try_join;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
@@ -19,31 +18,29 @@ use crate::utils::UdpClientStream;
 
 struct TransferState {
     abort: AtomicBool,
-    io_active_timestamp_secs: AtomicU64,
+    start: Instant,
+    last_active_millis: AtomicU64,
 }
 
 impl TransferState {
     fn new() -> Self {
         Self {
             abort: AtomicBool::new(false),
-            io_active_timestamp_secs: AtomicU64::new(0),
+            start: Instant::now(),
+            last_active_millis: AtomicU64::new(0),
         }
     }
     fn touch(&self) {
-        self.io_active_timestamp_secs.store(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            SeqCst,
-        );
+        self.last_active_millis
+            .store(self.start.elapsed().as_millis() as u64, Relaxed);
     }
-    fn idle_since_last_active(&self) -> u64 {
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        now_secs - self.io_active_timestamp_secs.load(SeqCst)
+    fn idle_snapshot(&self) -> (u64, u64) {
+        let now_millis = self.start.elapsed().as_millis() as u64;
+        let last_active_millis = self.last_active_millis.load(Relaxed);
+        (
+            now_millis.saturating_sub(last_active_millis),
+            last_active_millis,
+        )
     }
 }
 
@@ -65,16 +62,16 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     let check_timeout_secs = Duration::from_secs(CHECK_TIMEOUT_SECS);
     state.touch();
     loop {
-        if state.abort.load(SeqCst) {
+        if state.abort.load(Relaxed) {
             return Err(anyhow!("abort"));
         }
         match timeout(check_timeout_secs, r.read(&mut buf)).await {
             Err(_) => {
-                if state.idle_since_last_active() >= timeout_sec {
+                let (idle_millis, last_active_millis) = state.idle_snapshot();
+                if idle_millis >= timeout_sec.saturating_mul(1000) {
                     return Err(anyhow!(format!(
-                        "timeout after inactive {}secs, io active time:{}",
-                        state.idle_since_last_active(),
-                        state.io_active_timestamp_secs.load(SeqCst)
+                        "timeout after inactive {}ms, last active at +{}ms",
+                        idle_millis, last_active_millis
                     )));
                 } else {
                     continue;
@@ -86,12 +83,12 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
                     break;
                 };
                 if let Err(ex) = w.write_all(&buf[0..n]).await {
-                    state.abort.store(true, SeqCst);
+                    state.abort.store(true, Relaxed);
                     return Err(ex.into());
                 }
             }
             Ok(Err(e)) => {
-                state.abort.store(true, SeqCst);
+                state.abort.store(true, Relaxed);
                 return Err(e.into());
             }
         }
@@ -161,7 +158,7 @@ pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteEx
             }
             let config = bincode::config::standard();
             let (open_event, _len): (OpenStreamEvent, usize) =
-                bincode::decode_from_slice(&ev.body[..], config)?;
+                bincode::decode_from_slice(ev.body.as_ref(), config)?;
             tracing::info!("[{}]recv open event:{:?}", ev.header.stream_id, open_event);
             if open_event.proto == "udp" {
                 let udp_socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;

@@ -88,6 +88,10 @@ struct Args {
     #[clap(default_value = "30", long)]
     idle_timeout_secs: usize,
 
+    /// Per-stream mux inbound channel size (TLS protocol only)
+    #[clap(long, default_value_t = mux::DEFAULT_STREAM_CHANNEL_SIZE)]
+    mux_stream_channel_size: usize,
+
     #[clap(default_value = "mydomain.io", long)]
     tls_host: String,
 
@@ -99,6 +103,15 @@ struct Args {
 
     #[clap(default_value = "false", long)]
     profile: bool,
+
+    /// Run in the background (Unix only)
+    #[clap(
+        short = 'd',
+        long = "daemon",
+        default_value = "false",
+        conflicts_with = "profile"
+    )]
+    daemon: bool,
 
     #[clap(default_value = "", long)]
     log: String,
@@ -369,6 +382,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             &args.tls_host,
                             args.concurrent,
                             args.idle_timeout_secs,
+                            args.mux_stream_channel_size,
                         )
                         .await?
                     }
@@ -469,6 +483,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                         args.cert.as_ref().unwrap(),
                         args.key.as_ref().unwrap(),
                         args.idle_timeout_secs,
+                        args.mux_stream_channel_size,
                     )
                     .await
                     {
@@ -496,6 +511,14 @@ fn main() {
         }
         return;
     }
+
+    if args.daemon {
+        if let Err(e) = utils::daemonize(!args.log.is_empty()) {
+            eprintln!("daemonize failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.threads)
         .enable_all()

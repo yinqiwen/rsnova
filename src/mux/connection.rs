@@ -1,5 +1,6 @@
 use crate::mux::stream::MuxStream;
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -11,11 +12,12 @@ use super::event;
 
 use super::stream::Control;
 
-const DEFAULT_STREAM_CHANNEL_SIZE: usize = 4;
+pub const DEFAULT_STREAM_CHANNEL_SIZE: usize = 16;
 
 pub struct Connection {
     ev_writer: mpsc::Sender<Control>,
     stream_id_seed: AtomicU32,
+    stream_channel_size: usize,
 }
 
 pub enum Mode {
@@ -24,25 +26,31 @@ pub enum Mode {
 }
 
 impl Connection {
-    pub fn new<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static>(
+    pub fn new_with_stream_channel_size<
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    >(
         r: R,
         w: W,
         mode: Mode,
         id: u32,
+        stream_channel_size: usize,
     ) -> Self {
         let (sender_orig, receiver) = mpsc::channel::<Control>(4096);
         let sender = sender_orig.clone();
         tokio::spawn(async move {
-            handle_mux_connection(id, r, w, receiver, sender).await;
+            handle_mux_connection(id, r, w, receiver, sender, stream_channel_size).await;
         });
         match mode {
             Mode::Client => Self {
                 ev_writer: sender_orig,
                 stream_id_seed: AtomicU32::new(0),
+                stream_channel_size,
             },
             Mode::Server => Self {
                 ev_writer: sender_orig,
                 stream_id_seed: AtomicU32::new(1),
+                stream_channel_size,
             },
         }
     }
@@ -53,7 +61,7 @@ impl Connection {
         Ok(())
     }
     pub async fn open_stream(&self) -> Result<MuxStream> {
-        let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>(DEFAULT_STREAM_CHANNEL_SIZE);
+        let (sender, receiver) = mpsc::channel::<Option<Bytes>>(self.stream_channel_size);
         let id = self.stream_id_seed.fetch_add(2, Ordering::SeqCst);
         let stream = MuxStream::new(id, self.ev_writer.clone(), receiver);
         if let Err(e) = self
@@ -83,6 +91,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut w: W,
     mut ev_reader: mpsc::Receiver<Control>,
     ev_writer_orig: mpsc::Sender<Control>,
+    stream_channel_size: usize,
 ) {
     let ev_writer = ev_writer_orig.clone();
     let read_connection_fut = async move {
@@ -90,25 +99,36 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         while let Ok(ev) = event::read_event(&mut buf_reader).await {
             match ev.header.flags() {
                 event::FLAG_SYN => {
-                    let (sender, receiver) =
-                        mpsc::channel::<Option<Vec<u8>>>(DEFAULT_STREAM_CHANNEL_SIZE);
+                    let (sender, receiver) = mpsc::channel::<Option<Bytes>>(stream_channel_size);
                     let ctrl = Control::NewStream((ev.header.stream_id, sender, Some(receiver)));
                     if ev_writer.send(ctrl).await.is_err() {
                         break;
                     }
                 }
                 event::FLAG_FIN => {
-                    if ev_writer.send(Control::StreamClose(ev.header.stream_id, true)).await.is_err() {
+                    if ev_writer
+                        .send(Control::StreamClose(ev.header.stream_id, true))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 event::FLAG_SHUTDOWN => {
-                    if ev_writer.send(Control::StreamShutdown(ev.header.stream_id, true)).await.is_err() {
+                    if ev_writer
+                        .send(Control::StreamShutdown(ev.header.stream_id, true))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 event::FLAG_DATA => {
-                    if ev_writer.send(Control::StreamData(ev.header.stream_id, ev.body, true)).await.is_err() {
+                    if ev_writer
+                        .send(Control::StreamData(ev.header.stream_id, ev.body, true))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -132,7 +152,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         //let labels: [(&str, String); 1] = [("idx", format!("{}", conn_id))];
         let mut incoming_streams: VecDeque<MuxStream> = VecDeque::new();
         let mut accept_callback: Option<oneshot::Sender<Result<MuxStream>>> = None;
-        let mut stream_senders: HashMap<u32, mpsc::Sender<Option<Vec<u8>>>> = HashMap::new();
+        let mut stream_senders: HashMap<u32, mpsc::Sender<Option<Bytes>>> = HashMap::new();
 
         while let Some(ctrl) = ev_reader.recv().await {
             match ctrl {
@@ -146,7 +166,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 Control::NewStream((sid, sender, receiver)) => match stream_senders.entry(sid) {
                     Entry::Occupied(e) => {
                         tracing::error!("Duplicate stream id:{}", sid);
-                        let _ = e.get().send(Some(Vec::new())).await;
+                        let _ = e.get().send(Some(Bytes::new())).await;
                     }
                     Entry::Vacant(v) => {
                         v.insert(sender);
@@ -213,7 +233,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                 break;
                             }
                         } else {
-                            let _ = sender.send(Some(Vec::new())).await;
+                            let _ = sender.send(Some(Bytes::new())).await;
                         }
                     }
                 }

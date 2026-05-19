@@ -18,6 +18,7 @@ pub async fn start_tls_remote_server(
     cert_path: &Path,
     key_path: &Path,
     idle_timeout_secs: usize,
+    stream_channel_size: usize,
 ) -> Result<()> {
     let certs = read_tokio_tls_certs(cert_path)?;
     let key = read_private_key(key_path)?;
@@ -47,7 +48,7 @@ pub async fn start_tls_remote_server(
         let fut = async move {
             let stream = acceptor.accept(stream).await?;
             tracing::info!("TLS connection incoming");
-            handle_tls_connection(stream, conn_id, idle_timeout_secs).await?;
+            handle_tls_connection(stream, conn_id, idle_timeout_secs, stream_channel_size).await?;
             Ok(()) as Result<()>
         };
 
@@ -64,9 +65,16 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
     conn: T,
     id: u32,
     idle_timeout_secs: usize,
+    stream_channel_size: usize,
 ) -> Result<()> {
     let (r, w) = tokio::io::split(conn);
-    let mux_conn = mux::Connection::new(r, w, mux::Mode::Server, id);
+    let mux_conn = mux::Connection::new_with_stream_channel_size(
+        r,
+        w,
+        mux::Mode::Server,
+        id,
+        stream_channel_size,
+    );
 
     loop {
         let stream = mux_conn.accept_stream().await?;

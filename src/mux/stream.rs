@@ -1,7 +1,6 @@
 use crate::utils;
-use crate::utils::fill_read_buf;
 use anyhow::Result;
-use bytes::BytesMut;
+use bytes::Bytes;
 use futures::ready;
 use futures::SinkExt;
 use std::pin::Pin;
@@ -16,25 +15,19 @@ use tokio_util::sync::PollSender;
 pub struct MuxStream {
     id: u32,
     ev_writer: PollSender<Control>,
-    inbound_reader: mpsc::Receiver<Option<Vec<u8>>>,
-    recv_buf: BytesMut,
+    inbound_reader: mpsc::Receiver<Option<Bytes>>,
+    recv_buf: Bytes,
     initial_close: bool,
     close_by_remote: bool,
     read_eof: bool,
 }
 
-type StreamDataReceiver = mpsc::Receiver<Option<Vec<u8>>>;
+type StreamDataReceiver = mpsc::Receiver<Option<Bytes>>;
 
 pub enum Control {
     AcceptStream(oneshot::Sender<Result<MuxStream>>),
-    NewStream(
-        (
-            u32,
-            mpsc::Sender<Option<Vec<u8>>>,
-            Option<StreamDataReceiver>,
-        ),
-    ),
-    StreamData(u32, Vec<u8>, bool),
+    NewStream((u32, mpsc::Sender<Option<Bytes>>, Option<StreamDataReceiver>)),
+    StreamData(u32, Bytes, bool),
     StreamShutdown(u32, bool),
     StreamClose(u32, bool),
     Ping,
@@ -45,13 +38,13 @@ impl MuxStream {
     pub fn new(
         id: u32,
         ev_writer: mpsc::Sender<Control>,
-        inbound_reader: mpsc::Receiver<Option<Vec<u8>>>,
+        inbound_reader: mpsc::Receiver<Option<Bytes>>,
     ) -> Self {
         Self {
             id,
             ev_writer: PollSender::new(ev_writer),
             inbound_reader,
-            recv_buf: BytesMut::new(),
+            recv_buf: Bytes::new(),
             initial_close: false,
             close_by_remote: false,
             read_eof: false,
@@ -74,7 +67,13 @@ impl AsyncRead for MuxStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         if !self.recv_buf.is_empty() {
-            fill_read_buf(&mut self.recv_buf, buf);
+            let copy_n = self.recv_buf.len().min(buf.remaining());
+            buf.put_slice(&self.recv_buf[..copy_n]);
+            self.recv_buf = if copy_n == self.recv_buf.len() {
+                Bytes::new()
+            } else {
+                self.recv_buf.slice(copy_n..)
+            };
             return Poll::Ready(Ok(()));
         };
         if self.read_eof {
@@ -96,7 +95,7 @@ impl AsyncRead for MuxStream {
                     }
                     buf.put_slice(&b[0..copy_n]);
                     if copy_n < b.len() {
-                        self.recv_buf.extend_from_slice(&b[copy_n..]);
+                        self.recv_buf = b.slice(copy_n..);
                     }
                     Poll::Ready(Ok(()))
                 }
@@ -147,13 +146,18 @@ impl AsyncWrite for MuxStream {
                 "close by remote",
             )));
         }
-        let ctrl = Control::StreamData(self.id, Vec::from(buf), false);
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         match ready!(self.ev_writer.poll_reserve(cx)) {
             Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
-            Ok(_v) => match self.ev_writer.send_item(ctrl) {
-                Ok(()) => Poll::Ready(Ok(buf.len())),
-                Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
-            },
+            Ok(_v) => {
+                let ctrl = Control::StreamData(self.id, Bytes::copy_from_slice(buf), false);
+                match self.ev_writer.send_item(ctrl) {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
+                }
+            }
         }
     }
     fn poll_flush(
