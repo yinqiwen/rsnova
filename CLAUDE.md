@@ -15,9 +15,6 @@ cargo build
 # Release build
 cargo build --release
 
-# Build with Quinn QUIC instead of default s2n-quic
-cargo build --features quinn --no-default-features
-
 # Cross-compile for Linux targets (uses cross)
 ./ci/build_linux.sh
 
@@ -53,8 +50,7 @@ src/
 │   ├── http_local.rs    # HTTP/HTTPS proxy handler
 │   ├── client.rs        # Generic client interface and multiplexing
 │   ├── tls_client.rs    # TLS transport client
-│   ├── s2n_quic_client.rs   # AWS s2n-quic client (default)
-│   ├── quinn_quic_client.rs # Quinn QUIC client (optional)
+│   ├── s2n_quic_client.rs   # AWS s2n-quic client
 │   └── *_remote.rs      # Server-side transport implementations
 ├── mux/                 # Stream multiplexing
 │   ├── connection.rs    # Manages bidirectional stream multiplex
@@ -81,7 +77,6 @@ src/
 ### Feature Flags
 
 - `default = ["s2n_quic"]` - AWS s2n QUIC implementation
-- `quinn` - Alternative Quinn QUIC implementation
 
 ### Platform-Specific Code
 

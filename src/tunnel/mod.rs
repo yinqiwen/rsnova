@@ -12,20 +12,17 @@ mod tls_remote;
 
 mod transparent;
 
-#[cfg(all(feature = "quinn", not(feature = "s2n_quic")))]
-mod quinn_quic_client;
-#[cfg(all(feature = "quinn", not(feature = "s2n_quic")))]
-pub use self::quinn_quic_client::new_quic_client;
-
-#[cfg(all(feature = "quinn", not(feature = "s2n_quic")))]
-mod quinn_quic_remote;
-#[cfg(all(feature = "quinn", not(feature = "s2n_quic")))]
-pub use self::quinn_quic_remote::start_quic_remote_server;
+pub mod tunnel_client;
+pub mod tunnel_config;
+pub mod tunnel_registry;
+pub mod tunnel_remote;
 
 #[cfg(feature = "s2n_quic")]
 mod s2n_quic_client;
 #[cfg(feature = "s2n_quic")]
 pub use self::s2n_quic_client::new_quic_client;
+#[cfg(feature = "s2n_quic")]
+pub use self::s2n_quic_client::start_tunnel_client_quic;
 
 #[cfg(feature = "s2n_quic")]
 mod s2n_quic_remote;
@@ -42,3 +39,41 @@ pub use self::local::start_local_tunnel_server;
 
 pub use self::tls_client::new_tls_client;
 pub use self::tls_remote::start_tls_remote_server;
+
+pub async fn start_tunnel_client(
+    url: &url::Url,
+    cert_path: &std::path::Path,
+    host: &str,
+    idle_timeout_secs: usize,
+    stream_channel_size: usize,
+    client_id: &str,
+    entries: Vec<crate::mux::event::TunnelEntry>,
+) -> anyhow::Result<()> {
+    match url.scheme() {
+        "tls" => {
+            tunnel_client::start_tunnel_client_tls(
+                url,
+                cert_path,
+                host,
+                idle_timeout_secs,
+                stream_channel_size,
+                client_id,
+                entries,
+            )
+            .await
+        }
+        #[cfg(feature = "s2n_quic")]
+        "quic" => {
+            start_tunnel_client_quic(
+                url,
+                cert_path,
+                host,
+                client_id,
+                entries,
+                idle_timeout_secs,
+            )
+            .await
+        }
+        _ => Err(anyhow::anyhow!("unsupported scheme: {}", url.scheme())),
+    }
+}

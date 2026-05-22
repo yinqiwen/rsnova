@@ -3,6 +3,7 @@ use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use url::Url;
@@ -11,6 +12,9 @@ use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
 use super::Message;
+use crate::mux::event::{
+    self, AuthAck, AuthRequest, RegisterRequest, TunnelEntry, FLAG_AUTH_ACK,
+};
 
 pub struct S2NQuicConnection {
     pub(crate) inner: Option<s2n_quic::Connection>,
@@ -68,6 +72,10 @@ impl MuxConnection for S2NQuicConnection {
         }
     }
 
+    async fn accept_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)> {
+        Err(anyhow!("QUIC accept_stream not yet implemented for tunnel mode"))
+    }
+
     fn set_connection(&mut self, new_c: Self) {
         *self = new_c;
     }
@@ -108,6 +116,25 @@ impl MuxClient<S2NQuicConnection> {
                             tracing::info!("QUIC connection:{} established!", i);
                         }
                     }
+                    if let Some(ref mut connection) = quic_conn.inner {
+                        let auth_stream = connection
+                            .open_bidirectional_stream()
+                            .await
+                            .map_err(|e| anyhow!("open auth stream: {}", e))?;
+                        let (mut auth_r, mut auth_w) = auth_stream.split();
+                        let auth_req = AuthRequest::Proxy;
+                        let ev = event::new_auth_event(0, &auth_req)?;
+                        event::write_event(&mut auth_w, ev).await?;
+
+                        let ack_ev = event::read_event(&mut auth_r).await?;
+                        if ack_ev.header.flags() != FLAG_AUTH_ACK {
+                            return Err(anyhow!(
+                                "proxy auth failed: unexpected flag {}",
+                                ack_ev.header.flags()
+                            ));
+                        }
+                        tracing::info!("QUIC connection:{} auth completed (proxy mode)", i);
+                    }
                     client.conns.push(quic_conn);
                 }
                 tokio::spawn(mux_client_loop(client, receiver, idle_timeout_secs));
@@ -118,7 +145,10 @@ impl MuxClient<S2NQuicConnection> {
     }
 }
 
-fn new_s2n_quic_endpoint(_url: &Url, cert_path: &Path) -> anyhow::Result<s2n_quic::client::Client> {
+pub(crate) fn new_s2n_quic_endpoint(
+    _url: &Url,
+    cert_path: &Path,
+) -> anyhow::Result<s2n_quic::client::Client> {
     let client = s2n_quic::client::Client::builder()
         .with_tls(cert_path)?
         .with_io("0.0.0.0:0")?
@@ -126,7 +156,7 @@ fn new_s2n_quic_endpoint(_url: &Url, cert_path: &Path) -> anyhow::Result<s2n_qui
     Ok(client)
 }
 
-async fn new_s2n_quic_connection(
+pub(crate) async fn new_s2n_quic_connection(
     endpoint: &s2n_quic::client::Client,
     url: &Url,
     host: &str,
@@ -138,10 +168,115 @@ async fn new_s2n_quic_connection(
 
     let connect = s2n_quic::client::Connect::new(remote).with_server_name(host);
     let mut connection = endpoint.connect(connect).await?;
-    // ensure the connection doesn't time out with inactivity
     tracing::info!("conncect s2n quic success");
     connection.keep_alive(true)?;
     Ok(connection)
+}
+
+/// Tunnel client loop for QUIC mode using Connection::split()
+pub async fn start_tunnel_client_quic(
+    url: &Url,
+    cert_path: &Path,
+    host: &str,
+    client_id: &str,
+    entries: Vec<TunnelEntry>,
+    idle_timeout_secs: usize,
+) -> anyhow::Result<()> {
+    const INITIAL_BACKOFF_SECS: u64 = 1;
+    const MAX_BACKOFF_SECS: u64 = 60;
+
+    let mut backoff_secs = INITIAL_BACKOFF_SECS;
+    loop {
+        let start = std::time::Instant::now();
+        let result = run_quic_tunnel_connection(
+            url,
+            cert_path,
+            host,
+            client_id,
+            &entries,
+            idle_timeout_secs,
+        )
+        .await;
+
+        // Reset backoff if connection was productive (lasted > 30s)
+        if start.elapsed() > Duration::from_secs(30) {
+            backoff_secs = INITIAL_BACKOFF_SECS;
+        }
+
+        tracing::info!(
+            "QUIC tunnel connection lost ({}), reconnecting in {}s...",
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            backoff_secs
+        );
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+    }
+}
+
+async fn run_quic_tunnel_connection(
+    url: &Url,
+    cert_path: &Path,
+    host: &str,
+    client_id: &str,
+    entries: &[TunnelEntry],
+    idle_timeout_secs: usize,
+) -> anyhow::Result<()> {
+    let endpoint = new_s2n_quic_endpoint(url, cert_path)?;
+    let mut connection = new_s2n_quic_connection(&endpoint, url, host).await?;
+
+    let auth_stream = connection
+        .open_bidirectional_stream()
+        .await
+        .map_err(|e| anyhow!("open auth stream: {}", e))?;
+    let (mut recv, mut send) = auth_stream.split();
+
+    let auth_req = AuthRequest::Register(RegisterRequest {
+        client_id: client_id.to_string(),
+        tunnels: entries.to_vec(),
+    });
+    let ev = event::new_auth_event(0, &auth_req)?;
+    event::write_event(&mut send, ev).await?;
+
+    let ack_ev = event::read_event(&mut recv).await?;
+    if ack_ev.header.flags() != FLAG_AUTH_ACK {
+        return Err(anyhow!(
+            "expected FLAG_AUTH_ACK, got flag={}",
+            ack_ev.header.flags()
+        ));
+    }
+    let config = bincode::config::standard();
+    let (ack, _): (AuthAck, usize) = bincode::decode_from_slice(ack_ev.body.as_ref(), config)
+        .map_err(|e| anyhow!("decode AuthAck failed: {}", e))?;
+    match ack {
+        AuthAck::Proxy => return Err(anyhow!("server returned Proxy ack for tunnel request")),
+        AuthAck::RegisterAck(register_ack) => {
+            crate::tunnel::tunnel_client::handle_register_ack(&register_ack)?;
+        }
+    }
+    drop(send);
+    drop(recv);
+
+    let (_handle, mut acceptor) = connection.split();
+
+    while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
+        let (mut recv_stream, mut send_stream) = stream.split();
+        tokio::spawn(async move {
+            if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
+                &mut recv_stream,
+                &mut send_stream,
+                idle_timeout_secs,
+            )
+            .await
+            {
+                tracing::warn!("QUIC reverse stream error: {}", e);
+            }
+        });
+    }
+    Ok(())
 }
 
 pub async fn new_quic_client(

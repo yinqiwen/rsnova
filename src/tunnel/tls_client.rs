@@ -14,6 +14,7 @@ use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
 use super::Message;
+use crate::mux::event;
 use crate::mux::MuxStream;
 use crate::mux::{self};
 use crate::tunnel::ALPN_QUIC_HTTP;
@@ -23,6 +24,16 @@ pub struct TlsConnection {
     pub(crate) inner: Option<mux::Connection>,
     pub(crate) id: u32,
     pub(crate) stream_channel_size: usize,
+}
+
+impl TlsConnection {
+    pub fn new(stream_channel_size: usize) -> Self {
+        Self {
+            inner: None,
+            id: 0,
+            stream_channel_size,
+        }
+    }
 }
 
 impl MuxConnection for TlsConnection {
@@ -72,6 +83,22 @@ impl MuxConnection for TlsConnection {
         }
     }
 
+    async fn accept_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)> {
+        match &mut self.inner {
+            None => Err(anyhow!("null connection")),
+            Some(c) => match c.accept_stream().await {
+                Ok(stream) => {
+                    let (r, w) = tokio::io::split(stream);
+                    Ok((w, r))
+                }
+                Err(e) => {
+                    self.inner = None;
+                    Err(e)
+                }
+            },
+        }
+    }
+
     fn set_connection(&mut self, new_c: Self) {
         *self = new_c;
     }
@@ -111,6 +138,22 @@ impl MuxClient<TlsConnection> {
                         _ => {
                             tracing::info!("TLS connection:{} established!", i);
                         }
+                    }
+                    if let Some(ref mut conn) = tls_conn.inner {
+                        let auth_stream = conn.open_stream().await?;
+                        let (mut auth_r, mut auth_w) = tokio::io::split(auth_stream);
+                        let auth_req = event::AuthRequest::Proxy;
+                        let ev = event::new_auth_event(0, &auth_req)?;
+                        event::write_event(&mut auth_w, ev).await?;
+
+                        let ack_ev = event::read_event(&mut auth_r).await?;
+                        if ack_ev.header.flags() != event::FLAG_AUTH_ACK {
+                            return Err(anyhow!(
+                                "proxy auth failed: unexpected flag {}",
+                                ack_ev.header.flags()
+                            ));
+                        }
+                        tracing::info!("TLS connection:{} auth completed (proxy mode)", i);
                     }
                     client.conns.push(tls_conn);
                 }

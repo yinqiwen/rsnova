@@ -1,11 +1,13 @@
 // use anyhow::Context;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::mux::event;
 use crate::tunnel::stream::handle_server_stream;
 use crate::{mux, tunnel::ALPN_QUIC_HTTP};
 
-use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Arc, sync::Mutex};
+use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Mutex};
 
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -19,6 +21,7 @@ pub async fn start_tls_remote_server(
     key_path: &Path,
     idle_timeout_secs: usize,
     stream_channel_size: usize,
+    registry: Option<crate::tunnel::tunnel_registry::SharedRegistry>,
 ) -> Result<()> {
     let certs = read_tokio_tls_certs(cert_path)?;
     let key = read_private_key(key_path)?;
@@ -45,10 +48,18 @@ pub async fn start_tls_remote_server(
         };
         let acceptor = acceptor.clone();
         let fut_free_ids = free_ids.clone();
+        let registry = registry.clone();
         let fut = async move {
             let stream = acceptor.accept(stream).await?;
             tracing::info!("TLS connection incoming");
-            handle_tls_connection(stream, conn_id, idle_timeout_secs, stream_channel_size).await?;
+            handle_tls_connection(
+                stream,
+                conn_id,
+                idle_timeout_secs,
+                stream_channel_size,
+                registry,
+            )
+            .await?;
             Ok(()) as Result<()>
         };
 
@@ -66,34 +77,126 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
     id: u32,
     idle_timeout_secs: usize,
     stream_channel_size: usize,
+    registry: Option<crate::tunnel::tunnel_registry::SharedRegistry>,
 ) -> Result<()> {
     let (r, w) = tokio::io::split(conn);
-    let mux_conn = mux::Connection::new_with_stream_channel_size(
+    let mux_conn = Arc::new(mux::Connection::new_with_stream_channel_size(
         r,
         w,
         mux::Mode::Server,
         id,
         stream_channel_size,
-    );
+    ));
 
-    loop {
-        let stream = mux_conn.accept_stream().await?;
-        metrics::increment_gauge!("tls_server_proxy_streams", 1.0);
-        tokio::spawn(async move {
-            let stream_id = stream.id();
-            let (mut stream_reader, mut stream_writer) = tokio::io::split(stream);
-            if let Err(e) =
-                handle_server_stream(&mut stream_reader, &mut stream_writer, idle_timeout_secs)
+    let auth_stream = mux_conn.accept_stream().await?;
+    let (mut auth_r, mut auth_w) = tokio::io::split(auth_stream);
+
+    let ev = event::read_event(&mut auth_r).await?;
+    if ev.header.flags() != event::FLAG_AUTH {
+        return Err(anyhow!(
+            "expected FLAG_AUTH on first stream, got flag={}",
+            ev.header.flags()
+        ));
+    }
+
+    let config = bincode::config::standard();
+    let (auth_req, _): (event::AuthRequest, usize) =
+        bincode::decode_from_slice(ev.body.as_ref(), config)
+            .map_err(|e| anyhow!("decode AuthRequest failed: {}", e))?;
+
+    match auth_req {
+        event::AuthRequest::Proxy => {
+            let ack = event::AuthAck::Proxy;
+            let ack_ev = event::new_auth_ack_event(0, &ack)?;
+            event::write_event(&mut auth_w, ack_ev).await?;
+            drop(auth_r);
+            drop(auth_w);
+
+            loop {
+                let stream = mux_conn.accept_stream().await?;
+                metrics::increment_gauge!("tls_server_proxy_streams", 1.0);
+                tokio::spawn(async move {
+                    let stream_id = stream.id();
+                    let (mut stream_reader, mut stream_writer) = tokio::io::split(stream);
+                    if let Err(e) = handle_server_stream(
+                        &mut stream_reader,
+                        &mut stream_writer,
+                        idle_timeout_secs,
+                    )
                     .await
-            {
-                tracing::error!(
-                    "[{}/{}]failed: {reason}",
-                    id,
-                    stream_id,
-                    reason = e.to_string()
-                );
+                    {
+                        tracing::error!(
+                            "[{}/{}]failed: {reason}",
+                            id,
+                            stream_id,
+                            reason = e.to_string()
+                        );
+                    }
+                    metrics::decrement_gauge!("tls_server_proxy_streams", 1.0);
+                });
             }
-            metrics::decrement_gauge!("tls_server_proxy_streams", 1.0);
-        });
+        }
+        event::AuthRequest::Register(register_req) => {
+            let Some(registry) = registry else {
+                let ack = event::AuthAck::RegisterAck(event::RegisterAck {
+                    results: register_req
+                        .tunnels
+                        .iter()
+                        .map(|t| event::TunnelResult {
+                            success: false,
+                            remote_port: t.remote_port,
+                            sni: t.sni.clone(),
+                            error: Some("tunnel not enabled on server".to_string()),
+                        })
+                        .collect(),
+                });
+                let ack_ev = event::new_auth_ack_event(0, &ack)?;
+                event::write_event(&mut auth_w, ack_ev).await?;
+                return Ok(());
+            };
+
+            let results = crate::tunnel::tunnel_remote::handle_tunnel_register(
+                &registry,
+                &register_req,
+                crate::tunnel::tunnel_registry::ConnectionHandler::Tls(mux_conn.clone()),
+                id,
+                idle_timeout_secs,
+            )
+            .await;
+
+            let ack = event::AuthAck::RegisterAck(event::RegisterAck { results });
+            let ack_ev = event::new_auth_ack_event(0, &ack)?;
+            event::write_event(&mut auth_w, ack_ev).await?;
+            drop(auth_r);
+            drop(auth_w);
+
+            tracing::info!(
+                "[{}] Tunnel client '{}' registered, waiting for disconnect...",
+                id,
+                register_req.client_id
+            );
+
+            while let Ok(_stream) = mux_conn.accept_stream().await {
+                tracing::warn!("[{}] Unexpected stream in tunnel mode, discarding", id);
+            }
+
+            tracing::info!(
+                "[{}] Tunnel client '{}' disconnected, cleaning up",
+                id,
+                register_req.client_id
+            );
+            let mut reg = registry.lock().await;
+            let no_connections = reg.remove_connection(&register_req.client_id, id);
+            if no_connections {
+                let empty_ports = reg.remove_client_routes(&register_req.client_id);
+                for port in empty_ports {
+                    if let Some(port_state) = reg.ports.remove(&port) {
+                        port_state.cancel_token.cancel();
+                        tracing::info!("Closed listener on port {}", port);
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }

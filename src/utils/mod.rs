@@ -1,4 +1,3 @@
-mod autoproxy;
 mod clean;
 #[cfg(unix)]
 mod daemon;
@@ -11,7 +10,6 @@ mod net;
 mod tls;
 mod udp;
 
-pub use autoproxy::fetch_and_generate_pac;
 pub use clean::clean_rotate_logs;
 #[cfg(unix)]
 pub use daemon::daemonize;
