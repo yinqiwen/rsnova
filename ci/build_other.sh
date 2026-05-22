@@ -36,6 +36,5 @@ then
 else
     tar -C target/$TARGET/release -cf rsnova-$VERSION-$TARGET.tar rsnova
 fi
-tar uf rsnova-$VERSION-$TARGET.tar 
 gzip rsnova-$VERSION-$TARGET.tar
 mv rsnova-$VERSION-$TARGET.tar.gz $PKG_DIR

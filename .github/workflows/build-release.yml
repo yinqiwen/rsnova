@@ -10,6 +10,9 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -27,75 +30,83 @@ jobs:
           - arm-unknown-linux-musleabihf
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         run: |
           rustup set profile minimal
-          rustup toolchain install nightly
-          rustup default nightly
-          rustup override set nightly
-          rustup target add --toolchain nightly ${{ matrix.target }}
+          rustup toolchain install stable
+          rustup default stable
+          rustup override set stable
+          rustup target add --toolchain stable ${{ matrix.target }}
 
       - name: Install cross
-        run: cargo install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build ${{ matrix.target }}
         timeout-minutes: 120
         run: |
-          compile_target=${{ matrix.target }}
           chmod +x ./ci/build_linux.sh
           ./ci/build_linux.sh ${{ matrix.target }}
 
       - name: Upload Github Assets
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
           files: ci/release/*
           prerelease: ${{ contains(github.ref_name, '-') }}
           tag_name: ${{ inputs.tag || github.ref_name }}
 
-  build-unix:
-    runs-on: ${{ matrix.os }}
+  build-macos-x86:
+    runs-on: macos-13
     env:
       RUST_BACKTRACE: full
-    strategy:
-      fail-fast: false
-      matrix:
-        # os: [ubuntu-latest, macos-latest]
-        os: [macos-latest]
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Install GNU tar
-        if: runner.os == 'macOS'
-        run: |
-          brew install gnu-tar
-          # echo "::add-path::/usr/local/opt/gnu-tar/libexec/gnubin"
-          echo "/usr/local/opt/gnu-tar/libexec/gnubin" >> $GITHUB_PATH
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         run: |
           rustup set profile minimal
-          rustup toolchain install nightly
-          rustup default nightly
-          rustup override set nightly
-          rustup target add --toolchain nightly ${{ matrix.target }}
+          rustup toolchain install stable
+          rustup default stable
+          rustup override set stable
+          rustup target add --toolchain stable x86_64-apple-darwin
 
       - name: Build release
         shell: bash
         run: |
           chmod +x ./ci/build_other.sh
-          ./ci/build_other.sh ${{ matrix.target }}
+          ./ci/build_other.sh x86_64-apple-darwin
 
       - name: Upload Github Assets
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ci/release/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+
+  build-macos-arm:
+    runs-on: macos-latest
+    env:
+      RUST_BACKTRACE: full
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable
+          rustup default stable
+          rustup override set stable
+          rustup target add --toolchain stable aarch64-apple-darwin
+
+      - name: Build release
+        shell: bash
+        run: |
+          chmod +x ./ci/build_other.sh
+          ./ci/build_other.sh aarch64-apple-darwin
+
+      - name: Upload Github Assets
+        uses: softprops/action-gh-release@v2
         with:
           files: ci/release/*
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -107,14 +118,14 @@ jobs:
       RUSTFLAGS: "-C target-feature=+crt-static"
       RUST_BACKTRACE: full
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         run: |
           rustup set profile minimal
-          rustup toolchain install nightly
-          rustup default nightly
-          rustup override set nightly
+          rustup toolchain install stable
+          rustup default stable
+          rustup override set stable
 
       - name: Build release
         shell: bash
@@ -123,9 +134,7 @@ jobs:
           ./ci/build_other.sh x86_64-pc-windows-msvc
 
       - name: Upload Github Assets
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
           files: ci/release/*
           prerelease: ${{ contains(github.ref_name, '-') }}

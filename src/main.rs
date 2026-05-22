@@ -1,5 +1,3 @@
-// #![feature(map_try_insert)]
-
 use anyhow::anyhow;
 use clap_serde_derive::{
     clap::{self, Parser, ValueEnum},

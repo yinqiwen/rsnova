@@ -19,6 +19,5 @@ fi
 
 # Package up the release binary
 tar -C target/$TARGET/release -cf rsnova-$VERSION-$TARGET.tar rsnova
-tar uf rsnova-$VERSION-$TARGET.tar 
 gzip rsnova-$VERSION-$TARGET.tar
 mv rsnova-$VERSION-$TARGET.tar.gz $PKG_DIR
