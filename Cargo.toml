@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.1.4", features = ["derive", "env"] }
+clap_serde_derive = { package = "clap-serde-derive", version = "0.2" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
@@ -22,7 +25,7 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 # rustls-native-certs = "0.7"
 anyhow = "1.0"
-url = "2.5.0"
+url = { version = "2.5.0", features = ["serde"] }
 bincode = "2.0.0-rc.3"
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["compat", "io", "codec", "net"] }
@@ -34,12 +37,9 @@ metrics-util = "0.15"
 time = "0.3"
 pki-types = { package = "rustls-pki-types", version = "1" }
 s2n-quic = { version = "1", optional = true }
-quinn = { version = "0.11", optional = true }
 socket2 = { version = "0.5", features = ["all"] }
 cfg-if = "1.0"
 lru = "0.12.5"
-base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "socks"] }
 # axum = "0.7.9"
 
 [target.'cfg(unix)'.dependencies]
@@ -68,4 +68,3 @@ mimalloc = { version = "*" }
 default = ["s2n_quic"]
 # s2n_quic = ["dep:s2n-quic", "dep:aws-lc-rs"]
 s2n_quic = ["dep:s2n-quic"]
-quinn = ["dep:quinn"]

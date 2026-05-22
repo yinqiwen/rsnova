@@ -82,9 +82,9 @@ pub(crate) trait MuxConnection {
     async fn ping(&mut self) -> anyhow::Result<()>;
     async fn connect(&mut self, url: &Url, key_path: &Path, host: &str) -> anyhow::Result<()>;
     async fn open_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)>;
+    async fn accept_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)>;
     fn is_valid(&self) -> bool;
     fn set_connection(&mut self, new_c: Self);
-    // async fn accept_stream(&self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)>;
 }
 
 pub(crate) trait MuxClientTrait {

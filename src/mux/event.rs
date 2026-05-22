@@ -12,8 +12,13 @@ pub const FLAG_DATA: u8 = 3;
 // pub const FLAG_WIN_UPDATE: u8 = 4;
 pub const FLAG_PING: u8 = 5;
 pub const FLAG_SHUTDOWN: u8 = 7;
-// pub const FLAG_PONG: u8 = 8;
-// pub const FLAG_ROUTINE: u8 = 9;
+// Value 6 was previously unused. FLAG_WIN_UPDATE (4) and FLAG_PONG (8) and
+// FLAG_ROUTINE (9) were commented out and their values are being reclaimed:
+//   6 → FLAG_AUTH (new), 9 → FLAG_AUTH_ACK (replaces commented-out FLAG_ROUTINE),
+//   10 → FLAG_REVERSE_OPEN (new)
+pub const FLAG_AUTH: u8 = 6;
+pub const FLAG_AUTH_ACK: u8 = 9;
+pub const FLAG_REVERSE_OPEN: u8 = 10;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 pub const MAX_EVENT_BODY_LEN: u32 = 16 * 1024 * 1024; // 16MB
@@ -67,6 +72,44 @@ impl Header {
 pub struct OpenStreamEvent {
     pub proto: String,
     pub addr: String,
+}
+
+#[derive(Encode, Decode, PartialEq, Debug, Clone)]
+pub enum AuthRequest {
+    Proxy,
+    Register(RegisterRequest),
+}
+
+#[derive(Encode, Decode, PartialEq, Debug, Clone)]
+pub struct RegisterRequest {
+    pub client_id: String,
+    pub tunnels: Vec<TunnelEntry>,
+}
+
+#[derive(Encode, Decode, PartialEq, Debug, Clone)]
+pub struct TunnelEntry {
+    pub local_addr: String,
+    pub remote_port: u16,
+    pub sni: Option<String>,
+}
+
+#[derive(Encode, Decode, PartialEq, Debug, Clone)]
+pub enum AuthAck {
+    Proxy,
+    RegisterAck(RegisterAck),
+}
+
+#[derive(Encode, Decode, PartialEq, Debug, Clone)]
+pub struct RegisterAck {
+    pub results: Vec<TunnelResult>,
+}
+
+#[derive(Encode, Decode, PartialEq, Debug, Clone)]
+pub struct TunnelResult {
+    pub success: bool,
+    pub remote_port: u16,
+    pub sni: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +197,33 @@ pub fn new_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> anyhow::Result<
         .map_err(|e| anyhow::anyhow!("encode open stream event failed: {}", e))?;
     let mut ev = new_event(sid, Bytes::from(data));
     ev.header.set_flag(FLAG_OPEN);
+    Ok(ev)
+}
+
+pub fn new_auth_event(sid: u32, req: &AuthRequest) -> anyhow::Result<Event> {
+    let config = config::standard();
+    let data: Vec<u8> = bincode::encode_to_vec(req, config)
+        .map_err(|e| anyhow::anyhow!("encode auth request failed: {}", e))?;
+    let mut ev = new_event(sid, Bytes::from(data));
+    ev.header.set_flag(FLAG_AUTH);
+    Ok(ev)
+}
+
+pub fn new_auth_ack_event(sid: u32, ack: &AuthAck) -> anyhow::Result<Event> {
+    let config = config::standard();
+    let data: Vec<u8> = bincode::encode_to_vec(ack, config)
+        .map_err(|e| anyhow::anyhow!("encode auth ack failed: {}", e))?;
+    let mut ev = new_event(sid, Bytes::from(data));
+    ev.header.set_flag(FLAG_AUTH_ACK);
+    Ok(ev)
+}
+
+pub fn new_reverse_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> anyhow::Result<Event> {
+    let config = config::standard();
+    let data: Vec<u8> = bincode::encode_to_vec(msg, config)
+        .map_err(|e| anyhow::anyhow!("encode reverse open stream event failed: {}", e))?;
+    let mut ev = new_event(sid, Bytes::from(data));
+    ev.header.set_flag(FLAG_REVERSE_OPEN);
     Ok(ev)
 }
 

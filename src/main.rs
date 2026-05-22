@@ -1,20 +1,22 @@
 // #![feature(map_try_insert)]
 
 use anyhow::anyhow;
-use clap::{Parser, ValueEnum};
+use clap_serde_derive::{
+    clap::{self, Parser, ValueEnum},
+    ClapSerde,
+};
+use serde::Deserialize;
 
 use std::fs;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::RwLock;
 use tokio::time;
 
 use url::Url;
-use veil::Redact;
 
 mod mux;
 mod tunnel;
@@ -39,106 +41,126 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // #[export_name = "malloc_conf"]
 // pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Protocol {
     Tls,
     Quic,
 }
 
-#[derive(ValueEnum, Clone, Debug, PartialEq)]
+#[derive(ValueEnum, Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Role {
     Client,
     Server,
 }
 
-#[derive(Parser, Redact)]
-#[clap(author, version, about, long_about = None)]
+/// Outer CLI struct: only handles --config path and forwards the rest
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Config file path (TOML format)
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+
+    /// All other arguments (merged with config file)
+    #[command(flatten)]
+    args: <Args as ClapSerde>::Opt,
+}
+
+/// Main configuration (supports both CLI and TOML config file)
+#[derive(ClapSerde, Debug)]
 struct Args {
-    // #[clap(default_value = "", long, env)]
-    // #[redact(partial)]
-    // model_id: String,
-    #[structopt(long = "listen", default_value = "127.0.0.1:48100")]
+    #[default("127.0.0.1:48100".parse::<SocketAddr>().unwrap())]
+    #[arg(long)]
     listen: SocketAddr,
 
-    #[clap(long, value_enum, default_value_t=Protocol::Tls)]
+    #[default(Protocol::Tls)]
+    #[arg(long, value_enum)]
     protocol: Protocol,
 
-    #[structopt(long = "remote")]
+    #[arg(long)]
     remote: Option<Url>,
 
-    #[clap(long = "key", requires = "cert", default_value = "key.pem")]
-    #[redact(partial)]
-    key: Option<PathBuf>,
-    /// TLS certificate in PEM format
-    #[clap(long = "cert", default_value = "cert.pem")]
-    cert: Option<PathBuf>,
+    #[default(PathBuf::from("key.pem"))]
+    #[arg(long = "key", requires = "cert")]
+    key: PathBuf,
 
-    #[clap(long, value_enum, default_value_t=Role::Client)]
+    /// TLS certificate in PEM format
+    #[default(PathBuf::from("cert.pem"))]
+    #[arg(long = "cert")]
+    cert: PathBuf,
+
+    #[default(Role::Client)]
+    #[arg(long, value_enum)]
     role: Role,
 
-    #[clap(default_value = "5", long)]
+    #[default(5)]
+    #[arg(long)]
     concurrent: usize,
 
-    #[clap(default_value = "2", long)]
+    #[default(2)]
+    #[arg(long)]
     threads: usize,
 
-    #[clap(default_value = "1048576", long)]
+    #[default(1048576)]
+    #[arg(long)]
     thread_stack_size: usize,
 
-    #[clap(default_value = "30", long)]
+    #[default(30)]
+    #[arg(long)]
     idle_timeout_secs: usize,
 
     /// Per-stream mux inbound channel size (TLS protocol only)
-    #[clap(long, default_value_t = mux::DEFAULT_STREAM_CHANNEL_SIZE)]
+    #[default(mux::DEFAULT_STREAM_CHANNEL_SIZE)]
+    #[arg(long)]
     mux_stream_channel_size: usize,
 
-    #[clap(default_value = "mydomain.io", long)]
+    #[default("mydomain.io".to_string())]
+    #[arg(long)]
     tls_host: String,
 
-    #[clap(default_value = "false", long)]
+    #[default(false)]
+    #[arg(long)]
     tproxy: bool,
 
-    #[clap(default_value = "false", long)]
+    #[default(false)]
+    #[arg(long)]
     rcgen: bool,
 
-    #[clap(default_value = "false", long)]
+    #[default(false)]
+    #[arg(long)]
     profile: bool,
 
     /// Run in the background (Unix only)
-    #[clap(
-        short = 'd',
-        long = "daemon",
-        default_value = "false",
-        conflicts_with = "profile"
-    )]
+    #[default(false)]
+    #[arg(short = 'd', long = "daemon", conflicts_with = "profile")]
     daemon: bool,
 
-    #[clap(default_value = "", long)]
+    #[default(String::new())]
+    #[arg(long)]
     log: String,
 
-    /// PAC file path to serve
-    #[clap(long, conflicts_with = "autoproxy_url")]
-    pac_file: Option<PathBuf>,
-
-    /// HTTP server listen address (serves /pac and /metrics)
-    #[clap(long, default_value = "127.0.0.1:48102")]
+    /// HTTP server listen address (serves /metrics)
+    #[default("127.0.0.1:48102".parse::<SocketAddr>().unwrap())]
+    #[arg(long)]
     admin_listen: SocketAddr,
 
-    /// AutoProxy list URL for auto-generating PAC (e.g., gfwlist)
-    #[clap(long, conflicts_with = "pac_file")]
-    autoproxy_url: Option<String>,
+    /// Tunnel entries for NAT traversal (client mode).
+    /// Formats: port | localPort:remotePort | host:localPort:remotePort | host:localPort:remotePort:sni
+    #[default(Vec::new())]
+    #[arg(long = "tunnel", conflicts_with_all = ["listen", "tproxy"])]
+    tunnel: Vec<String>,
 
-    /// AutoProxy list update interval in seconds (0 to disable auto-update)
-    #[clap(long, default_value = "86400")]
-    autoproxy_update_secs: u64,
-}
+    /// Client identifier for tunnel mode (required when --tunnel is specified)
+    #[default(String::new())]
+    #[arg(long = "tunnel-client-id")]
+    tunnel_client_id: String,
 
-/// 获取本机的出口 IP 地址
-fn get_local_ip() -> Option<std::net::IpAddr> {
-    // 通过连接外部地址来获取本机使用的出口 IP
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    socket.local_addr().ok().map(|addr| addr.ip())
+    /// Server-side allowed port ranges for tunnel (e.g., "8000-9000,10000-10100")
+    #[default(String::new())]
+    #[arg(long = "tunnel-port-range")]
+    tunnel_port_range: String,
 }
 
 fn rcgen(tls_host: &String) -> anyhow::Result<()> {
@@ -163,7 +185,6 @@ fn rcgen(tls_host: &String) -> anyhow::Result<()> {
 
 async fn start_admin_server(
     listen: &SocketAddr,
-    pac_content: Arc<RwLock<Option<Vec<u8>>>>,
     metrics_registry: utils::MetricsRegistry,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -171,7 +192,6 @@ async fn start_admin_server(
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
-        let pac_content = pac_content.clone();
         let registry = metrics_registry.clone();
 
         tokio::spawn(async move {
@@ -195,24 +215,16 @@ async fn start_admin_server(
             tracing::debug!("Admin server request from {}: {}", addr, path);
 
             let (status, content_type, body) = match path {
-                "/pac" | "/pac.js" => {
-                    let content = pac_content.read().await;
-                    if let Some(ref pac) = *content {
-                        ("200 OK", "application/x-ns-proxy-autoconfig", pac.clone())
-                    } else {
-                        ("404 Not Found", "text/plain; charset=utf-8", "PAC not configured\n".as_bytes().to_vec())
-                    }
-                }
                 "/metrics" => {
                     let metrics = utils::format_metrics(&registry);
                     ("200 OK", "text/plain; charset=utf-8", metrics.into_bytes())
                 }
                 "/" => {
-                    let body = "rsnova admin server\n\nEndpoints:\n  /pac - PAC file\n  /metrics - Server metrics\n";
+                    let body = "rsnova admin server\n\nEndpoints:\n  /metrics - Server metrics\n";
                     ("200 OK", "text/plain; charset=utf-8", body.as_bytes().to_vec())
                 }
                 _ => {
-                    let body = "404 Not Found\n\nAvailable endpoints:\n  /pac - PAC file\n  /metrics - Server metrics\n";
+                    let body = "404 Not Found\n\nAvailable endpoints:\n  /metrics - Server metrics\n";
                     ("404 Not Found", "text/plain; charset=utf-8", body.as_bytes().to_vec())
                 }
             };
@@ -240,67 +252,6 @@ async fn start_admin_server(
     }
 }
 
-async fn watch_pac_file(pac_file: PathBuf, pac_content: Arc<RwLock<Option<Vec<u8>>>>) {
-    let mut last_modified = fs::metadata(&pac_file)
-        .and_then(|m| m.modified())
-        .ok();
-
-    let mut interval = time::interval(Duration::from_secs(5));
-    loop {
-        interval.tick().await;
-
-        let current_modified = match fs::metadata(&pac_file).and_then(|m| m.modified()) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                tracing::warn!("Failed to get PAC file metadata: {}", e);
-                continue;
-            }
-        };
-
-        if current_modified != last_modified {
-            match fs::read(&pac_file) {
-                Ok(new_content) => {
-                    let mut content = pac_content.write().await;
-                    *content = Some(new_content);
-                    last_modified = current_modified;
-                    tracing::info!("PAC file {:?} reloaded", pac_file);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to reload PAC file {:?}: {}", pac_file, e);
-                }
-            }
-        }
-    }
-}
-
-async fn watch_autoproxy(
-    autoproxy_url: String,
-    pac_proxy: String,
-    fetch_proxy: Option<String>,
-    pac_content: Arc<RwLock<Option<Vec<u8>>>>,
-    update_secs: u64,
-) {
-    let mut interval = time::interval(Duration::from_secs(update_secs));
-    // Skip the first tick (already loaded at startup)
-    interval.tick().await;
-
-    loop {
-        interval.tick().await;
-        tracing::info!("Updating autoproxy list from {}", autoproxy_url);
-
-        match utils::fetch_and_generate_pac(&autoproxy_url, &pac_proxy, fetch_proxy.as_deref()).await {
-            Ok(new_content) => {
-                let mut content = pac_content.write().await;
-                *content = Some(new_content);
-                tracing::info!("AutoProxy PAC updated successfully");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to update autoproxy list: {}", e);
-            }
-        }
-    }
-}
-
 async fn service_main(args: &Args) -> anyhow::Result<()> {
     if args.profile {
         tracing_subscriber::fmt::init();
@@ -325,42 +276,58 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 
     tracing::info!("{args:?}");
 
+    let tunnel_entries = if !args.tunnel.is_empty() {
+        if args.tunnel_client_id.is_empty() {
+            return Err(anyhow!("--tunnel-client-id is required when --tunnel is specified"));
+        }
+        let mut entries = Vec::new();
+        for t in &args.tunnel {
+            entries.push(tunnel::tunnel_config::parse_tunnel_arg(t)?);
+        }
+        Some(entries)
+    } else {
+        None
+    };
+
+    let tunnel_port_ranges = if !args.tunnel_port_range.is_empty() {
+        Some(tunnel::tunnel_config::parse_port_range(&args.tunnel_port_range)?)
+    } else {
+        None
+    };
+
     let recorder = utils::MetricsLogRecorder::new();
     let metrics_registry = recorder.get_registry();
     if let Err(e) = metrics::set_boxed_recorder(Box::new(recorder)) {
         tracing::warn!("set metrics recorder failed: {}", e);
     }
 
-    // PAC content shared between admin server and client
-    let pac_content: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
-
     // Start admin server (always enabled)
     let admin_listen = args.admin_listen;
-    let pac_content_for_admin = pac_content.clone();
     let registry = metrics_registry.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_admin_server(&admin_listen, pac_content_for_admin, registry).await {
+        if let Err(e) = start_admin_server(&admin_listen, registry).await {
             tracing::error!("Admin server error: {}", e);
         }
     });
 
     match args.role {
         Role::Client => {
-            // Initialize PAC content from file (can be updated later by autoproxy)
-            if let Some(pac_file) = &args.pac_file {
-                let content = fs::read(pac_file)
-                    .map_err(|e| anyhow!("failed to read PAC file {:?}: {}", pac_file, e))?;
-                {
-                    let mut pac = pac_content.write().await;
-                    *pac = Some(content);
-                }
-
-                // Spawn PAC file watcher for hot reload
-                let pac_file_clone = pac_file.clone();
-                let pac_content_clone = pac_content.clone();
-                tokio::spawn(async move {
-                    watch_pac_file(pac_file_clone, pac_content_clone).await;
-                });
+            if let Some(entries) = tunnel_entries {
+                tracing::info!(
+                    "Starting in tunnel mode with client_id: {}",
+                    args.tunnel_client_id
+                );
+                tunnel::start_tunnel_client(
+                    args.remote.as_ref().unwrap(),
+                    &args.cert,
+                    &args.tls_host,
+                    args.idle_timeout_secs,
+                    args.mux_stream_channel_size,
+                    &args.tunnel_client_id,
+                    entries,
+                )
+                .await?;
+                return Ok(());
             }
 
             let tunnel_sender: UnboundedSender<tunnel::Message> =
@@ -368,7 +335,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     "quic" => {
                         tunnel::new_quic_client(
                             args.remote.as_ref().unwrap(),
-                            args.cert.as_ref().unwrap(),
+                            &args.cert,
                             &args.tls_host,
                             args.concurrent,
                             args.idle_timeout_secs,
@@ -378,7 +345,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     "tls" => {
                         tunnel::new_tls_client(
                             args.remote.as_ref().unwrap(),
-                            args.cert.as_ref().unwrap(),
+                            &args.cert,
                             &args.tls_host,
                             args.concurrent,
                             args.idle_timeout_secs,
@@ -412,65 +379,31 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 }
             });
 
-            // Wait a moment for the proxy to start
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Setup PAC content from autoproxy list (fetch through the proxy we just started)
-            if let Some(autoproxy_url) = &args.autoproxy_url {
-                let proxy_addr = if args.listen.ip().is_unspecified() {
-                    let ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".parse().unwrap());
-                    format!("{}:{}", ip, args.listen.port())
-                } else {
-                    args.listen.to_string()
-                };
-                let pac_proxy = format!("SOCKS5 {}; DIRECT", proxy_addr);
-                let fetch_proxy = format!("socks5://{}", proxy_addr);
-
-                match utils::fetch_and_generate_pac(autoproxy_url, &pac_proxy, Some(&fetch_proxy)).await {
-                    Ok(content) => {
-                        // Update shared pac_content
-                        {
-                            let mut pac = pac_content.write().await;
-                            *pac = Some(content);
-                        }
-
-                        // Spawn autoproxy updater if interval > 0
-                        if args.autoproxy_update_secs > 0 {
-                            let autoproxy_url = autoproxy_url.clone();
-                            let pac_content_clone = pac_content.clone();
-                            let update_interval = args.autoproxy_update_secs;
-                            let fetch_proxy_clone = fetch_proxy.clone();
-                            tokio::spawn(async move {
-                                watch_autoproxy(
-                                    autoproxy_url,
-                                    pac_proxy,
-                                    Some(fetch_proxy_clone),
-                                    pac_content_clone,
-                                    update_interval,
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to fetch autoproxy list: {}", e);
-                    }
-                }
-            }
-
             // Keep the main task running
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         }
         Role::Server => {
+            let registry = if let Some(ranges) = tunnel_port_ranges {
+                let listen_port = args.listen.port();
+                let admin_port = args.admin_listen.port();
+                let reserved = vec![listen_port, admin_port];
+                Some(Arc::new(tokio::sync::Mutex::new(
+                    tunnel::tunnel_registry::TunnelRegistry::new(ranges, reserved),
+                )))
+            } else {
+                None
+            };
+
             match args.protocol {
                 Protocol::Quic => {
                     if let Err(e) = tunnel::start_quic_remote_server(
                         &args.listen,
-                        args.cert.as_ref().unwrap(),
-                        args.key.as_ref().unwrap(),
+                        &args.cert,
+                        &args.key,
                         args.idle_timeout_secs,
+                        registry,
                     )
                     .await
                     {
@@ -480,10 +413,11 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 Protocol::Tls => {
                     if let Err(e) = tunnel::start_tls_remote_server(
                         &args.listen,
-                        args.cert.as_ref().unwrap(),
-                        args.key.as_ref().unwrap(),
+                        &args.cert,
+                        &args.key,
                         args.idle_timeout_secs,
                         args.mux_stream_channel_size,
+                        registry,
                     )
                     .await
                     {
@@ -503,7 +437,23 @@ fn main() {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    let args: Args = Args::parse();
+    let mut cli = Cli::parse();
+
+    // Load config file and merge: CLI args > config file > defaults
+    let args = if let Some(ref config_path) = cli.config {
+        if config_path.exists() {
+            let content = fs::read_to_string(config_path)
+                .unwrap_or_else(|e| panic!("Failed to read config file {:?}: {}", config_path, e));
+            let file_config: <Args as ClapSerde>::Opt = toml::from_str(&content)
+                .unwrap_or_else(|e| panic!("Invalid TOML in {:?}: {}", config_path, e));
+            Args::from(file_config).merge(&mut cli.args)
+        } else {
+            eprintln!("Warning: config file {:?} not found, using CLI args only", config_path);
+            Args::from(&mut cli.args)
+        }
+    } else {
+        Args::from(&mut cli.args)
+    };
 
     if args.rcgen {
         if let Err(e) = rcgen(&args.tls_host) {
