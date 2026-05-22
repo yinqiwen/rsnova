@@ -19,7 +19,7 @@ tracing-subscriber = "0.3"
 tracing-appender = "0.2"
 # console-subscriber = "0.4"
 veil = "0.1"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
@@ -65,6 +65,6 @@ mimalloc = { version = "*" }
 
 
 [features]
-default = ["s2n_quic"]
+default = []
 # s2n_quic = ["dep:s2n-quic", "dep:aws-lc-rs"]
 s2n_quic = ["dep:s2n-quic"]

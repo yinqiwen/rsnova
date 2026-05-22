@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio::time;
 
 use url::Url;
@@ -45,6 +45,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[serde(rename_all = "lowercase")]
 enum Protocol {
     Tls,
+    #[cfg(feature = "s2n_quic")]
     Quic,
 }
 
@@ -140,6 +141,10 @@ struct Args {
     #[default(String::new())]
     #[arg(long)]
     log: String,
+
+    #[default(256)]
+    #[arg(long)]
+    max_connections: usize,
 
     /// HTTP server listen address (serves /metrics)
     #[default("127.0.0.1:48102".parse::<SocketAddr>().unwrap())]
@@ -330,8 +335,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let tunnel_sender: UnboundedSender<tunnel::Message> =
+            let tunnel_sender: Sender<tunnel::Message> =
                 match args.remote.as_ref().unwrap().scheme() {
+                    #[cfg(feature = "s2n_quic")]
                     "quic" => {
                         tunnel::new_quic_client(
                             args.remote.as_ref().unwrap(),
@@ -364,7 +370,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 let mut interval = time::interval(Duration::from_secs(1));
                 loop {
                     interval.tick().await;
-                    if let Err(e) = health_checker.send(tunnel::Message::HealthCheck) {
+                    if let Err(e) = health_checker.send(tunnel::Message::HealthCheck).await {
                         tracing::error!("health check error:{}", e);
                     }
                 }
@@ -373,8 +379,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
             // Start local tunnel server in background
             let listen_addr = args.listen;
             let tproxy = args.tproxy;
+            let max_connections = args.max_connections;
             tokio::spawn(async move {
-                if let Err(e) = tunnel::start_local_tunnel_server(&listen_addr, tunnel_sender, tproxy).await {
+                if let Err(e) = tunnel::start_local_tunnel_server(&listen_addr, tunnel_sender, tproxy, max_connections).await {
                     tracing::error!("local tunnel server error: {e:?}");
                 }
             });
@@ -397,6 +404,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
             };
 
             match args.protocol {
+                #[cfg(feature = "s2n_quic")]
                 Protocol::Quic => {
                     if let Err(e) = tunnel::start_quic_remote_server(
                         &args.listen,

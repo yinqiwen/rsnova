@@ -1,18 +1,19 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use crate::tunnel::http_local::{handle_http, handle_https};
 use crate::tunnel::socks5_local::handle_socks5;
 use crate::tunnel::tls_local::{handle_tls, valid_tls_version};
-use crate::tunnel::Message;
+use crate::tunnel::client::ProxySender;
 use crate::utils::new_tcp_listener;
 use anyhow::{anyhow, Result};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 
 async fn handle_local_tunnel(
     inbound: TcpStream,
     tunnel_id: u32,
-    sender: mpsc::UnboundedSender<Message>,
+    sender: ProxySender,
 ) -> Result<()> {
     //stream.peek(buf)
     let mut peek_buf = [0u8; 3];
@@ -69,10 +70,12 @@ async fn handle_local_tunnel(
 
 pub async fn start_local_tunnel_server(
     addr: &SocketAddr,
-    sender: mpsc::UnboundedSender<Message>,
+    sender: ProxySender,
     tproxy: bool,
+    max_connections: usize,
 ) -> Result<(), std::io::Error> {
     let listener = new_tcp_listener(addr, tproxy).await?;
+    let semaphore = Arc::new(Semaphore::new(max_connections));
 
     #[cfg(target_os = "linux")]
     {
@@ -82,13 +85,21 @@ pub async fn start_local_tunnel_server(
         }
     }
 
-    tracing::info!("Start local TCP listen at {}", addr);
+    tracing::info!("Start local TCP listen at {} (max connections: {})", addr, max_connections);
     let mut tunnel_id_seed: u32 = 0;
     while let Ok((inbound, _)) = listener.accept().await {
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!("Max connections ({}) reached, rejecting new connection", max_connections);
+                continue;
+            }
+        };
         let tunnel_id = tunnel_id_seed;
         tunnel_id_seed += 1;
         let tunnel_sender = sender.clone();
         tokio::spawn(async move {
+            let _permit = permit; // hold permit until task completes
             if let Err(e) = handle_local_tunnel(inbound, tunnel_id, tunnel_sender).await {
                 tracing::error!("handle local tunnel error:{}", e);
             }

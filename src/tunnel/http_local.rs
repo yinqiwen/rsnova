@@ -1,10 +1,10 @@
+use crate::tunnel::client::ProxySender;
 use crate::tunnel::Message;
 use anyhow::{anyhow, Result};
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::tunnel::tls_local;
@@ -72,21 +72,21 @@ fn extract_target(headers_buf: &Vec<u8>, default_port: &str) -> Result<String> {
 pub async fn handle_http(
     _tunnel_id: u32,
     mut inbound: TcpStream,
-    sender: mpsc::UnboundedSender<Message>,
+    sender: ProxySender,
 ) -> Result<()> {
     let headers_buf = read_http_headers(&mut inbound).await?;
     let target_addr = extract_target(&headers_buf, ":80")?;
 
     tracing::info!("{}", target_addr);
     let msg = Message::open_tcp_stream(inbound, target_addr, Some(headers_buf));
-    sender.send(msg)?;
+    sender.send(msg).await?;
     Ok(())
 }
 
 pub async fn handle_https(
     tunnel_id: u32,
     mut inbound: TcpStream,
-    sender: mpsc::UnboundedSender<Message>,
+    sender: ProxySender,
 ) -> Result<()> {
     let headers_buf = read_http_headers(&mut inbound).await?;
     let conn_res = "HTTP/1.0 200 Connection established\r\n\r\n";
@@ -100,6 +100,6 @@ pub async fn handle_https(
     };
     tracing::info!("[{}]Handle HTTPS proxy to {} ", tunnel_id, target_addr);
     let msg = Message::open_tcp_stream(inbound, target_addr, None);
-    sender.send(msg)?;
+    sender.send(msg).await?;
     Ok(())
 }

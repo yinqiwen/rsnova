@@ -3,8 +3,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 
+use crate::tunnel::client::ProxySender;
 use crate::tunnel::Message;
 
 mod v5 {
@@ -48,7 +48,7 @@ fn name_port(addr_buf: &[u8]) -> Option<String> {
 pub async fn handle_socks5(
     tunnel_id: u32,
     mut inbound: TcpStream,
-    sender: mpsc::UnboundedSender<Message>,
+    sender: ProxySender,
 ) -> Result<()> {
     //let mut peek_buf = Vec::new();
     let mut num_methods_buf = [0u8; 2];
@@ -125,6 +125,6 @@ pub async fn handle_socks5(
     tracing::info!("[{}]Handle SOCKS5 proxy to {}", tunnel_id, target_addr);
 
     let msg = Message::open_tcp_stream(inbound, target_addr, None);
-    sender.send(msg)?;
+    sender.send(msg).await?;
     Ok(())
 }

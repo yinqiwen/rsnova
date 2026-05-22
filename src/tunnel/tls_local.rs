@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
 
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 
+use crate::tunnel::client::ProxySender;
 use crate::tunnel::Message;
 
 /// TLS record and handshake constants (RFC 5246, RFC 6066)
@@ -354,7 +354,7 @@ pub async fn peek_sni(inbound: &mut TcpStream) -> Result<String> {
 pub async fn handle_tls(
     tunnel_id: u32,
     inbound: TcpStream,
-    sender: mpsc::UnboundedSender<Message>,
+    sender: ProxySender,
 ) -> Result<()> {
     let target_addr = match peek_sni_v2(&inbound).await {
         Ok(mut sni) => {
@@ -369,7 +369,7 @@ pub async fn handle_tls(
     } else {
         tracing::info!("[{}]Handle TLS proxy to {} ", tunnel_id, target_addr);
         let msg = Message::open_tcp_stream(inbound, target_addr, None);
-        sender.send(msg)?;
+        sender.send(msg).await?;
         Ok(())
     }
 }
