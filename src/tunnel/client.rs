@@ -8,6 +8,15 @@ use url::Url;
 
 use crate::mux::event;
 use crate::mux::event::OpenStreamEvent;
+
+/// Bounded channel capacity for the proxy message queue.
+/// Limits memory growth under load via backpressure.
+pub const PROXY_CHANNEL_CAPACITY: usize = 256;
+
+/// Type alias for the bounded proxy message sender.
+pub type ProxySender = mpsc::Sender<Message>;
+/// Type alias for the bounded proxy message receiver.
+pub type ProxyReceiver = mpsc::Receiver<Message>;
 use crate::tunnel::stream::Stream;
 use crate::utils::UdpServerStream;
 
@@ -118,6 +127,7 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
         }
         Err(anyhow!("no available stream"))
     }
+
     async fn health_check(&mut self) -> anyhow::Result<()> {
         for c in &mut self.conns {
             if !c.is_valid() {
@@ -148,7 +158,7 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
 
 pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
     mut client: T,
-    mut receiver: mpsc::UnboundedReceiver<Message>,
+    mut receiver: ProxyReceiver,
     idle_timeout_secs: usize,
 ) where
     <T as MuxClientTrait>::SendStream: 'static,

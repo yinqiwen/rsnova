@@ -13,6 +13,7 @@ use url::Url;
 use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
+use super::client::{ProxySender, PROXY_CHANNEL_CAPACITY};
 use super::Message;
 use crate::mux::event;
 use crate::mux::MuxStream;
@@ -112,10 +113,10 @@ impl MuxClient<TlsConnection> {
         count: usize,
         idle_timeout_secs: usize,
         stream_channel_size: usize,
-    ) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
+    ) -> anyhow::Result<ProxySender> {
         match url.scheme() {
             "tls" => {
-                let (sender, receiver) = mpsc::unbounded_channel::<Message>();
+                let (sender, receiver) = mpsc::channel::<Message>(PROXY_CHANNEL_CAPACITY);
                 let mut client: MuxClient<TlsConnection> = MuxClient {
                     url: url.clone(),
                     conns: Vec::new(),
@@ -217,7 +218,7 @@ pub async fn new_tls_client(
     count: usize,
     idle_timeout_secs: usize,
     stream_channel_size: usize,
-) -> anyhow::Result<mpsc::UnboundedSender<Message>> {
+) -> anyhow::Result<ProxySender> {
     MuxClient::<TlsConnection>::from(
         url,
         cert_path,

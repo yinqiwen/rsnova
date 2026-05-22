@@ -21,7 +21,7 @@ pub const FLAG_AUTH_ACK: u8 = 9;
 pub const FLAG_REVERSE_OPEN: u8 = 10;
 
 pub const EVENT_HEADER_LEN: usize = 8;
-pub const MAX_EVENT_BODY_LEN: u32 = 16 * 1024 * 1024; // 16MB
+pub const MAX_EVENT_BODY_LEN: u32 = 256 * 1024; // 256KB (was 16MB, reduced for embedded)
 
 // pub fn get_event_type_str(flags: u8) -> &'static str {
 //     match flags {

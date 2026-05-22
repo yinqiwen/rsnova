@@ -13,6 +13,7 @@ use super::event;
 use super::stream::Control;
 
 pub const DEFAULT_STREAM_CHANNEL_SIZE: usize = 16;
+pub const CONTROL_CHANNEL_CAPACITY: usize = 256;
 
 pub struct Connection {
     ev_writer: mpsc::Sender<Control>,
@@ -36,7 +37,7 @@ impl Connection {
         id: u32,
         stream_channel_size: usize,
     ) -> Self {
-        let (sender_orig, receiver) = mpsc::channel::<Control>(4096);
+        let (sender_orig, receiver) = mpsc::channel::<Control>(CONTROL_CHANNEL_CAPACITY);
         let sender = sender_orig.clone();
         tokio::spawn(async move {
             handle_mux_connection(id, r, w, receiver, sender, stream_channel_size).await;

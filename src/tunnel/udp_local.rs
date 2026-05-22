@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, num::NonZeroUsize};
 
+use super::client::ProxySender;
 use super::Message;
 use crate::utils::{
     new_udp_listener, LinuxTproxyUdpSocket, UdpServerStream, MAXIMUM_UDP_PAYLOAD_SIZE,
@@ -36,7 +37,7 @@ impl UdpAssociateManager {
 
 pub(crate) fn start_local_udp_tunnel_server(
     addr: &SocketAddr,
-    _msg_sender: mpsc::UnboundedSender<Message>,
+    _msg_sender: ProxySender,
 ) -> Result<(), std::io::Error> {
     let udp_socket = new_udp_listener(addr, true)?;
     let tproxy_udp_server = LinuxTproxyUdpSocket::new(udp_socket)?;
