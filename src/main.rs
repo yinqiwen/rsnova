@@ -49,7 +49,7 @@ enum Role {
 
 /// Outer CLI struct: only handles --config path and forwards the rest
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CARGO_PKG_AUTHORS"), ")"), about, long_about = None)]
 struct Cli {
     /// Config file path (TOML format)
     #[arg(short, long)]

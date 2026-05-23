@@ -27,16 +27,16 @@ A Rust secure proxy and tunnel that multiplexes traffic over encrypted TLS and Q
 
 ## Quick Start
 
-### Build
+### Install
 
 ```sh
-cargo build --release
+cargo install rsnova
 ```
 
 ### 1. Generate certificates
 
 ```sh
-./target/release/rsnova --rcgen true --tls_host mydomain.io
+rsnova --rcgen true --tls_host mydomain.io
 ```
 
 This creates `cert.pem` and `key.pem` in the current directory.
@@ -46,7 +46,7 @@ This creates `cert.pem` and `key.pem` in the current directory.
 The server listens for both TLS (TCP) and QUIC (UDP) on the same address — no protocol flag required:
 
 ```sh
-./target/release/rsnova --role server --key key.pem --cert cert.pem --listen 0.0.0.0:48100
+rsnova --role server --key key.pem --cert cert.pem --listen 0.0.0.0:48100
 ```
 
 ### 3. Start the client
@@ -55,10 +55,10 @@ The client selects transport from the `--remote` URL scheme:
 
 ```sh
 # TLS
-./target/release/rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote tls://<server-ip>:48100 --tls_host mydomain.io
+rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote tls://<server-ip>:48100 --tls_host mydomain.io
 
 # QUIC
-./target/release/rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote quic://<server-ip>:48100 --tls_host mydomain.io
+rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote quic://<server-ip>:48100 --tls_host mydomain.io
 ```
 
 ### 4. Use the proxy
@@ -69,12 +69,12 @@ Point your browser or tools at `socks5://127.0.0.1:48100` or `http://127.0.0.1:4
 
 ```sh
 # Client: map local SSH (22) to remote port 2222
-./target/release/rsnova --role client --cert cert.pem --remote tls://<server-ip>:48100 \
+rsnova --role client --cert cert.pem --remote tls://<server-ip>:48100 \
   --tls_host mydomain.io --tunnel-client-id myhost \
   --tunnel 22:2222
 
 # Server: allow tunnel ports 8000-9000
-./target/release/rsnova --role server --key key.pem --cert cert.pem \
+rsnova --role server --key key.pem --cert cert.pem \
   --listen 0.0.0.0:48100 --tunnel-port-range 8000-9000
 ```
 

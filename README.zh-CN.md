@@ -27,16 +27,16 @@ Rust 实现的安全代理/隧道工具，基于 QUIC 和 TLS 协议提供多路
 
 ## 使用说明
 
-### 构建
+### 安装
 
 ```sh
-cargo build --release
+cargo install rsnova
 ```
 
 ### 1. 生成证书
 
 ```sh
-./target/release/rsnova --rcgen true --tls_host mydomain.io
+rsnova --rcgen true --tls_host mydomain.io
 ```
 
 生成 `cert.pem` 和 `key.pem`。
@@ -46,7 +46,7 @@ cargo build --release
 服务端同时监听 TLS (TCP) 和 QUIC (UDP)，无需指定协议：
 
 ```sh
-./target/release/rsnova --role server --key key.pem --cert cert.pem --listen 0.0.0.0:48100
+rsnova --role server --key key.pem --cert cert.pem --listen 0.0.0.0:48100
 ```
 
 ### 3. 启动客户端
@@ -55,10 +55,10 @@ cargo build --release
 
 ```sh
 # TLS
-./target/release/rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote tls://<server-ip>:48100 --tls_host mydomain.io
+rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote tls://<server-ip>:48100 --tls_host mydomain.io
 
 # QUIC
-./target/release/rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote quic://<server-ip>:48100 --tls_host mydomain.io
+rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote quic://<server-ip>:48100 --tls_host mydomain.io
 ```
 
 ### 4. 使用代理
@@ -69,12 +69,12 @@ cargo build --release
 
 ```sh
 # 客户端：将本地 SSH (22) 映射到服务端 2222 端口
-./target/release/rsnova --role client --cert cert.pem --remote tls://<server-ip>:48100 \
+rsnova --role client --cert cert.pem --remote tls://<server-ip>:48100 \
   --tls_host mydomain.io --tunnel-client-id myhost \
   --tunnel 22:2222
 
 # 服务端：允许隧道使用 8000-9000 端口
-./target/release/rsnova --role server --key key.pem --cert cert.pem \
+rsnova --role server --key key.pem --cert cert.pem \
   --listen 0.0.0.0:48100 --tunnel-port-range 8000-9000
 ```
 
