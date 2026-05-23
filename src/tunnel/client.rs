@@ -201,7 +201,7 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                                 &mut send,
                             );
                             if let Err(e) = stream.transfer(idle_timeout_secs).await {
-                                tracing::error!("transfer finish:{}", e);
+                                tracing::debug!("transfer finish:{}", e);
                             }
                         } else if let Some(udp_stream) = event.udp_stream {
                             let (mut local_reader, mut local_writer) = tokio::io::split(udp_stream);
@@ -232,7 +232,7 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                                 &mut send,
                             );
                             if let Err(e) = stream.transfer(idle_timeout_secs).await {
-                                tracing::error!("transfer finish:{}", e);
+                                tracing::debug!("transfer finish:{}", e);
                             }
                         }
                         decrement_gauge!("client_proxy_streams", 1.0);

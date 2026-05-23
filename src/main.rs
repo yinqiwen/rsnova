@@ -95,7 +95,7 @@ struct Args {
     #[arg(long)]
     thread_stack_size: usize,
 
-    #[default(30)]
+    #[default(120)]
     #[arg(long)]
     idle_timeout_secs: usize,
 
