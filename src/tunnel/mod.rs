@@ -4,9 +4,9 @@ mod local;
 #[cfg(target_os = "linux")]
 mod udp_local;
 
-mod socks5_local;
 mod s2n_quic_client;
 mod s2n_quic_remote;
+mod socks5_local;
 mod stream;
 mod tls_client;
 mod tls_local;
@@ -39,7 +39,7 @@ pub async fn start_tunnel_client(
     cert_path: &std::path::Path,
     host: &str,
     idle_timeout_secs: usize,
-    stream_channel_size: usize,
+    stream_window: u32,
     app_config: std::sync::Arc<crate::app_config::AppConfig>,
 ) -> anyhow::Result<()> {
     match url.scheme() {
@@ -49,20 +49,13 @@ pub async fn start_tunnel_client(
                 cert_path,
                 host,
                 idle_timeout_secs,
-                stream_channel_size,
+                stream_window,
                 app_config,
             )
             .await
         }
         "quic" => {
-            start_tunnel_client_quic(
-                url,
-                cert_path,
-                host,
-                app_config,
-                idle_timeout_secs,
-            )
-            .await
+            start_tunnel_client_quic(url, cert_path, host, app_config, idle_timeout_secs).await
         }
         _ => Err(anyhow::anyhow!("unsupported scheme: {}", url.scheme())),
     }

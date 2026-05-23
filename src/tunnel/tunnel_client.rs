@@ -19,7 +19,7 @@ pub async fn start_tunnel_client_tls(
     cert_path: &Path,
     host: &str,
     idle_timeout_secs: usize,
-    stream_channel_size: usize,
+    stream_window: u32,
     app_config: Arc<AppConfig>,
 ) -> Result<()> {
     const INITIAL_BACKOFF_SECS: u64 = 1;
@@ -40,7 +40,7 @@ pub async fn start_tunnel_client_tls(
                 url,
                 cert_path,
                 host,
-                stream_channel_size,
+                stream_window,
                 &client_id,
                 &entries,
                 idle_timeout_secs,
@@ -75,12 +75,12 @@ async fn run_tunnel_connection_tls(
     url: &Url,
     cert_path: &Path,
     host: &str,
-    stream_channel_size: usize,
+    stream_window: u32,
     client_id: &str,
     entries: &[TunnelEntry],
     idle_timeout_secs: usize,
 ) -> Result<()> {
-    let mut conn = TlsConnection::new(stream_channel_size);
+    let mut conn = TlsConnection::new(stream_window);
     conn.connect(url, cert_path, host).await?;
     tracing::info!("TLS tunnel connection established");
 
@@ -125,7 +125,10 @@ async fn run_tunnel_connection_tls(
     }
 }
 
-pub async fn handle_reverse_stream<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
+pub async fn handle_reverse_stream<
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+>(
     recv: &mut R,
     send: &mut W,
     idle_timeout_secs: usize,

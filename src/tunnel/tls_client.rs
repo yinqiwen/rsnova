@@ -24,15 +24,15 @@ use crate::utils::read_tokio_tls_certs;
 pub struct TlsConnection {
     pub(crate) inner: Option<mux::Connection>,
     pub(crate) id: u32,
-    pub(crate) stream_channel_size: usize,
+    pub(crate) stream_window: u32,
 }
 
 impl TlsConnection {
-    pub fn new(stream_channel_size: usize) -> Self {
+    pub fn new(stream_window: u32) -> Self {
         Self {
             inner: None,
             id: 0,
-            stream_channel_size,
+            stream_window,
         }
     }
 }
@@ -54,12 +54,12 @@ impl MuxConnection for TlsConnection {
         match new_tls_connection(url, key_path, host).await {
             Ok(c) => {
                 let (r, w) = tokio::io::split(c);
-                let mux_conn = mux::Connection::new_with_stream_channel_size(
+                let mux_conn = mux::Connection::new_with_stream_window(
                     r,
                     w,
                     mux::Mode::Client,
                     self.id,
-                    self.stream_channel_size,
+                    self.stream_window,
                 );
                 self.inner = Some(mux_conn);
                 Ok(())
@@ -112,7 +112,7 @@ impl MuxClient<TlsConnection> {
         host: &String,
         count: usize,
         idle_timeout_secs: usize,
-        stream_channel_size: usize,
+        stream_window: u32,
     ) -> anyhow::Result<ProxySender> {
         match url.scheme() {
             "tls" => {
@@ -128,7 +128,7 @@ impl MuxClient<TlsConnection> {
                     let mut tls_conn: TlsConnection = TlsConnection {
                         inner: None,
                         id: i as u32,
-                        stream_channel_size,
+                        stream_window,
                     };
                     match tls_conn.connect(url, cert_path, host).await {
                         Err(e) => {
@@ -217,7 +217,7 @@ pub async fn new_tls_client(
     host: &String,
     count: usize,
     idle_timeout_secs: usize,
-    stream_channel_size: usize,
+    stream_window: u32,
 ) -> anyhow::Result<ProxySender> {
     MuxClient::<TlsConnection>::from(
         url,
@@ -225,7 +225,7 @@ pub async fn new_tls_client(
         host,
         count,
         idle_timeout_secs,
-        stream_channel_size,
+        stream_window,
     )
     .await
 }
