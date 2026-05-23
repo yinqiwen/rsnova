@@ -50,11 +50,6 @@ lru = "0.12.5"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# [target.'cfg(not(target_os = "windows"))'.dependencies]
-# aws-lc-rs = { version = "1", features = ["bindgen"], optional = true }
-[target.'cfg(target_arch = "arm")'.dependencies]
-aws-lc-rs = { version = "1" }
-
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
 mimalloc = "0.1"
 
