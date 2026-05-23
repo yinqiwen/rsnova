@@ -49,7 +49,7 @@ enum Role {
 
 /// Outer CLI struct: only handles --config path and forwards the rest
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CARGO_PKG_AUTHORS"), ")"), about, long_about = None)]
 struct Cli {
     /// Config file path (TOML format)
     #[arg(short, long)]
@@ -95,14 +95,14 @@ struct Args {
     #[arg(long)]
     thread_stack_size: usize,
 
-    #[default(30)]
+    #[default(120)]
     #[arg(long)]
     idle_timeout_secs: usize,
 
-    /// Per-stream mux inbound channel size (TLS protocol only)
-    #[default(mux::DEFAULT_STREAM_CHANNEL_SIZE)]
+    /// Per-stream flow control window in bytes (TLS protocol only)
+    #[default(mux::INITIAL_STREAM_WINDOW)]
     #[arg(long)]
-    mux_stream_channel_size: usize,
+    mux_stream_window: u32,
 
     #[default("mydomain.io".to_string())]
     #[arg(long)]
@@ -201,7 +201,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 
     let tunnel_entries = if !args.tunnel.is_empty() {
         if args.tunnel_client_id.is_empty() {
-            return Err(anyhow!("--tunnel-client-id is required when --tunnel is specified"));
+            return Err(anyhow!(
+                "--tunnel-client-id is required when --tunnel is specified"
+            ));
         }
         let mut entries = Vec::new();
         for t in &args.tunnel {
@@ -213,7 +215,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
     };
 
     let tunnel_port_ranges = if !args.tunnel_port_range.is_empty() {
-        Some(tunnel::tunnel_config::parse_port_range(&args.tunnel_port_range)?)
+        Some(tunnel::tunnel_config::parse_port_range(
+            &args.tunnel_port_range,
+        )?)
     } else {
         None
     };
@@ -248,7 +252,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
             admin_listen: args.admin_listen.to_string(),
             tproxy: args.tproxy,
         },
-        reload_token: Arc::new(tokio::sync::Mutex::new(tokio_util::sync::CancellationToken::new())),
+        reload_token: Arc::new(tokio::sync::Mutex::new(
+            tokio_util::sync::CancellationToken::new(),
+        )),
     });
 
     // Start admin server (always enabled)
@@ -278,7 +284,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     &args.cert,
                     &args.tls_host,
                     args.idle_timeout_secs,
-                    args.mux_stream_channel_size,
+                    args.mux_stream_window,
                     app_config,
                 )
                 .await?;
@@ -304,7 +310,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             &args.tls_host,
                             args.concurrent,
                             args.idle_timeout_secs,
-                            args.mux_stream_channel_size,
+                            args.mux_stream_window,
                         )
                         .await?
                     }
@@ -330,7 +336,14 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
             let tproxy = args.tproxy;
             let max_connections = args.max_connections;
             tokio::spawn(async move {
-                if let Err(e) = tunnel::start_local_tunnel_server(&listen_addr, tunnel_sender, tproxy, max_connections).await {
+                if let Err(e) = tunnel::start_local_tunnel_server(
+                    &listen_addr,
+                    tunnel_sender,
+                    tproxy,
+                    max_connections,
+                )
+                .await
+                {
                     tracing::error!("local tunnel server error: {e:?}");
                 }
             });
@@ -359,7 +372,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
             let quic_cert = args.cert.clone();
             let quic_key = args.key.clone();
             let idle = args.idle_timeout_secs;
-            let channel_size = args.mux_stream_channel_size;
+            let stream_window = args.mux_stream_window;
             let tls_registry = registry.clone();
 
             let tls_handle = tokio::spawn(async move {
@@ -368,7 +381,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     &tls_cert,
                     &tls_key,
                     idle,
-                    channel_size,
+                    stream_window,
                     tls_registry,
                 )
                 .await
@@ -418,7 +431,10 @@ fn main() {
                 .unwrap_or_else(|e| panic!("Invalid TOML in {:?}: {}", config_path, e));
             Args::from(file_config).merge(&mut cli.args)
         } else {
-            eprintln!("Warning: config file {:?} not found, using CLI args only", config_path);
+            eprintln!(
+                "Warning: config file {:?} not found, using CLI args only",
+                config_path
+            );
             Args::from(&mut cli.args)
         }
     } else {

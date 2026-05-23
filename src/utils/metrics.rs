@@ -32,7 +32,8 @@ pub fn format_metrics(registry: &MetricsRegistry) -> String {
     metrics_info.push_str("Gauges:\n");
     registry.visit_gauges(|name, gauge| {
         let n = gauge.load(std::sync::atomic::Ordering::Relaxed);
-        metrics_info.push_str(format!("  {}:{}\n", name, f64::from_bits(n) as u64).as_str());
+        let value = f64::from_bits(n);
+        metrics_info.push_str(format!("  {}:{:.2}\n", name, value).as_str());
     });
     metrics_info.push_str("Counters:\n");
     registry.visit_counters(|name, counter| {
@@ -44,6 +45,25 @@ pub fn format_metrics(registry: &MetricsRegistry) -> String {
             )
             .as_str(),
         );
+    });
+    metrics_info.push_str("Histograms:\n");
+    registry.visit_histograms(|name, histogram| {
+        let samples: Vec<f64> = histogram.data();
+        if samples.is_empty() {
+            metrics_info.push_str(format!("  {}: no data\n", name).as_str());
+        } else {
+            let count = samples.len();
+            let sum: f64 = samples.iter().sum();
+            let min = samples.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            metrics_info.push_str(
+                format!(
+                    "  {}: count={} sum={:.2} min={:.2} max={:.2}\n",
+                    name, count, sum, min, max
+                )
+                .as_str(),
+            );
+        }
     });
     metrics_info
 }

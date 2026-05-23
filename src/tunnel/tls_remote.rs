@@ -20,7 +20,7 @@ pub async fn start_tls_remote_server(
     cert_path: &Path,
     key_path: &Path,
     idle_timeout_secs: usize,
-    stream_channel_size: usize,
+    stream_window: u32,
     registry: Option<crate::tunnel::tunnel_registry::SharedRegistry>,
 ) -> Result<()> {
     let certs = read_tokio_tls_certs(cert_path)?;
@@ -52,14 +52,8 @@ pub async fn start_tls_remote_server(
         let fut = async move {
             let stream = acceptor.accept(stream).await?;
             tracing::info!("TLS connection incoming");
-            handle_tls_connection(
-                stream,
-                conn_id,
-                idle_timeout_secs,
-                stream_channel_size,
-                registry,
-            )
-            .await?;
+            handle_tls_connection(stream, conn_id, idle_timeout_secs, stream_window, registry)
+                .await?;
             Ok(()) as Result<()>
         };
 
@@ -76,16 +70,16 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
     conn: T,
     id: u32,
     idle_timeout_secs: usize,
-    stream_channel_size: usize,
+    stream_window: u32,
     registry: Option<crate::tunnel::tunnel_registry::SharedRegistry>,
 ) -> Result<()> {
     let (r, w) = tokio::io::split(conn);
-    let mux_conn = Arc::new(mux::Connection::new_with_stream_channel_size(
+    let mux_conn = Arc::new(mux::Connection::new_with_stream_window(
         r,
         w,
         mux::Mode::Server,
         id,
-        stream_channel_size,
+        stream_window,
     ));
 
     let auth_stream = mux_conn.accept_stream().await?;

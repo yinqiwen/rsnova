@@ -1,94 +1,96 @@
 # rsnova
 
-Rust 实现的安全代理/隧道工具，基于 QUIC 和 TLS 协议提供多路复用的网络隧道。
+[简体中文](README.zh-CN.md)
 
-## 特性
+A Rust secure proxy and tunnel that multiplexes traffic over encrypted TLS and QUIC connections.
 
-- **加密传输** — 支持 TLS (rustls) 和 QUIC (s2n-quic) 两种加密隧道协议，服务端同时监听
-- **多协议代理** — 自动识别 SOCKS5、HTTP/HTTPS、TLS SNI 协议，无法识别时回退到透明代理
-- **流多路复用** — 单条连接上承载多个数据流，内置背压控制和连接池
-- **NAT 穿透** — 反向隧道模式，将内网服务暴露到公网，支持 SNI 域名路由
-- **透明代理** — Linux 下支持 `SO_ORIGINAL_DST` / tproxy（TCP + UDP）
-- **自签证书** — 内置 `--rcgen` 一键生成 TLS 证书
-- **后台运行** — Unix 下支持 `-d` 守护进程模式
-- **日志轮转** — `--log` 指定日志文件，自动按天轮转
-- **监控接口** — 内置 Admin HTTP 服务，提供 `/metrics` 端点
+## Features
 
-## 使用场景
+- **Encrypted transport** — TLS (rustls) and QUIC (s2n-quic); the server listens on both simultaneously
+- **Multi-protocol proxy** — Auto-detects SOCKS5, HTTP/HTTPS, and TLS SNI; falls back to transparent proxy
+- **Stream multiplexing** — Many logical streams over one connection, with WINDOW_UPDATE flow control and a connection pool
+- **NAT traversal** — Reverse tunnel mode to expose local services on a public server, with optional SNI routing
+- **Transparent proxy** — Linux `SO_ORIGINAL_DST` / tproxy support (TCP + UDP)
+- **Self-signed certs** — Built-in `--rcgen` certificate generation
+- **Daemon mode** — Background execution on Unix (`-d`)
+- **Log rotation** — Daily rotation via `--log`
+- **Admin HTTP** — Built-in `/metrics` and `/config` endpoints
 
-| 场景 | 说明 |
-|------|------|
-| 安全代理 | 客户端提供 SOCKS5/HTTP 代理入口，通过加密隧道转发到服务端访问目标网络 |
-| 内网穿透 | 将内网服务（SSH、数据库、Web 等）通过反向隧道暴露到公网服务器 |
-| 透明代理 | Linux 网关上配合 iptables/nftables 做透明代理，无需客户端配置 |
-| TLS SNI 路由 | 根据 TLS ClientHello 中的 SNI 域名路由到不同后端服务 |
+## Use Cases
 
-## 使用说明
+| Scenario | Description |
+|----------|-------------|
+| Secure proxy | Client exposes SOCKS5/HTTP locally; traffic is forwarded through an encrypted tunnel to reach targets on the server side |
+| NAT traversal | Expose internal services (SSH, databases, web apps) on a public host via reverse tunnels |
+| Transparent proxy | Gateway transparent proxy on Linux with iptables/nftables, no client configuration |
+| TLS SNI routing | Route by SNI hostname from TLS ClientHello to different backend services |
 
-### 构建
+## Quick Start
 
-```sh
-cargo build --release
-```
-
-### 1. 生成证书
+### Install
 
 ```sh
-./target/release/rsnova --rcgen true --tls_host mydomain.io
+cargo install rsnova
 ```
 
-生成 `cert.pem` 和 `key.pem`。
-
-### 2. 启动服务端
-
-服务端同时监听 TLS (TCP) 和 QUIC (UDP)，无需指定协议：
+### 1. Generate certificates
 
 ```sh
-./target/release/rsnova --role server --key key.pem --cert cert.pem --listen 0.0.0.0:48100
+rsnova --rcgen true --tls_host mydomain.io
 ```
 
-### 3. 启动客户端
+This creates `cert.pem` and `key.pem` in the current directory.
 
-客户端根据 `--remote` 的 URL scheme 自动选择协议：
+### 2. Start the server
+
+The server listens for both TLS (TCP) and QUIC (UDP) on the same address — no protocol flag required:
+
+```sh
+rsnova --role server --key key.pem --cert cert.pem --listen 0.0.0.0:48100
+```
+
+### 3. Start the client
+
+The client selects transport from the `--remote` URL scheme:
 
 ```sh
 # TLS
-./target/release/rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote tls://<server-ip>:48100 --tls_host mydomain.io
+rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote tls://<server-ip>:48100 --tls_host mydomain.io
 
 # QUIC
-./target/release/rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote quic://<server-ip>:48100 --tls_host mydomain.io
+rsnova --role client --cert cert.pem --listen 127.0.0.1:48100 --remote quic://<server-ip>:48100 --tls_host mydomain.io
 ```
 
-### 4. 使用代理
+### 4. Use the proxy
 
-浏览器或工具配置代理为 `socks5://127.0.0.1:48100` 或 `http://127.0.0.1:48100`。
+Point your browser or tools at `socks5://127.0.0.1:48100` or `http://127.0.0.1:48100`.
 
-### NAT 穿透（反向隧道）
+### NAT Traversal (Reverse Tunnel)
 
 ```sh
-# 客户端：将本地 SSH (22) 映射到服务端 2222 端口
-./target/release/rsnova --role client --cert cert.pem --remote tls://<server-ip>:48100 \
+# Client: map local SSH (22) to remote port 2222
+rsnova --role client --cert cert.pem --remote tls://<server-ip>:48100 \
   --tls_host mydomain.io --tunnel-client-id myhost \
   --tunnel 22:2222
 
-# 服务端：允许隧道使用 8000-9000 端口
-./target/release/rsnova --role server --key key.pem --cert cert.pem \
+# Server: allow tunnel ports 8000-9000
+rsnova --role server --key key.pem --cert cert.pem \
   --listen 0.0.0.0:48100 --tunnel-port-range 8000-9000
 ```
 
-隧道格式：
+Tunnel entry formats:
 
-| 格式 | 说明 |
-|------|------|
-| `port` | localhost:port → 远端同端口 |
-| `localPort:remotePort` | localhost:localPort → 远端 remotePort |
-| `host:localPort:remotePort` | host:localPort → 远端 remotePort |
-| `host:localPort:remotePort:sni` | 同上，附带 SNI 域名路由 |
-| `[ipv6]:localPort:remotePort[:sni]` | IPv6 地址支持 |
+| Format | Description |
+|--------|-------------|
+| `port` | localhost:port → same port on server |
+| `localPort:remotePort` | localhost:localPort → server remotePort |
+| `host:localPort:remotePort` | host:localPort → server remotePort |
+| `host:localPort:remotePort:sni` | Same as above, with SNI domain routing |
+| `[ipv6]:localPort:remotePort[:sni]` | IPv6 host support |
 
-### 配置文件
+### Configuration File
 
-支持 TOML 配置文件（`-c config.toml`），CLI 参数优先级高于配置文件：
+All options can be set in a TOML file (`-c config.toml`). CLI arguments override file values:
 
 ```toml
 listen = "127.0.0.1:48100"
@@ -99,23 +101,26 @@ key = "key.pem"
 tls_host = "mydomain.io"
 concurrent = 5
 threads = 2
-idle_timeout_secs = 30
+idle_timeout_secs = 120
+mux_stream_window = 262144
 max_connections = 256
 admin_listen = "127.0.0.1:48102"
 ```
 
-### 常用参数
+### Common Options
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--listen` | `127.0.0.1:48100` | 代理监听地址 |
-| `--role` | `client` | `client` 或 `server` |
-| `--remote` | — | 远端地址 (`tls://host:port` 或 `quic://host:port`) |
-| `--concurrent` | `5` | 连接池大小 |
-| `--max-connections` | `256` | 最大并发代理连接数 |
-| `--tunnel` | — | 隧道条目（与 `--listen`/`--tproxy` 互斥） |
-| `--tunnel-port-range` | — | 服务端允许的端口范围，如 `8000-9000,10000-10100` |
-| `--tproxy` | `false` | 透明代理模式 (Linux) |
-| `-d, --daemon` | `false` | 后台运行 (Unix) |
-| `--log` | — | 日志文件路径 |
-| `-c, --config` | — | TOML 配置文件路径 |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--listen` | `127.0.0.1:48100` | Local proxy listen address |
+| `--role` | `client` | `client` or `server` |
+| `--remote` | — | Remote URL (`tls://host:port` or `quic://host:port`) |
+| `--concurrent` | `5` | Connection pool size |
+| `--max-connections` | `256` | Max concurrent proxy connections |
+| `--idle-timeout-secs` | `120` | Idle timeout per relay (seconds) |
+| `--mux-stream-window` | `262144` | TLS mux per-stream flow-control window (bytes) |
+| `--tunnel` | — | Tunnel entries (conflicts with `--listen` / `--tproxy`) |
+| `--tunnel-port-range` | — | Allowed port ranges on server, e.g. `8000-9000,10000-10100` |
+| `--tproxy` | `false` | Transparent proxy mode (Linux) |
+| `-d, --daemon` | `false` | Run in background (Unix) |
+| `--log` | — | Log file path |
+| `-c, --config` | — | TOML config file path |

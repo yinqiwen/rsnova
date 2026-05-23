@@ -14,6 +14,7 @@ pub const FLAG_SHUTDOWN: u8 = 7;
 pub const FLAG_AUTH: u8 = 6;
 pub const FLAG_AUTH_ACK: u8 = 9;
 pub const FLAG_REVERSE_OPEN: u8 = 10;
+pub const FLAG_WIN_UPDATE: u8 = 8;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 pub const MAX_EVENT_BODY_LEN: u32 = 256 * 1024; // 256KB (was 16MB, reduced for embedded)
@@ -183,6 +184,16 @@ pub fn new_ping_event() -> Event {
             stream_id: 0,
         },
         body: Bytes::new(),
+    }
+}
+
+pub fn new_window_update_event(sid: u32, increment: u32) -> Event {
+    Event {
+        header: Header {
+            flag_len: get_flag_len(4, FLAG_WIN_UPDATE),
+            stream_id: sid,
+        },
+        body: Bytes::copy_from_slice(&increment.to_le_bytes()),
     }
 }
 
@@ -386,5 +397,25 @@ mod tests {
             writer.written,
             expected_bytes(get_flag_len(body.len() as u32, FLAG_DATA), 42, &body)
         );
+    }
+
+    #[tokio::test]
+    async fn write_read_window_update_event() {
+        let ev = new_window_update_event(42, 131072);
+        assert_eq!(ev.header.flags(), FLAG_WIN_UPDATE);
+        assert_eq!(ev.header.len(), 4);
+        assert_eq!(ev.header.stream_id, 42);
+        let increment = u32::from_le_bytes(ev.body[..4].try_into().unwrap());
+        assert_eq!(increment, 131072);
+
+        let mut writer = PartialVecWriter::new(1024);
+        write_event(&mut writer, ev).await.unwrap();
+
+        let mut reader = &writer.written[..];
+        let decoded = read_event(&mut reader).await.unwrap();
+        assert_eq!(decoded.header.flags(), FLAG_WIN_UPDATE);
+        assert_eq!(decoded.header.stream_id, 42);
+        let decoded_increment = u32::from_le_bytes(decoded.body[..4].try_into().unwrap());
+        assert_eq!(decoded_increment, 131072);
     }
 }

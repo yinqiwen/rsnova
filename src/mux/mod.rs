@@ -4,5 +4,5 @@ mod stream;
 
 pub use connection::Connection;
 pub use connection::Mode;
-pub use connection::DEFAULT_STREAM_CHANNEL_SIZE;
+pub use connection::INITIAL_STREAM_WINDOW;
 pub use stream::MuxStream;

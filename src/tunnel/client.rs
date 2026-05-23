@@ -168,7 +168,7 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
     while let Some(msg) = receiver.recv().await {
         match msg {
             Message::OpenStream(event) => {
-                tracing::info!("Proxy request to {}", event.event.addr);
+                // tracing::info!("Proxy request to {}", event.event.addr);
                 if let Ok((mut send, mut recv)) = client.open_stream().await {
                     increment_gauge!("client_proxy_streams", 1.0);
                     tokio::spawn(async move {
@@ -201,7 +201,7 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                                 &mut send,
                             );
                             if let Err(e) = stream.transfer(idle_timeout_secs).await {
-                                tracing::error!("transfer finish:{}", e);
+                                tracing::debug!("transfer finish:{}", e);
                             }
                         } else if let Some(udp_stream) = event.udp_stream {
                             let (mut local_reader, mut local_writer) = tokio::io::split(udp_stream);
@@ -232,7 +232,7 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                                 &mut send,
                             );
                             if let Err(e) = stream.transfer(idle_timeout_secs).await {
-                                tracing::error!("transfer finish:{}", e);
+                                tracing::debug!("transfer finish:{}", e);
                             }
                         }
                         decrement_gauge!("client_proxy_streams", 1.0);
@@ -244,16 +244,14 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
             Message::HealthCheck => {
                 let _ = client.health_check().await;
             }
-            Message::AddConnection(c) => {
-                match c.downcast::<T::Connection>().ok() {
-                    Some(obj) => {
-                        let _ = client.add_connection(*obj);
-                    }
-                    None => {
-                        tracing::error!("AddConnection failed: connection type mismatch");
-                    }
+            Message::AddConnection(c) => match c.downcast::<T::Connection>().ok() {
+                Some(obj) => {
+                    let _ = client.add_connection(*obj);
                 }
-            }
+                None => {
+                    tracing::error!("AddConnection failed: connection type mismatch");
+                }
+            },
         }
     }
 }

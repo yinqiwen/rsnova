@@ -5,6 +5,7 @@ Cargo.lock
 .vscode
 *.der
 *.pem
+rsnova_linux
 
 
 # Added by cargo

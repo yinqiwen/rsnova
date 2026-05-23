@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::tunnel::client::ProxySender;
 use crate::tunnel::http_local::{handle_http, handle_https};
 use crate::tunnel::socks5_local::handle_socks5;
 use crate::tunnel::tls_local::{handle_tls, valid_tls_version};
-use crate::tunnel::client::ProxySender;
 use crate::utils::new_tcp_listener;
 use anyhow::{anyhow, Result};
 use tokio::net::TcpStream;
@@ -21,7 +21,7 @@ async fn handle_local_tunnel(
     match peek_buf[0] {
         5 => {
             //socks5
-            tracing::info!("[{}]Accept client as SOCKS5 proxy.", tunnel_id);
+            // tracing::info!("[{}]Accept client as SOCKS5 proxy.", tunnel_id);
             handle_socks5(tunnel_id, inbound, sender).await?;
             return Ok(());
         }
@@ -35,7 +35,7 @@ async fn handle_local_tunnel(
         }
     }
     if valid_tls_version(&peek_buf[..]) {
-        tracing::info!("[{}]Accept client as TLS proxy.", tunnel_id);
+        // tracing::info!("[{}]Accept client as TLS proxy.", tunnel_id);
         handle_tls(tunnel_id, inbound, sender).await?;
         return Ok(());
     }
@@ -43,11 +43,11 @@ async fn handle_local_tunnel(
         let prefix_str = prefix_str.to_uppercase();
         match prefix_str.as_str() {
             "GET" | "PUT" | "POS" | "DEL" | "OPT" | "TRA" | "PAT" | "HEA" | "CON" | "UPG" => {
-                tracing::info!(
-                    "[{}]Accept client as HTTP proxy with method:{}",
-                    tunnel_id,
-                    prefix_str
-                );
+                // tracing::info!(
+                //     "[{}]Accept client as HTTP proxy with method:{}",
+                //     tunnel_id,
+                //     prefix_str
+                // );
                 //http proxy
                 if prefix_str.as_str() == "CON" {
                     handle_https(tunnel_id, inbound, sender).await?;
@@ -85,13 +85,20 @@ pub async fn start_local_tunnel_server(
         }
     }
 
-    tracing::info!("Start local TCP listen at {} (max connections: {})", addr, max_connections);
+    tracing::info!(
+        "Start local TCP listen at {} (max connections: {})",
+        addr,
+        max_connections
+    );
     let mut tunnel_id_seed: u32 = 0;
     while let Ok((inbound, _)) = listener.accept().await {
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                tracing::warn!("Max connections ({}) reached, rejecting new connection", max_connections);
+                tracing::warn!(
+                    "Max connections ({}) reached, rejecting new connection",
+                    max_connections
+                );
                 continue;
             }
         };
