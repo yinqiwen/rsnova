@@ -1,4 +1,3 @@
-//use tokio::codec::{Decoder, Encoder};
 use anyhow::Result;
 use bincode::{config, Decode, Encode};
 use bytes::{Bytes, BytesMut};
@@ -9,13 +8,9 @@ pub const FLAG_OPEN: u8 = 1;
 pub const FLAG_FIN: u8 = 2;
 pub const FLAG_SYN: u8 = 4;
 pub const FLAG_DATA: u8 = 3;
-// pub const FLAG_WIN_UPDATE: u8 = 4;
 pub const FLAG_PING: u8 = 5;
 pub const FLAG_SHUTDOWN: u8 = 7;
-// Value 6 was previously unused. FLAG_WIN_UPDATE (4) and FLAG_PONG (8) and
-// FLAG_ROUTINE (9) were commented out and their values are being reclaimed:
-//   6 → FLAG_AUTH (new), 9 → FLAG_AUTH_ACK (replaces commented-out FLAG_ROUTINE),
-//   10 → FLAG_REVERSE_OPEN (new)
+
 pub const FLAG_AUTH: u8 = 6;
 pub const FLAG_AUTH_ACK: u8 = 9;
 pub const FLAG_REVERSE_OPEN: u8 = 10;
@@ -330,17 +325,11 @@ mod tests {
             Poll::Ready(Ok(n))
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 

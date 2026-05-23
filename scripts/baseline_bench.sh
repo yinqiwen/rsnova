@@ -409,7 +409,7 @@ fi
 
 (
   cd "$CERT_DIR"
-  "$BIN" --rcgen --tls-host "$TLS_HOST" > "$RESULT_DIR/rcgen.log" 2>&1
+  "$BIN" --rcgen true --tls-host "$TLS_HOST" > "$RESULT_DIR/rcgen.log" 2>&1
 )
 
 sample_processes() {
@@ -447,7 +447,6 @@ python3 "$HELPER" wait-port --addr "$BACKEND_LISTEN" --timeout 10 >> "$RESULT_DI
 
 "$BIN" \
   --role server \
-  --protocol tls \
   --listen "$REMOTE_LISTEN" \
   --admin-listen "$SERVER_ADMIN" \
   --cert "$CERT_DIR/cert.pem" \
@@ -461,7 +460,6 @@ python3 "$HELPER" wait-port --addr "$SERVER_ADMIN" --timeout 10 >> "$RESULT_DIR/
 
 "$BIN" \
   --role client \
-  --protocol tls \
   --listen "$LOCAL_LISTEN" \
   --admin-listen "$CLIENT_ADMIN" \
   --remote "tls://$REMOTE_LISTEN" \
@@ -512,7 +510,6 @@ if [[ "$RUN_FILE_LOG_CASE" == "1" ]]; then
 
   "$BIN" \
     --role server \
-    --protocol tls \
     --listen "$REMOTE_LISTEN" \
     --admin-listen "$SERVER_ADMIN" \
     --cert "$CERT_DIR/cert.pem" \
@@ -526,7 +523,6 @@ if [[ "$RUN_FILE_LOG_CASE" == "1" ]]; then
 
   "$BIN" \
     --role client \
-    --protocol tls \
     --listen "$LOCAL_LISTEN" \
     --admin-listen "$CLIENT_ADMIN" \
     --remote "tls://$REMOTE_LISTEN" \

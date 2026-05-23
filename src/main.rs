@@ -10,12 +10,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::Sender;
 use tokio::time;
 
 use url::Url;
 
+mod admin;
+mod app_config;
 mod mux;
 mod tunnel;
 mod utils;
@@ -38,14 +39,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // #[allow(non_upper_case_globals)]
 // #[export_name = "malloc_conf"]
 // pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
-
-#[derive(ValueEnum, Clone, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Protocol {
-    Tls,
-    #[cfg(feature = "s2n_quic")]
-    Quic,
-}
 
 #[derive(ValueEnum, Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -73,10 +66,6 @@ struct Args {
     #[default("127.0.0.1:48100".parse::<SocketAddr>().unwrap())]
     #[arg(long)]
     listen: SocketAddr,
-
-    #[default(Protocol::Tls)]
-    #[arg(long, value_enum)]
-    protocol: Protocol,
 
     #[arg(long)]
     remote: Option<Url>,
@@ -186,75 +175,6 @@ fn rcgen(tls_host: &String) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn start_admin_server(
-    listen: &SocketAddr,
-    metrics_registry: utils::MetricsRegistry,
-) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!("Admin server listening on {}", listen);
-
-    loop {
-        let (mut stream, addr) = listener.accept().await?;
-        let registry = metrics_registry.clone();
-
-        tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            let n = match stream.read(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!("Admin server read error from {}: {}", addr, e);
-                    return;
-                }
-            };
-
-            // Parse HTTP request to get the path
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("/");
-
-            tracing::debug!("Admin server request from {}: {}", addr, path);
-
-            let (status, content_type, body) = match path {
-                "/metrics" => {
-                    let metrics = utils::format_metrics(&registry);
-                    ("200 OK", "text/plain; charset=utf-8", metrics.into_bytes())
-                }
-                "/" => {
-                    let body = "rsnova admin server\n\nEndpoints:\n  /metrics - Server metrics\n";
-                    ("200 OK", "text/plain; charset=utf-8", body.as_bytes().to_vec())
-                }
-                _ => {
-                    let body = "404 Not Found\n\nAvailable endpoints:\n  /metrics - Server metrics\n";
-                    ("404 Not Found", "text/plain; charset=utf-8", body.as_bytes().to_vec())
-                }
-            };
-
-            let response = format!(
-                "HTTP/1.1 {}\r\n\
-                 Content-Type: {}\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\
-                 \r\n",
-                status,
-                content_type,
-                body.len()
-            );
-
-            if let Err(e) = stream.write_all(response.as_bytes()).await {
-                tracing::warn!("Admin server write header error to {}: {}", addr, e);
-                return;
-            }
-            if let Err(e) = stream.write_all(&body).await {
-                tracing::warn!("Admin server write body error to {}: {}", addr, e);
-                return;
-            }
-        });
-    }
-}
-
 async fn service_main(args: &Args) -> anyhow::Result<()> {
     if args.profile {
         tracing_subscriber::fmt::init();
@@ -287,9 +207,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
         for t in &args.tunnel {
             entries.push(tunnel::tunnel_config::parse_tunnel_arg(t)?);
         }
-        Some(entries)
+        entries
     } else {
-        None
+        Vec::new()
     };
 
     let tunnel_port_ranges = if !args.tunnel_port_range.is_empty() {
@@ -304,18 +224,51 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
         tracing::warn!("set metrics recorder failed: {}", e);
     }
 
+    // Build shared AppConfig for admin server and tunnel client
+    let app_config = Arc::new(app_config::AppConfig {
+        reloadable: Arc::new(tokio::sync::Mutex::new(app_config::ReloadableConfig {
+            tunnel_entries,
+            tunnel_client_id: args.tunnel_client_id.clone(),
+        })),
+        static_args: app_config::StaticArgs {
+            listen: args.listen.to_string(),
+            role: match args.role {
+                Role::Client => "client".to_string(),
+                Role::Server => "server".to_string(),
+            },
+            is_tunnel: !args.tunnel.is_empty(),
+            remote: args.remote.as_ref().map(|u| u.to_string()),
+            key: args.key.display().to_string(),
+            cert: args.cert.display().to_string(),
+            tls_host: args.tls_host.clone(),
+            concurrent: args.concurrent,
+            threads: args.threads,
+            idle_timeout_secs: args.idle_timeout_secs,
+            max_connections: args.max_connections,
+            admin_listen: args.admin_listen.to_string(),
+            tproxy: args.tproxy,
+        },
+        reload_token: Arc::new(tokio::sync::Mutex::new(tokio_util::sync::CancellationToken::new())),
+    });
+
     // Start admin server (always enabled)
     let admin_listen = args.admin_listen;
-    let registry = metrics_registry.clone();
+    let metrics_reg = metrics_registry.clone();
+    let admin_config = app_config.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_admin_server(&admin_listen, registry).await {
+        if let Err(e) = admin::start_admin_server(&admin_listen, metrics_reg, admin_config).await {
             tracing::error!("Admin server error: {}", e);
         }
     });
 
     match args.role {
         Role::Client => {
-            if let Some(entries) = tunnel_entries {
+            let has_tunnel = {
+                let cfg = app_config.reloadable.lock().await;
+                !cfg.tunnel_entries.is_empty()
+            };
+
+            if has_tunnel {
                 tracing::info!(
                     "Starting in tunnel mode with client_id: {}",
                     args.tunnel_client_id
@@ -326,8 +279,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     &args.tls_host,
                     args.idle_timeout_secs,
                     args.mux_stream_channel_size,
-                    &args.tunnel_client_id,
-                    entries,
+                    app_config,
                 )
                 .await?;
                 return Ok(());
@@ -335,7 +287,6 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 
             let tunnel_sender: Sender<tunnel::Message> =
                 match args.remote.as_ref().unwrap().scheme() {
-                    #[cfg(feature = "s2n_quic")]
                     "quic" => {
                         tunnel::new_quic_client(
                             args.remote.as_ref().unwrap(),
@@ -401,35 +352,48 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 None
             };
 
-            match args.protocol {
-                #[cfg(feature = "s2n_quic")]
-                Protocol::Quic => {
-                    if let Err(e) = tunnel::start_quic_remote_server(
-                        &args.listen,
-                        &args.cert,
-                        &args.key,
-                        args.idle_timeout_secs,
-                        registry,
-                    )
-                    .await
-                    {
-                        tracing::error!("{e:?}");
-                    }
+            let tls_listen = args.listen;
+            let quic_listen = args.listen;
+            let tls_cert = args.cert.clone();
+            let tls_key = args.key.clone();
+            let quic_cert = args.cert.clone();
+            let quic_key = args.key.clone();
+            let idle = args.idle_timeout_secs;
+            let channel_size = args.mux_stream_channel_size;
+            let tls_registry = registry.clone();
+
+            let tls_handle = tokio::spawn(async move {
+                if let Err(e) = tunnel::start_tls_remote_server(
+                    &tls_listen,
+                    &tls_cert,
+                    &tls_key,
+                    idle,
+                    channel_size,
+                    tls_registry,
+                )
+                .await
+                {
+                    tracing::error!("TLS server error: {e:?}");
                 }
-                Protocol::Tls => {
-                    if let Err(e) = tunnel::start_tls_remote_server(
-                        &args.listen,
-                        &args.cert,
-                        &args.key,
-                        args.idle_timeout_secs,
-                        args.mux_stream_channel_size,
-                        registry,
-                    )
-                    .await
-                    {
-                        tracing::error!("{e:?}");
-                    }
+            });
+
+            let quic_handle = tokio::spawn(async move {
+                if let Err(e) = tunnel::start_quic_remote_server(
+                    &quic_listen,
+                    &quic_cert,
+                    &quic_key,
+                    idle,
+                    registry,
+                )
+                .await
+                {
+                    tracing::error!("QUIC server error: {e:?}");
                 }
+            });
+
+            tokio::select! {
+                r = tls_handle => r?,
+                r = quic_handle => r?,
             }
         }
     }

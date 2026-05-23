@@ -61,7 +61,7 @@ resolve_rsnova() {
 ensure_certs() {
   if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
     log "generating self-signed cert for localhost"
-    "$RSNOVA" --rcgen --tls-host localhost
+    "$RSNOVA" --rcgen true --tls-host localhost
   fi
 }
 
@@ -136,7 +136,7 @@ start_backend 9992 "web-ok"
 sleep 0.5
 
 log "starting server on $SERVER_LISTEN"
-"$RSNOVA" --role server --protocol tls --listen "$SERVER_LISTEN" \
+"$RSNOVA" --role server --listen "$SERVER_LISTEN" \
   --key "$KEY" --cert "$CERT" --tunnel-port-range 8000-9000 \
   >"$LOG_DIR/server.log" 2>&1 &
 PIDS+=($!)

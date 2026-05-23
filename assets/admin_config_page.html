@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Configuration</title>
+<style>
+{{CSS}}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Configuration</h1>
+  <p class="subtitle">{{ROLE_LABEL}} | Admin: {{ADMIN_LISTEN}}</p>
+
+  <form method="POST" action="/config" onsubmit="return onSubmit()">
+
+    <div class="section-title">Connection</div>
+    {{CONNECTION_FIELDS}}
+
+    {{TUNNEL_SECTION}}
+
+    <div class="actions">
+      <button type="submit" class="btn btn-primary">Save &amp; Reload</button>
+    </div>
+
+    {{ALERT}}
+  </form>
+</div>
+
+<script>
+function addTunnelRow(local, remotePort, sni) {
+  local = local || 'localhost:0';
+  remotePort = remotePort || '';
+  sni = sni || '';
+  var container = document.getElementById('tunnel-rows');
+  var row = document.createElement('div');
+  row.className = 'tunnel-row';
+  row.innerHTML =
+    '<input type="text" class="t-local" placeholder="host:port" value="' + escHtml(local) + '" />' +
+    '<input type="text" class="t-remote" placeholder="remote port" value="' + escHtml(remotePort) + '" />' +
+    '<input type="text" class="t-sni" placeholder="optional" value="' + escHtml(sni) + '" />' +
+    '<button type="button" class="btn btn-remove" onclick="this.parentElement.remove()">✕</button>';
+  container.appendChild(row);
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function onSubmit() {
+  var form = document.querySelector('form');
+  var tunnelInput = document.getElementById('tunnel');
+  if (tunnelInput) {
+    serializeTunnels();
+  }
+  return true;
+}
+
+function serializeTunnels() {
+  var rows = document.querySelectorAll('.tunnel-row');
+  var lines = [];
+  rows.forEach(function(row) {
+    var local = row.querySelector('.t-local').value.trim();
+    var remote = row.querySelector('.t-remote').value.trim();
+    var sni = row.querySelector('.t-sni').value.trim();
+    if (!remote) return;
+    if (local.startsWith('[')) {
+      var closeIdx = local.indexOf(']');
+      if (closeIdx < 0) return;
+      var host = local.substring(0, closeIdx + 1);
+      var rest = local.substring(closeIdx + 1);
+      var localPort = rest.startsWith(':') ? rest.substring(1) : '';
+      if (sni) {
+        lines.push(host + ':' + localPort + ':' + remote + ':' + sni);
+      } else if (localPort) {
+        lines.push(host + ':' + localPort + ':' + remote);
+      } else {
+        lines.push(host + ':' + remote);
+      }
+    } else {
+      var parts = local.split(':');
+      if (parts.length === 1) {
+        if (sni) {
+          lines.push('localhost:' + parts[0] + ':' + remote + ':' + sni);
+        } else if (parts[0] === remote) {
+          lines.push(parts[0]);
+        } else {
+          lines.push(parts[0] + ':' + remote);
+        }
+      } else {
+        if (sni) {
+          lines.push(local + ':' + remote + ':' + sni);
+        } else {
+          lines.push(local + ':' + remote);
+        }
+      }
+    }
+  });
+  document.getElementById('tunnel').value = lines.join('\n');
+}
+</script>
+</body>
+</html>

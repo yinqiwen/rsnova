@@ -181,7 +181,6 @@ async fn handle_visitor(
             let mut relay = Stream::new(&mut visitor_r, &mut visitor_w, &mut stream_r, &mut stream_w);
             relay.transfer(idle_timeout_secs).await?;
         }
-        #[cfg(feature = "s2n_quic")]
         ConnectionHandler::Quic(mut handle) => {
             let stream = handle
                 .open_bidirectional_stream()

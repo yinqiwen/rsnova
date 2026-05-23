@@ -5,6 +5,8 @@ mod local;
 mod udp_local;
 
 mod socks5_local;
+mod s2n_quic_client;
+mod s2n_quic_remote;
 mod stream;
 mod tls_client;
 mod tls_local;
@@ -17,16 +19,8 @@ pub mod tunnel_config;
 pub mod tunnel_registry;
 pub mod tunnel_remote;
 
-#[cfg(feature = "s2n_quic")]
-mod s2n_quic_client;
-#[cfg(feature = "s2n_quic")]
 pub use self::s2n_quic_client::new_quic_client;
-#[cfg(feature = "s2n_quic")]
 pub use self::s2n_quic_client::start_tunnel_client_quic;
-
-#[cfg(feature = "s2n_quic")]
-mod s2n_quic_remote;
-#[cfg(feature = "s2n_quic")]
 pub use self::s2n_quic_remote::start_quic_remote_server;
 
 // pub const DEFAULT_TLS_HOST: &str = "google.com";
@@ -46,8 +40,7 @@ pub async fn start_tunnel_client(
     host: &str,
     idle_timeout_secs: usize,
     stream_channel_size: usize,
-    client_id: &str,
-    entries: Vec<crate::mux::event::TunnelEntry>,
+    app_config: std::sync::Arc<crate::app_config::AppConfig>,
 ) -> anyhow::Result<()> {
     match url.scheme() {
         "tls" => {
@@ -57,19 +50,16 @@ pub async fn start_tunnel_client(
                 host,
                 idle_timeout_secs,
                 stream_channel_size,
-                client_id,
-                entries,
+                app_config,
             )
             .await
         }
-        #[cfg(feature = "s2n_quic")]
         "quic" => {
             start_tunnel_client_quic(
                 url,
                 cert_path,
                 host,
-                client_id,
-                entries,
+                app_config,
                 idle_timeout_secs,
             )
             .await

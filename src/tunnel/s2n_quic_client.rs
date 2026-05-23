@@ -174,13 +174,12 @@ pub(crate) async fn new_s2n_quic_connection(
     Ok(connection)
 }
 
-/// Tunnel client loop for QUIC mode using Connection::split()
+/// Tunnel client loop for QUIC mode with hot-reload support
 pub async fn start_tunnel_client_quic(
     url: &Url,
     cert_path: &Path,
     host: &str,
-    client_id: &str,
-    entries: Vec<TunnelEntry>,
+    app_config: Arc<crate::app_config::AppConfig>,
     idle_timeout_secs: usize,
 ) -> anyhow::Result<()> {
     const INITIAL_BACKOFF_SECS: u64 = 1;
@@ -188,16 +187,29 @@ pub async fn start_tunnel_client_quic(
 
     let mut backoff_secs = INITIAL_BACKOFF_SECS;
     loop {
+        let (client_id, entries) = {
+            let cfg = app_config.reloadable.lock().await;
+            (cfg.tunnel_client_id.clone(), cfg.tunnel_entries.clone())
+        };
+
         let start = std::time::Instant::now();
-        let result = run_quic_tunnel_connection(
-            url,
-            cert_path,
-            host,
-            client_id,
-            &entries,
-            idle_timeout_secs,
-        )
-        .await;
+        let token = app_config.reload_token_clone().await;
+
+        let result = tokio::select! {
+            r = run_quic_tunnel_connection(
+                url,
+                cert_path,
+                host,
+                &client_id,
+                &entries,
+                idle_timeout_secs,
+            ) => r,
+            _ = token.cancelled() => {
+                tracing::info!("Config reloaded, reconnecting QUIC tunnel with new entries...");
+                backoff_secs = INITIAL_BACKOFF_SECS;
+                continue;
+            }
+        };
 
         // Reset backoff if connection was productive (lasted > 30s)
         if start.elapsed() > Duration::from_secs(30) {

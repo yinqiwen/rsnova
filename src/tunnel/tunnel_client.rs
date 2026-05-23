@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use url::Url;
 
+use crate::app_config::AppConfig;
 use crate::mux::event::{
     self, AuthAck, AuthRequest, OpenStreamEvent, RegisterAck, RegisterRequest, TunnelEntry,
     FLAG_AUTH_ACK, FLAG_REVERSE_OPEN,
@@ -11,32 +13,44 @@ use crate::tunnel::client::MuxConnection;
 use crate::tunnel::stream::Stream;
 use crate::tunnel::tls_client::TlsConnection;
 
-/// Entry point for tunnel client mode (TLS).
+/// Entry point for tunnel client mode (TLS) with hot-reload support.
 pub async fn start_tunnel_client_tls(
     url: &Url,
     cert_path: &Path,
     host: &str,
     idle_timeout_secs: usize,
     stream_channel_size: usize,
-    client_id: &str,
-    entries: Vec<TunnelEntry>,
+    app_config: Arc<AppConfig>,
 ) -> Result<()> {
     const INITIAL_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
 
     let mut backoff_secs = INITIAL_BACKOFF_SECS;
     loop {
+        let (client_id, entries) = {
+            let cfg = app_config.reloadable.lock().await;
+            (cfg.tunnel_client_id.clone(), cfg.tunnel_entries.clone())
+        };
+
         let start = Instant::now();
-        let result = run_tunnel_connection_tls(
-            url,
-            cert_path,
-            host,
-            stream_channel_size,
-            client_id,
-            &entries,
-            idle_timeout_secs,
-        )
-        .await;
+        let token = app_config.reload_token_clone().await;
+
+        let result = tokio::select! {
+            r = run_tunnel_connection_tls(
+                url,
+                cert_path,
+                host,
+                stream_channel_size,
+                &client_id,
+                &entries,
+                idle_timeout_secs,
+            ) => r,
+            _ = token.cancelled() => {
+                tracing::info!("Config reloaded, reconnecting TLS tunnel with new entries...");
+                backoff_secs = INITIAL_BACKOFF_SECS;
+                continue;
+            }
+        };
 
         // Reset backoff if connection was productive (lasted > 30s)
         if start.elapsed() > Duration::from_secs(30) {

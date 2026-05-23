@@ -34,7 +34,6 @@ pub struct PortState {
 #[derive(Clone)]
 pub enum ConnectionHandler {
     Tls(Arc<crate::mux::Connection>),
-    #[cfg(feature = "s2n_quic")]
     Quic(s2n_quic::connection::Handle),
 }
 
