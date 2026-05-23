@@ -1,6 +1,6 @@
 [package]
 name = "rsnova"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A lightweight tunnel/proxy using TLS mux and QUIC"
 license = "Apache-2.0"

@@ -5,7 +5,7 @@ use crate::tunnel::client::ProxySender;
 use crate::tunnel::http_local::{handle_http, handle_https};
 use crate::tunnel::socks5_local::handle_socks5;
 use crate::tunnel::tls_local::{handle_tls, valid_tls_version};
-use crate::utils::new_tcp_listener;
+use crate::utils::{get_original_dst, new_tcp_listener};
 use anyhow::{anyhow, Result};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -15,6 +15,13 @@ async fn handle_local_tunnel(
     tunnel_id: u32,
     sender: ProxySender,
 ) -> Result<()> {
+    // Check if this is a transparent proxy connection (nft redirect/TPROXY)
+    // by trying to get SO_ORIGINAL_DST. If it succeeds, the connection was
+    // redirected by firewall rules and we should use the original destination
+    // instead of extracting target from protocol headers.
+    let original_dst = get_original_dst(&inbound).ok();
+    let is_transparent = original_dst.is_some();
+
     //stream.peek(buf)
     let mut peek_buf = [0u8; 3];
     inbound.peek(&mut peek_buf).await?;
@@ -35,21 +42,32 @@ async fn handle_local_tunnel(
         }
     }
     if valid_tls_version(&peek_buf[..]) {
-        // tracing::info!("[{}]Accept client as TLS proxy.", tunnel_id);
-        handle_tls(tunnel_id, inbound, sender).await?;
+        if is_transparent {
+            super::transparent::handle_transparent_with_dst(
+                tunnel_id,
+                inbound,
+                original_dst,
+                sender,
+            )
+            .await?;
+        } else {
+            handle_tls(tunnel_id, inbound, sender).await?;
+        }
         return Ok(());
     }
     if let Ok(prefix_str) = std::str::from_utf8(&peek_buf) {
         let prefix_str = prefix_str.to_uppercase();
         match prefix_str.as_str() {
             "GET" | "PUT" | "POS" | "DEL" | "OPT" | "TRA" | "PAT" | "HEA" | "CON" | "UPG" => {
-                // tracing::info!(
-                //     "[{}]Accept client as HTTP proxy with method:{}",
-                //     tunnel_id,
-                //     prefix_str
-                // );
-                //http proxy
-                if prefix_str.as_str() == "CON" {
+                if is_transparent {
+                    super::transparent::handle_transparent_with_dst(
+                        tunnel_id,
+                        inbound,
+                        original_dst,
+                        sender,
+                    )
+                    .await?;
+                } else if prefix_str.as_str() == "CON" {
                     handle_https(tunnel_id, inbound, sender).await?;
                 } else {
                     handle_http(tunnel_id, inbound, sender).await?;

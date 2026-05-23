@@ -2,6 +2,7 @@ use crate::tunnel::client::ProxySender;
 use crate::tunnel::Message;
 use crate::utils::get_original_dst;
 use anyhow::Result;
+use std::net::SocketAddr;
 
 use tokio::net::TcpStream;
 
@@ -15,7 +16,18 @@ pub async fn handle_transparent(
         Err(_) => inbound.local_addr()?, // TPROXY
     };
 
-    let target_addr = target_addr.to_string();
+    handle_transparent_with_dst(tunnel_id, inbound, Some(target_addr), sender).await
+}
+
+pub async fn handle_transparent_with_dst(
+    tunnel_id: u32,
+    inbound: TcpStream,
+    original_dst: Option<SocketAddr>,
+    sender: ProxySender,
+) -> Result<()> {
+    let target_addr = original_dst
+        .unwrap_or_else(|| inbound.local_addr().unwrap())
+        .to_string();
     tracing::info!(
         "[{}]Handle transparent proxy to {} ",
         tunnel_id,
