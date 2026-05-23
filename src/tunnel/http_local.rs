@@ -70,20 +70,14 @@ fn extract_target(headers_buf: &Vec<u8>, default_port: &str) -> Result<String> {
 }
 
 pub async fn handle_http(
-    tunnel_id: u32,
+    _tunnel_id: u32,
     mut inbound: TcpStream,
     sender: ProxySender,
 ) -> Result<()> {
     let headers_buf = read_http_headers(&mut inbound).await?;
     let target_addr = extract_target(&headers_buf, ":80")?;
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers);
-    let method = match req.parse(&headers_buf) {
-        Ok(_) => req.method.unwrap_or("?"),
-        Err(_) => "?",
-    };
-    tracing::info!("[{tunnel_id}] HTTP {method} {target_addr}");
 
+    tracing::info!("{}", target_addr);
     let msg = Message::open_tcp_stream(inbound, target_addr, Some(headers_buf));
     sender.send(msg).await?;
     Ok(())
