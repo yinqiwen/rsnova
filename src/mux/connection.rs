@@ -23,6 +23,10 @@ struct StreamEntry {
     sender: mpsc::UnboundedSender<Option<Bytes>>,
     recv_window: u32,
     flow: Arc<StreamFlow>,
+    /// Bytes pushed into unbounded channel but not yet consumed by MuxStream.
+    /// Incremented on sender.send(), decremented when WindowUpdateToPeer fires
+    /// (which means MuxStream read data and released window).
+    pending_bytes: u64,
 }
 
 pub struct Connection {
@@ -187,6 +191,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             sender: params.sender,
                             recv_window: initial_stream_window,
                             flow: params.flow.clone(),
+                            pending_bytes: 0,
                         });
                         metrics::increment_gauge!("mux.streams", 1.0);
                         if let Some(rx) = params.receiver {
@@ -227,6 +232,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                 let _ = event::write_event(&mut w, ev).await;
                             } else {
                                 entry.recv_window -= data_len;
+                                entry.pending_bytes += data_len as u64;
                                 if entry.sender.send(Some(data)).is_err() {
                                     tracing::error!(
                                         "[{}/{}] stream receiver dropped",
@@ -254,6 +260,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
                 Control::WindowUpdateToPeer(sid, increment) => {
                     if let Some(entry) = stream_entries.get_mut(&sid) {
+                        entry.pending_bytes = entry.pending_bytes.saturating_sub(increment as u64);
                         entry.recv_window = entry
                             .recv_window
                             .saturating_add(increment)
@@ -307,6 +314,19 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 let _ = accept_callback.unwrap().send(Ok(stream));
                 accept_callback = None;
             }
+
+            // Aggregate flow control and channel depth metrics across all streams.
+            let mut total_recv_window: u64 = 0;
+            let mut total_send_window: u64 = 0;
+            let mut total_pending_bytes: u64 = 0;
+            for entry in stream_entries.values() {
+                total_recv_window += entry.recv_window as u64;
+                total_send_window += entry.flow.available() as u64;
+                total_pending_bytes += entry.pending_bytes;
+            }
+            metrics::gauge!("mux.stream.total_recv_window", total_recv_window as f64);
+            metrics::gauge!("mux.stream.total_send_window", total_send_window as f64);
+            metrics::gauge!("mux.stream.total_pending_bytes", total_pending_bytes as f64);
         }
 
         metrics::decrement_gauge!("mux.streams", stream_entries.len() as f64);
