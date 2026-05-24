@@ -190,10 +190,13 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
         if args.log.is_empty() {
             tracing_subscriber::fmt::init();
         } else {
-            let file_appender = tracing_appender::rolling::daily("./", args.log.as_str());
-            //let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
+            let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix(args.log.as_str())
+                .max_log_files(7)
+                .build("./")
+                .expect("failed to initialize rolling file appender");
             tracing_subscriber::fmt().with_writer(file_appender).init();
-            tokio::spawn(utils::clean_rotate_logs(format!("./{}", args.log.as_str())));
         }
     }
 

@@ -1,4 +1,3 @@
-mod clean;
 #[cfg(unix)]
 mod daemon;
 #[cfg(windows)]
@@ -10,7 +9,6 @@ mod net;
 mod tls;
 mod udp;
 
-pub use clean::clean_rotate_logs;
 #[cfg(unix)]
 pub use daemon::daemonize;
 #[cfg(windows)]
