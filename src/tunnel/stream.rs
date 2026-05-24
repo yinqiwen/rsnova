@@ -63,14 +63,14 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     state.touch();
     loop {
         if state.abort.load(Relaxed) {
-            metrics::counter!("mux.stream.close.abort", 1);
+            metrics::counter!("mux.stream.close.abort").increment(1);
             return Err(anyhow!("abort"));
         }
         match timeout(check_timeout_secs, r.read(&mut buf)).await {
             Err(_) => {
                 let (idle_millis, last_active_millis) = state.idle_snapshot();
                 if idle_millis >= timeout_sec.saturating_mul(1000) {
-                    metrics::counter!("mux.stream.close.idle_timeout", 1);
+                    metrics::counter!("mux.stream.close.idle_timeout").increment(1);
                     return Err(anyhow!(format!(
                         "timeout after inactive {}ms, last active at +{}ms",
                         idle_millis, last_active_millis
@@ -82,18 +82,18 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
             Ok(Ok(n)) => {
                 state.touch();
                 if n == 0 {
-                    metrics::counter!("mux.stream.close.eof", 1);
+                    metrics::counter!("mux.stream.close.eof").increment(1);
                     break;
                 };
                 if let Err(ex) = w.write_all(&buf[0..n]).await {
                     state.abort.store(true, Relaxed);
-                    metrics::counter!("mux.stream.close.write_error", 1);
+                    metrics::counter!("mux.stream.close.write_error").increment(1);
                     return Err(ex.into());
                 }
             }
             Ok(Err(e)) => {
                 state.abort.store(true, Relaxed);
-                metrics::counter!("mux.stream.close.read_error", 1);
+                metrics::counter!("mux.stream.close.read_error").increment(1);
                 return Err(e.into());
             }
         }

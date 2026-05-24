@@ -163,10 +163,10 @@ fn rcgen(tls_host: &String) -> anyhow::Result<()> {
         "generating self-signed certificate at {:?}  & {:?} with host:{}",
         cert_path, key_path, tls_host,
     );
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec![tls_host.into()])
             .map_err(|e| anyhow!("generate cert failed: {}", e))?;
-    let key = key_pair.serialize_pem();
+    let key = signing_key.serialize_pem();
     let cert = cert.pem();
 
     fs::write(&cert_path, cert).map_err(|e| anyhow!("write cert failed: {}", e))?;
@@ -224,7 +224,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 
     let recorder = utils::MetricsLogRecorder::new();
     let metrics_registry = recorder.get_registry();
-    if let Err(e) = metrics::set_boxed_recorder(Box::new(recorder)) {
+    if let Err(e) = metrics::set_global_recorder(recorder) {
         tracing::warn!("set metrics recorder failed: {}", e);
     }
 

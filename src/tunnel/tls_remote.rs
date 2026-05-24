@@ -108,7 +108,7 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
 
             loop {
                 let stream = mux_conn.accept_stream().await?;
-                metrics::increment_gauge!("tls_server_proxy_streams", 1.0);
+                metrics::gauge!("tls_server_proxy_streams").increment(1.0);
                 tokio::spawn(async move {
                     let stream_id = stream.id();
                     let (mut stream_reader, mut stream_writer) = tokio::io::split(stream);
@@ -126,7 +126,7 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
                             reason = e.to_string()
                         );
                     }
-                    metrics::decrement_gauge!("tls_server_proxy_streams", 1.0);
+                    metrics::gauge!("tls_server_proxy_streams").decrement(1.0);
                 });
             }
         }
