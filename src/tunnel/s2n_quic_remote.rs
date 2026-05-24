@@ -77,7 +77,7 @@ pub async fn start_quic_remote_server(
                     drop(send);
 
                     while let Ok(Some(stream)) = connection.accept_bidirectional_stream().await {
-                        metrics::increment_gauge!("quic_server_proxy_streams", 1.0);
+                        metrics::gauge!("quic_server_proxy_streams").increment(1.0);
                         let (mut r, mut s) = stream.split();
                         tokio::spawn(async move {
                             if let Err(e) =
@@ -85,7 +85,7 @@ pub async fn start_quic_remote_server(
                             {
                                 tracing::error!("failed: {reason}", reason = e.to_string());
                             }
-                            metrics::decrement_gauge!("quic_server_proxy_streams", 1.0);
+                            metrics::gauge!("quic_server_proxy_streams").decrement(1.0);
                         });
                     }
                 }

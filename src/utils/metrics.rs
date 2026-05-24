@@ -1,4 +1,4 @@
-use metrics::{Counter, Gauge, Histogram, Key, KeyName, Recorder, SharedString, Unit};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use metrics_util::registry::{AtomicStorage, Registry};
 use std::sync::Arc;
 
@@ -12,15 +12,15 @@ impl Recorder for MetricsLogRecorder {
     fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
     fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
     fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
-    fn register_counter(&self, key: &Key) -> Counter {
+    fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
         self.registry
             .get_or_create_counter(key, |c| Counter::from_arc(c.clone()))
     }
-    fn register_gauge(&self, key: &Key) -> Gauge {
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
         self.registry
             .get_or_create_gauge(key, |g| Gauge::from_arc(g.clone()))
     }
-    fn register_histogram(&self, key: &Key) -> Histogram {
+    fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
         self.registry
             .get_or_create_histogram(key, |h| Histogram::from_arc(h.clone()))
     }

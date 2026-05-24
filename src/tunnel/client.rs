@@ -1,5 +1,4 @@
 use anyhow::anyhow;
-use metrics::{decrement_gauge, increment_gauge};
 use std::any::Any;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -170,7 +169,7 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
             Message::OpenStream(event) => {
                 // tracing::info!("Proxy request to {}", event.event.addr);
                 if let Ok((mut send, mut recv)) = client.open_stream().await {
-                    increment_gauge!("client_proxy_streams", 1.0);
+                    metrics::gauge!("client_proxy_streams").increment(1.0);
                     tokio::spawn(async move {
                         if let Some(mut tcp_stream) = event.tcp_stream {
                             let (mut local_reader, mut local_writer) = tcp_stream.split();
@@ -178,19 +177,19 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                                 Ok(ev) => ev,
                                 Err(e) => {
                                     tracing::error!("create open stream event failed:{}", e);
-                                    decrement_gauge!("client_proxy_streams", 1.0);
+                                    metrics::gauge!("client_proxy_streams").decrement(1.0);
                                     return;
                                 }
                             };
                             if let Err(e) = event::write_event(&mut send, ev).await {
                                 tracing::error!("write open stream event failed:{}", e);
-                                decrement_gauge!("client_proxy_streams", 1.0);
+                                metrics::gauge!("client_proxy_streams").decrement(1.0);
                                 return;
                             }
                             if let Some(payload) = event.payload {
                                 if let Err(e) = send.write_all(&payload).await {
                                     tracing::error!("write payload failed:{}", e);
-                                    decrement_gauge!("client_proxy_streams", 1.0);
+                                    metrics::gauge!("client_proxy_streams").decrement(1.0);
                                     return;
                                 }
                             }
@@ -209,19 +208,19 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                                 Ok(ev) => ev,
                                 Err(e) => {
                                     tracing::error!("create open stream event failed:{}", e);
-                                    decrement_gauge!("client_proxy_streams", 1.0);
+                                    metrics::gauge!("client_proxy_streams").decrement(1.0);
                                     return;
                                 }
                             };
                             if let Err(e) = event::write_event(&mut send, ev).await {
                                 tracing::error!("write open stream event failed:{}", e);
-                                decrement_gauge!("client_proxy_streams", 1.0);
+                                metrics::gauge!("client_proxy_streams").decrement(1.0);
                                 return;
                             }
                             if let Some(payload) = event.payload {
                                 if let Err(e) = send.write_all(&payload).await {
                                     tracing::error!("write payload failed:{}", e);
-                                    decrement_gauge!("client_proxy_streams", 1.0);
+                                    metrics::gauge!("client_proxy_streams").decrement(1.0);
                                     return;
                                 }
                             }
@@ -235,7 +234,7 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                                 tracing::debug!("transfer finish:{}", e);
                             }
                         }
-                        decrement_gauge!("client_proxy_streams", 1.0);
+                        metrics::gauge!("client_proxy_streams").decrement(1.0);
                     });
                 } else {
                     tracing::error!("create remote proxy stream failed");

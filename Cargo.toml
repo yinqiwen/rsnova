@@ -18,14 +18,13 @@ path = "src/main.rs"
 clap = { version = "4.1.4", features = ["derive", "env"] }
 clap_serde_derive = { package = "clap-serde-derive", version = "0.2" }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
 # console-subscriber = "0.4"
-veil = "0.1"
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
-rcgen = "0.13"
+rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 # rustls-native-certs = "0.7"
@@ -37,14 +36,14 @@ tokio-util = { version = "0.7", features = ["compat", "io", "codec", "net"] }
 httparse = "1.9"
 bytes = "1"
 futures = "0.3"
-metrics = "0.21"
-metrics-util = "0.15"
+metrics = "0.24"
+metrics-util = "0.20"
 time = "0.3"
 pki-types = { package = "rustls-pki-types", version = "1" }
 s2n-quic = "1"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 cfg-if = "1.0"
-lru = "0.12.5"
+lru = "0.18"
 # axum = "0.7.9"
 
 [target.'cfg(unix)'.dependencies]

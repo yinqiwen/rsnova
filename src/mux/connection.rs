@@ -193,7 +193,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             flow: params.flow.clone(),
                             pending_bytes: 0,
                         });
-                        metrics::increment_gauge!("mux.streams", 1.0);
+                        metrics::gauge!("mux.streams").increment(1.0);
                         if let Some(rx) = params.receiver {
                             let stream = MuxStream::new(
                                 params.stream_id,
@@ -227,7 +227,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                 entry.flow.close();
                                 let _ = entry.sender.send(None);
                                 stream_entries.remove(&sid);
-                                metrics::decrement_gauge!("mux.streams", 1.0);
+                                metrics::gauge!("mux.streams").decrement(1.0);
                                 let ev = event::new_fin_event(sid);
                                 let _ = event::write_event(&mut w, ev).await;
                             } else {
@@ -241,7 +241,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                     );
                                     entry.flow.close();
                                     stream_entries.remove(&sid);
-                                    metrics::decrement_gauge!("mux.streams", 1.0);
+                                    metrics::gauge!("mux.streams").decrement(1.0);
                                 }
                             }
                         }
@@ -287,7 +287,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
                 Control::StreamClose(sid, remote) => {
                     if let Some(entry) = stream_entries.remove(&sid) {
-                        metrics::decrement_gauge!("mux.streams", 1.0);
+                        metrics::gauge!("mux.streams").decrement(1.0);
                         entry.flow.close();
                         if !remote {
                             let ev = event::new_fin_event(sid);
@@ -324,12 +324,12 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 total_send_window += entry.flow.available() as u64;
                 total_pending_bytes += entry.pending_bytes;
             }
-            metrics::gauge!("mux.stream.total_recv_window", total_recv_window as f64);
-            metrics::gauge!("mux.stream.total_send_window", total_send_window as f64);
-            metrics::gauge!("mux.stream.total_pending_bytes", total_pending_bytes as f64);
+            metrics::gauge!("mux.stream.total_recv_window").set(total_recv_window as f64);
+            metrics::gauge!("mux.stream.total_send_window").set(total_send_window as f64);
+            metrics::gauge!("mux.stream.total_pending_bytes").set(total_pending_bytes as f64);
         }
 
-        metrics::decrement_gauge!("mux.streams", stream_entries.len() as f64);
+        metrics::gauge!("mux.streams").decrement(stream_entries.len() as f64);
         for (_, entry) in stream_entries.drain() {
             entry.flow.close();
             let _ = entry.sender.send(None);
