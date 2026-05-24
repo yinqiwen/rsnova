@@ -23,7 +23,7 @@ jobs:
           - arm-unknown-linux-musleabihf
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         run: |
@@ -54,7 +54,7 @@ jobs:
           - aarch64-apple-darwin
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         run: |
@@ -76,7 +76,7 @@ jobs:
       RUSTFLAGS: "-C target-feature=+crt-static"
       RUST_BACKTRACE: full
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         run: |

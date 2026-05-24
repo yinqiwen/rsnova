@@ -30,7 +30,7 @@ jobs:
           - arm-unknown-linux-musleabihf
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         run: |
@@ -50,7 +50,7 @@ jobs:
           ./ci/build_linux.sh ${{ matrix.target }}
 
       - name: Upload Github Assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ci/release/*
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -68,7 +68,7 @@ jobs:
           - aarch64-apple-darwin
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         run: |
@@ -85,7 +85,7 @@ jobs:
           ./ci/build_other.sh ${{ matrix.target }}
 
       - name: Upload Github Assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ci/release/*
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -97,7 +97,7 @@ jobs:
       RUSTFLAGS: "-C target-feature=+crt-static"
       RUST_BACKTRACE: full
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         run: |
@@ -113,7 +113,7 @@ jobs:
           ./ci/build_other.sh x86_64-pc-windows-msvc
 
       - name: Upload Github Assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ci/release/*
           prerelease: ${{ contains(github.ref_name, '-') }}
