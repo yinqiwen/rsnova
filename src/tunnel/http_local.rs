@@ -76,12 +76,13 @@ pub async fn handle_http(
 ) -> Result<()> {
     let headers_buf = read_http_headers(&mut inbound).await?;
     let target_addr = extract_target(&headers_buf, ":80")?;
-    let original_dst = crate::utils::get_original_dst(&inbound)
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "N/A".to_string());
-    let headers_str = String::from_utf8_lossy(&headers_buf);
-    let src = inbound.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "N/A".to_string());
-    tracing::info!("[{tunnel_id}] HTTP src={src} target={target_addr} original_dst={original_dst} headers={headers_str}");
+    // let original_dst = crate::utils::get_original_dst(&inbound)
+    //     .map(|a| a.to_string())
+    //     .unwrap_or_else(|_| "N/A".to_string());
+    // let headers_str = String::from_utf8_lossy(&headers_buf);
+    // let src = inbound.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "N/A".to_string());
+    // tracing::info!("[{tunnel_id}] HTTP src={src} target={target_addr} original_dst={original_dst} headers={headers_str}");
+    tracing::info!("[{}]Handle HTTP proxy to {} ", tunnel_id, target_addr);
     let msg = Message::open_tcp_stream(inbound, target_addr, Some(headers_buf));
     sender.send(msg).await?;
     Ok(())
