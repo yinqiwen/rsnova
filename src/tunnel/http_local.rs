@@ -70,14 +70,18 @@ fn extract_target(headers_buf: &Vec<u8>, default_port: &str) -> Result<String> {
 }
 
 pub async fn handle_http(
-    _tunnel_id: u32,
+    tunnel_id: u32,
     mut inbound: TcpStream,
     sender: ProxySender,
 ) -> Result<()> {
     let headers_buf = read_http_headers(&mut inbound).await?;
     let target_addr = extract_target(&headers_buf, ":80")?;
-
-    tracing::info!("{}", target_addr);
+    let original_dst = crate::utils::get_original_dst(&inbound)
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "N/A".to_string());
+    let headers_str = String::from_utf8_lossy(&headers_buf);
+    let src = inbound.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "N/A".to_string());
+    tracing::info!("[{tunnel_id}] HTTP src={src} target={target_addr} original_dst={original_dst} headers={headers_str}");
     let msg = Message::open_tcp_stream(inbound, target_addr, Some(headers_buf));
     sender.send(msg).await?;
     Ok(())

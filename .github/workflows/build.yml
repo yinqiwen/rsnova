@@ -42,10 +42,17 @@ jobs:
           chmod +x ./ci/build_linux.sh
           ./ci/build_linux.sh ${{ matrix.target }}
 
-  build-macos-x86:
+  build-macos:
     runs-on: macos-latest
     env:
       RUST_BACKTRACE: full
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+
     steps:
       - uses: actions/checkout@v4
 
@@ -55,34 +62,13 @@ jobs:
           rustup toolchain install stable
           rustup default stable
           rustup override set stable
-          rustup target add --toolchain stable x86_64-apple-darwin
+          rustup target add --toolchain stable ${{ matrix.target }}
 
-      - name: Build release
+      - name: Build ${{ matrix.target }}
         shell: bash
         run: |
           chmod +x ./ci/build_other.sh
-          ./ci/build_other.sh x86_64-apple-darwin
-
-  build-macos-arm:
-    runs-on: macos-latest
-    env:
-      RUST_BACKTRACE: full
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        run: |
-          rustup set profile minimal
-          rustup toolchain install stable
-          rustup default stable
-          rustup override set stable
-          rustup target add --toolchain stable aarch64-apple-darwin
-
-      - name: Build release
-        shell: bash
-        run: |
-          chmod +x ./ci/build_other.sh
-          ./ci/build_other.sh aarch64-apple-darwin
+          ./ci/build_other.sh ${{ matrix.target }}
 
   build-windows:
     runs-on: windows-latest
