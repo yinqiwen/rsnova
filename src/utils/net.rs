@@ -45,7 +45,7 @@ pub async fn new_tcp_listener(
     };
     let listen_tcp_socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
     if transparent {
-        set_ip_transparent(&listen_tcp_socket)?;
+        set_ip_transparent(&listen_tcp_socket, domain)?;
     }
     listen_tcp_socket.bind(&socket2_addr.into())?;
     listen_tcp_socket.listen(128)?;
@@ -71,7 +71,7 @@ pub fn new_udp_listener(
     };
     let listen_udp_socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
     if transparent {
-        set_ip_transparent(&listen_udp_socket)?;
+        set_ip_transparent(&listen_udp_socket, domain)?;
     }
     // Ok(listen_udp_socket)
     listen_udp_socket.bind(&socket2_addr.into())?;
@@ -87,12 +87,16 @@ pub fn new_udp_listener(
 // }
 
 #[cfg(target_os = "linux")]
-fn set_ip_transparent(socket: &socket2::Socket) -> std::io::Result<()> {
-    socket.set_ip_transparent(true)
+fn set_ip_transparent(socket: &socket2::Socket, domain: socket2::Domain) -> std::io::Result<()> {
+    match domain {
+        socket2::Domain::IPV4 => socket.set_ip_transparent_v4(true),
+        socket2::Domain::IPV6 => socket.set_ip_transparent_v6(true),
+        _ => Ok(()),
+    }
 }
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-fn set_ip_transparent(_socket: &socket2::Socket) -> std::io::Result<()> {
+fn set_ip_transparent(_socket: &socket2::Socket, _domain: socket2::Domain) -> std::io::Result<()> {
     Ok(())
 }
 
