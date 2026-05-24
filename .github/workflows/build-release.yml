@@ -57,7 +57,7 @@ jobs:
           tag_name: ${{ inputs.tag || github.ref_name }}
 
   build-macos-x86:
-    runs-on: macos-15-intel
+    runs-on: macos-latest
     env:
       RUST_BACKTRACE: full
     steps:
