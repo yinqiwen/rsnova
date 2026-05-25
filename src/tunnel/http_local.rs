@@ -96,7 +96,7 @@ pub async fn handle_https(
     let headers_buf = read_http_headers(&mut inbound).await?;
     let conn_res = "HTTP/1.0 200 Connection established\r\n\r\n";
     inbound.write_all(conn_res.as_bytes()).await?;
-    let target_addr = match tls_local::peek_sni(&mut inbound).await {
+    let target_addr = match tls_local::peek_sni_v2(&inbound).await {
         Ok(mut sni) => {
             sni.push_str(":443");
             sni
