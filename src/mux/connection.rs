@@ -5,6 +5,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -17,6 +18,14 @@ pub const INITIAL_STREAM_WINDOW: u32 = 256 * 1024;
 #[allow(dead_code)]
 pub const WINDOW_UPDATE_THRESHOLD: u32 = INITIAL_STREAM_WINDOW / 2;
 pub const CONTROL_CHANNEL_CAPACITY: usize = 256;
+
+/// How long a single ping waits for its matching pong before declaring the
+/// connection unhealthy. The health-check loop in `tunnel/client.rs` fires
+/// every 1 second; a 2-second timeout gives one missed RTT of headroom while
+/// still surfacing a half-open link within ~3 seconds of a stall. Tune higher
+/// for very high-latency links (mobile/satellite); lower values risk
+/// false-positive reconnects under transient load.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Per-stream state owned exclusively by the dispatcher.
 struct StreamEntry {
@@ -33,6 +42,8 @@ pub struct Connection {
     ev_writer: mpsc::Sender<Control>,
     stream_id_seed: AtomicU32,
     initial_stream_window: u32,
+    pong_rx: mpsc::Receiver<u32>,
+    ping_nonce_seed: AtomicU32,
 }
 
 pub enum Mode {
@@ -53,28 +64,46 @@ impl Connection {
     ) -> Self {
         let (sender_orig, receiver) = mpsc::channel::<Control>(CONTROL_CHANNEL_CAPACITY);
         let sender = sender_orig.clone();
+        let (pong_sender, pong_rx) = mpsc::channel::<u32>(1);
         tokio::spawn(async move {
-            handle_mux_connection(id, r, w, receiver, sender, stream_window).await;
+            handle_mux_connection(id, r, w, receiver, sender, stream_window, pong_sender).await;
         });
         match mode {
             Mode::Client => Self {
                 ev_writer: sender_orig,
                 stream_id_seed: AtomicU32::new(0),
                 initial_stream_window: stream_window,
+                pong_rx,
+                ping_nonce_seed: AtomicU32::new(1),
             },
             Mode::Server => Self {
                 ev_writer: sender_orig,
                 stream_id_seed: AtomicU32::new(1),
                 initial_stream_window: stream_window,
+                pong_rx,
+                ping_nonce_seed: AtomicU32::new(1),
             },
         }
     }
 
-    pub async fn ping(&self) -> Result<()> {
-        if let Err(e) = self.ev_writer.send(Control::Ping).await {
+    pub async fn ping(&mut self) -> Result<()> {
+        // Allocate a fresh monotonic nonce for this round-trip. Stale pongs
+        // from previously timed-out pings carry old nonces and will be ignored
+        // below — we drain them first as an optimization.
+        while self.pong_rx.try_recv().is_ok() {}
+        let nonce = self.ping_nonce_seed.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = self.ev_writer.send(Control::Ping(nonce)).await {
             return Err(anyhow::Error::new(e));
         }
-        Ok(())
+        let deadline = tokio::time::Instant::now() + PING_TIMEOUT;
+        loop {
+            match tokio::time::timeout_at(deadline, self.pong_rx.recv()).await {
+                Ok(Some(n)) if n == nonce => return Ok(()),
+                Ok(Some(_)) => continue, // stale pong from a previous round; keep waiting
+                Ok(None) => return Err(anyhow!("mux task terminated; connection unhealthy")),
+                Err(_) => return Err(anyhow!("ping timeout after {:?}", PING_TIMEOUT)),
+            }
+        }
     }
 
     pub async fn open_stream(&self) -> Result<MuxStream> {
@@ -113,6 +142,17 @@ impl Connection {
             Err(e) => Err(anyhow::Error::new(e)),
         }
     }
+
+    /// Signal the spawned mux task to exit promptly.
+    ///
+    /// Without this, dropping `Connection` leaves the task running until the
+    /// underlying transport errors out — which can take many seconds on a
+    /// half-open TCP/TLS link, exactly the case where ping detection is most
+    /// useful. Best-effort: if the channel is already closed, the task has
+    /// already exited.
+    pub fn close(&self) {
+        let _ = self.ev_writer.try_send(Control::Close);
+    }
 }
 
 async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -122,6 +162,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut ev_reader: mpsc::Receiver<Control>,
     ev_writer_orig: mpsc::Sender<Control>,
     initial_stream_window: u32,
+    pong_sender: mpsc::Sender<u32>,
 ) {
     let ev_writer = ev_writer_orig.clone();
     let read_connection_fut = async move {
@@ -141,7 +182,28 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 event::FLAG_FIN => Control::StreamClose(ev.header.stream_id, true),
                 event::FLAG_SHUTDOWN => Control::StreamShutdown(ev.header.stream_id, true),
                 event::FLAG_DATA => Control::StreamData(ev.header.stream_id, ev.body, true),
-                event::FLAG_PING => continue,
+                event::FLAG_PING => {
+                    if ev.body.len() == 4 {
+                        let nonce = u32::from_le_bytes(ev.body[..4].try_into().unwrap());
+                        Control::Pong(nonce)
+                    } else {
+                        // Older peer that didn't carry a nonce — echo zero so
+                        // they at least see liveness.
+                        Control::Pong(0)
+                    }
+                }
+                event::FLAG_PONG => {
+                    if ev.body.len() == 4 {
+                        let nonce = u32::from_le_bytes(ev.body[..4].try_into().unwrap());
+                        // Use try_send: at-most-one notification is sufficient, and an
+                        // .await here would deadlock the read loop if the channel is
+                        // already full (e.g., server side never drains, or peer sends
+                        // duplicate pongs). Stale entries are filtered by nonce match
+                        // in `ping()`.
+                        let _ = pong_sender.try_send(nonce);
+                    }
+                    continue;
+                }
                 event::FLAG_WIN_UPDATE => {
                     if ev.body.len() == 4 {
                         let increment = u32::from_le_bytes(ev.body[..4].try_into().unwrap());
@@ -297,10 +359,17 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         }
                     }
                 }
-                Control::Ping => {
-                    let ev = event::new_ping_event();
+                Control::Ping(nonce) => {
+                    let ev = event::new_ping_event(nonce);
                     if let Err(e) = event::write_event(&mut w, ev).await {
                         tracing::error!("write ping failed:{}", e);
+                        break;
+                    }
+                }
+                Control::Pong(nonce) => {
+                    let ev = event::new_pong_event(nonce);
+                    if let Err(e) = event::write_event(&mut w, ev).await {
+                        tracing::error!("write pong failed:{}", e);
                         break;
                     }
                 }
@@ -339,4 +408,65 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
     tokio::join!(read_connection_fut, read_ctrl_fut);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two Connections wired back-to-back over `tokio::io::duplex` should
+    /// successfully complete a ping round-trip: the client sends FLAG_PING,
+    /// the server's read loop converts it to Control::Pong and writes
+    /// FLAG_PONG, the client matches the nonce and returns Ok.
+    #[tokio::test]
+    async fn ping_roundtrip_succeeds() {
+        let (a, b) = tokio::io::duplex(8192);
+        let (a_r, a_w) = tokio::io::split(a);
+        let (b_r, b_w) = tokio::io::split(b);
+
+        let mut client =
+            Connection::new_with_stream_window(a_r, a_w, Mode::Client, 0, INITIAL_STREAM_WINDOW);
+        let _server =
+            Connection::new_with_stream_window(b_r, b_w, Mode::Server, 1, INITIAL_STREAM_WINDOW);
+
+        client.ping().await.expect("ping should succeed");
+        // Second ping uses a fresh nonce — verifies the counter advances and
+        // the previous round didn't poison state.
+        client.ping().await.expect("second ping should succeed");
+    }
+
+    /// If the peer never echoes pongs (simulated by routing reads to a sink
+    /// that never produces FLAG_PONG), `ping()` must time out within roughly
+    /// `PING_TIMEOUT` rather than hang.
+    #[tokio::test]
+    async fn ping_times_out_when_peer_silent() {
+        // duplex with a peer that we never service — writes will buffer up to
+        // capacity but no one reads or replies.
+        let (a, _b) = tokio::io::duplex(8192);
+        let (a_r, a_w) = tokio::io::split(a);
+
+        let mut client =
+            Connection::new_with_stream_window(a_r, a_w, Mode::Client, 0, INITIAL_STREAM_WINDOW);
+
+        let start = tokio::time::Instant::now();
+        let err = client.ping().await.expect_err("ping should time out");
+        let elapsed = start.elapsed();
+        assert!(
+            err.to_string().contains("timeout"),
+            "expected timeout error, got: {}",
+            err
+        );
+        // Allow generous slack for CI scheduling, but ensure we didn't return
+        // immediately (which would indicate the timeout wasn't actually waited).
+        assert!(
+            elapsed >= PING_TIMEOUT.saturating_sub(Duration::from_millis(100)),
+            "returned too early: {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < PING_TIMEOUT + Duration::from_secs(1),
+            "returned too late: {:?}",
+            elapsed
+        );
+    }
 }

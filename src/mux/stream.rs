@@ -101,7 +101,8 @@ pub enum Control {
     StreamClose(u32, bool),
     WindowUpdateFromPeer(u32, u32),
     WindowUpdateToPeer(u32, u32),
-    Ping,
+    Ping(u32),
+    Pong(u32),
     Close,
 }
 
