@@ -462,6 +462,7 @@ fn main() {
     runtime.block_on(async {
         if let Err(e) = service_main(&args).await {
             tracing::error!("service_main error:{e:?}");
+            std::process::exit(1);
         }
     });
 }
