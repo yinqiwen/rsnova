@@ -9,6 +9,7 @@ pub const FLAG_FIN: u8 = 2;
 pub const FLAG_SYN: u8 = 4;
 pub const FLAG_DATA: u8 = 3;
 pub const FLAG_PING: u8 = 5;
+pub const FLAG_PONG: u8 = 11;
 pub const FLAG_SHUTDOWN: u8 = 7;
 
 pub const FLAG_AUTH: u8 = 6;
@@ -177,13 +178,23 @@ pub fn new_syn_event(sid: u32) -> Event {
         body: Bytes::new(),
     }
 }
-pub fn new_ping_event() -> Event {
+pub fn new_ping_event(nonce: u32) -> Event {
     Event {
         header: Header {
-            flag_len: get_flag_len(0, FLAG_PING),
+            flag_len: get_flag_len(4, FLAG_PING),
             stream_id: 0,
         },
-        body: Bytes::new(),
+        body: Bytes::copy_from_slice(&nonce.to_le_bytes()),
+    }
+}
+
+pub fn new_pong_event(nonce: u32) -> Event {
+    Event {
+        header: Header {
+            flag_len: get_flag_len(4, FLAG_PONG),
+            stream_id: 0,
+        },
+        body: Bytes::copy_from_slice(&nonce.to_le_bytes()),
     }
 }
 
@@ -378,12 +389,12 @@ mod tests {
 
     #[tokio::test]
     async fn write_event_writes_empty_body_header() {
-        let ev = new_ping_event();
+        let ev = new_fin_event(0);
         let mut writer = PartialVecWriter::new(3);
         write_event(&mut writer, ev).await.unwrap();
         assert_eq!(
             writer.written,
-            expected_bytes(get_flag_len(0, FLAG_PING), 0, &[])
+            expected_bytes(get_flag_len(0, FLAG_FIN), 0, &[])
         );
     }
 

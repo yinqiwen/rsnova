@@ -137,7 +137,7 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
                     tracing::error!("reconnect error:{}", e);
                 }
             } else if let Err(e) = c.ping().await {
-                tracing::error!("open stream failed:{}", e);
+                tracing::error!("ping failed:{}", e);
             }
         }
         Ok(())

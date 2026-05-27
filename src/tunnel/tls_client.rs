@@ -47,7 +47,19 @@ impl MuxConnection for TlsConnection {
     async fn ping(&mut self) -> anyhow::Result<()> {
         match &mut self.inner {
             None => Err(anyhow!("null connection")),
-            Some(c) => c.ping().await,
+            Some(c) => match c.ping().await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Tear down the old mux task before dropping it. Otherwise
+                    // it keeps running on the half-open TLS link until TCP
+                    // keepalive eventually trips — exactly the failure mode
+                    // ping was added to detect.
+                    c.close();
+                    self.inner = None;
+                    tracing::error!("ping failed: {}", e);
+                    Err(e)
+                }
+            },
         }
     }
     async fn connect(&mut self, url: &Url, key_path: &Path, host: &str) -> anyhow::Result<()> {
@@ -76,6 +88,7 @@ impl MuxConnection for TlsConnection {
                     Ok((w, r))
                 }
                 Err(e) => {
+                    c.close();
                     self.inner = None;
                     tracing::error!("failed to open stream: {}", e);
                     Err(e)
@@ -93,6 +106,7 @@ impl MuxConnection for TlsConnection {
                     Ok((w, r))
                 }
                 Err(e) => {
+                    c.close();
                     self.inner = None;
                     Err(e)
                 }
