@@ -41,7 +41,7 @@ metrics-util = "0.20"
 time = "0.3"
 pki-types = { package = "rustls-pki-types", version = "1" }
 s2n-quic = "1"
-socket2 = { version = "0.6", features = ["all"] }
+socket2 = { version = "0.6.3", features = ["all"] }
 cfg-if = "1.0"
 lru = "0.18"
 # axum = "0.7.9"
