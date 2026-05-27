@@ -334,22 +334,17 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                 }
             });
 
-            // Start local tunnel server in background
+            // Start local tunnel server
             let listen_addr = args.listen;
             let tproxy = args.tproxy;
             let max_connections = args.max_connections;
-            tokio::spawn(async move {
-                if let Err(e) = tunnel::start_local_tunnel_server(
-                    &listen_addr,
-                    tunnel_sender,
-                    tproxy,
-                    max_connections,
-                )
-                .await
-                {
-                    tracing::error!("local tunnel server error: {e:?}");
-                }
-            });
+            tunnel::start_local_tunnel_server(
+                &listen_addr,
+                tunnel_sender,
+                tproxy,
+                max_connections,
+            )
+            .await?;
 
             // Keep the main task running
             loop {
@@ -467,6 +462,7 @@ fn main() {
     runtime.block_on(async {
         if let Err(e) = service_main(&args).await {
             tracing::error!("service_main error:{e:?}");
+            std::process::exit(1);
         }
     });
 }
