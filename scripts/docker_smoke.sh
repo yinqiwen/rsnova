@@ -41,7 +41,7 @@ cargo build --release --locked
 
 log "Initializing data directory at $DATA_DIR"
 mkdir -p "$DATA_DIR"
-"$RSNOVA_BIN" --init-dir "$DATA_DIR"
+"$RSNOVA_BIN" --init-dir "$DATA_DIR" < /dev/null
 
 for file in cert.pem key.pem server.toml client_proxy.toml client_tunnel.toml; do
   [[ -f "$DATA_DIR/$file" ]] || fail "missing init output: $file"
