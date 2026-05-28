@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -54,6 +54,14 @@ struct Cli {
     /// Config file path (TOML format)
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Generate certificates and role configs in the given directory, then exit
+    #[arg(long)]
+    init_dir: Option<PathBuf>,
+
+    /// Overwrite existing files when used with --init-dir
+    #[arg(long, requires = "init_dir")]
+    force: bool,
 
     /// All other arguments (merged with config file)
     #[command(flatten)]
@@ -155,13 +163,26 @@ struct Args {
     tunnel_port_range: String,
 }
 
-fn rcgen(tls_host: &String) -> anyhow::Result<()> {
-    let cert_path = std::path::PathBuf::from(r"./cert.pem");
-    let key_path = std::path::PathBuf::from(r"./key.pem");
+fn rcgen(output_dir: &Path, tls_host: &str, force: bool) -> anyhow::Result<()> {
+    let cert_path = output_dir.join("cert.pem");
+    let key_path = output_dir.join("key.pem");
+
+    if cert_path.exists() && key_path.exists() && !force {
+        println!(
+            "Skipping existing certificates at {}",
+            output_dir.display()
+        );
+        return Ok(());
+    }
+
+    fs::create_dir_all(output_dir)
+        .map_err(|e| anyhow!("create output directory {:?} failed: {}", output_dir, e))?;
 
     println!(
-        "generating self-signed certificate at {:?}  & {:?} with host:{}",
-        cert_path, key_path, tls_host,
+        "Generating self-signed certificate at {} and {} with host: {}",
+        cert_path.display(),
+        key_path.display(),
+        tls_host,
     );
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec![tls_host.into()])
@@ -171,7 +192,98 @@ fn rcgen(tls_host: &String) -> anyhow::Result<()> {
 
     fs::write(&cert_path, cert).map_err(|e| anyhow!("write cert failed: {}", e))?;
     fs::write(&key_path, key).map_err(|e| anyhow!("write key failed: {}", e))?;
-    println!("certificate generated successfully");
+    println!("Certificate generated successfully");
+    Ok(())
+}
+
+fn write_init_file(path: &Path, content: &str, force: bool) -> anyhow::Result<()> {
+    if path.exists() && !force {
+        println!("Skipping existing file: {}", path.display());
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("create directory {:?} failed: {}", parent, e))?;
+    }
+
+    fs::write(path, content).map_err(|e| anyhow!("write {:?} failed: {}", path, e))?;
+    println!("Wrote {}", path.display());
+    Ok(())
+}
+
+fn init_data_dir(output_dir: &Path, tls_host: &str, force: bool) -> anyhow::Result<()> {
+    rcgen(output_dir, tls_host, force)?;
+
+    let server_toml = r#"# === Server Configuration ===
+# Server listens on TLS (TCP) + QUIC (UDP) simultaneously on the same port.
+role = "server"
+listen = "0.0.0.0:48100"
+admin_listen = "0.0.0.0:48102"
+cert = "/data/cert.pem"
+key = "/data/key.pem"
+tunnel_port_range = "8000-9000"
+
+# === Optional (uncomment to customize) ===
+# concurrent = 5
+# threads = 2
+# idle_timeout_secs = 120
+# mux_stream_window = 262144
+# max_connections = 256
+# log = ""
+# NOTE: If enabling file logging to /data/, remove :ro from the volume mount.
+"#;
+
+    let client_proxy_toml = format!(
+        r#"# === Client Proxy Configuration ===
+role = "client"
+remote = "tls://server:48100"
+listen = "0.0.0.0:48101"
+admin_listen = "0.0.0.0:48103"
+cert = "/data/cert.pem"
+tls_host = "{tls_host}"
+
+# === Optional (uncomment to customize) ===
+# concurrent = 5
+# threads = 2
+# idle_timeout_secs = 120
+# mux_stream_window = 262144
+# max_connections = 256
+# log = ""
+# NOTE: "remote" uses Docker DNS name "server". For standalone docker run,
+# replace with actual IP or host.docker.internal.
+# NOTE: If enabling file logging to /data/, remove :ro from the volume mount.
+"#
+    );
+
+    let client_tunnel_toml = format!(
+        r#"# === Client Tunnel Configuration ===
+role = "client"
+remote = "tls://127.0.0.1:48100"
+admin_listen = "0.0.0.0:48104"
+cert = "/data/cert.pem"
+tls_host = "{tls_host}"
+tunnel_client_id = "my-client"
+# Formats: "port" | "local:remote" | "host:local:remote" | "host:local:remote:sni"
+tunnel = ["8080:80", "8443:443"]
+
+# === Optional (uncomment to customize) ===
+# threads = 2
+# idle_timeout_secs = 120
+# mux_stream_window = 262144
+# log = ""
+# NOTE: If enabling file logging to /data/, remove :ro from the volume mount.
+"#
+    );
+
+    write_init_file(&output_dir.join("server.toml"), server_toml, force)?;
+    write_init_file(&output_dir.join("client_proxy.toml"), &client_proxy_toml, force)?;
+    write_init_file(
+        &output_dir.join("client_tunnel.toml"),
+        &client_tunnel_toml,
+        force,
+    )?;
+
     Ok(())
 }
 
@@ -439,9 +551,18 @@ fn main() {
         Args::from(&mut cli.args)
     };
 
+    if let Some(ref init_dir) = cli.init_dir {
+        if let Err(e) = init_data_dir(init_dir, &args.tls_host, cli.force) {
+            eprintln!("init-dir failed: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if args.rcgen {
-        if let Err(e) = rcgen(&args.tls_host) {
+        if let Err(e) = rcgen(Path::new("."), &args.tls_host, true) {
             eprintln!("rcgen failed: {}", e);
+            std::process::exit(1);
         }
         return;
     }

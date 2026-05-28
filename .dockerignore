@@ -9,3 +9,7 @@ docs/
 ci/release
 *.pem
 *.key
+rsnova_data/
+rsnova_data_*/
+scripts/
+heap.pb.gz

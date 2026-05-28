@@ -1,6 +1,6 @@
 # Docker Support Design
 
-**Status: Spec (not implemented)**
+**Status: Phase 1 implemented (Phase 2 pending)**
 
 ## Overview
 
@@ -79,13 +79,17 @@ Uses Docker Compose profiles. Running `docker compose up` without `--profile` st
 **Admin port allocation**: Each role uses a different admin port to allow multi-role deployment on one host without conflicts.
 
 ```yaml
+x-rsnova-common: &rsnova-common
+  image: rsnova:${RSNOVA_IMAGE_TAG:-local}
+  build:
+    context: .
+    args:
+      VERSION: ${RSNOVA_RELEASE_VERSION:-latest}
+
 services:
   server:
+    <<: *rsnova-common
     profiles: [server]
-    build:
-      context: .
-      args:
-        VERSION: latest
     restart: unless-stopped
     ports:
       - "48100:48100/tcp"
@@ -97,11 +101,8 @@ services:
     command: ["-c", "/data/server.toml"]
 
   proxy:
+    <<: *rsnova-common
     profiles: [client_proxy]
-    build:
-      context: .
-      args:
-        VERSION: latest
     restart: unless-stopped
     ports:
       - "48101:48101"
@@ -112,11 +113,8 @@ services:
     command: ["-c", "/data/client_proxy.toml"]
 
   tunnel:
+    <<: *rsnova-common
     profiles: [client_tunnel]
-    build:
-      context: .
-      args:
-        VERSION: latest
     restart: unless-stopped
     # Tunnel client uses host network: Docker DNS unavailable,
     # remote defaults to 127.0.0.1.

@@ -1,0 +1,43 @@
+x-rsnova-common: &rsnova-common
+  image: rsnova:${RSNOVA_IMAGE_TAG:-local}
+  build:
+    context: .
+    args:
+      VERSION: ${RSNOVA_RELEASE_VERSION:-latest}
+
+services:
+  server:
+    <<: *rsnova-common
+    profiles: [server]
+    restart: unless-stopped
+    ports:
+      - "48100:48100/tcp"
+      - "48100:48100/udp"
+      - "48102:48102"
+    # network_mode: host  # recommended for tunnel deployments (see docs/superpowers/specs/2026-05-25-docker-support-design.md)
+    volumes:
+      - ${RSNOVA_DATA:-./rsnova_data}:/data:ro
+    command: ["-c", "/data/server.toml"]
+
+  proxy:
+    <<: *rsnova-common
+    profiles: [client_proxy]
+    restart: unless-stopped
+    ports:
+      - "48101:48101"
+      - "48103:48103"
+    # network_mode: host
+    volumes:
+      - ${RSNOVA_DATA:-./rsnova_data}:/data:ro
+    command: ["-c", "/data/client_proxy.toml"]
+
+  tunnel:
+    <<: *rsnova-common
+    profiles: [client_tunnel]
+    restart: unless-stopped
+    # Tunnel client uses host network: Docker DNS unavailable,
+    # remote defaults to 127.0.0.1.
+    network_mode: host
+    volumes:
+      - ${RSNOVA_DATA:-./rsnova_data}:/data:ro
+    command: ["-c", "/data/client_tunnel.toml"]
