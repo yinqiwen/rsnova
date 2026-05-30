@@ -136,9 +136,9 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
                 {
                     tracing::error!("reconnect error:{}", e);
                 }
-            } else if let Err(e) = c.ping().await {
+            } else { match c.ping().await { Err(e) => {
                 tracing::error!("ping failed:{}", e);
-            }
+            } _ => {}}}
         }
         Ok(())
     }
@@ -168,7 +168,7 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
         match msg {
             Message::OpenStream(event) => {
                 // tracing::info!("Proxy request to {}", event.event.addr);
-                if let Ok((mut send, mut recv)) = client.open_stream().await {
+                match client.open_stream().await { Ok((mut send, mut recv)) => {
                     metrics::gauge!("client_proxy_streams").increment(1.0);
                     tokio::spawn(async move {
                         if let Some(mut tcp_stream) = event.tcp_stream {
@@ -236,9 +236,9 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                         }
                         metrics::gauge!("client_proxy_streams").decrement(1.0);
                     });
-                } else {
+                } _ => {
                     tracing::error!("create remote proxy stream failed");
-                }
+                }}
             }
             Message::HealthCheck => {
                 let _ = client.health_check().await;
