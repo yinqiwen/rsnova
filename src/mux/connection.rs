@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -46,6 +46,7 @@ pub struct Connection {
     pong_rx: mpsc::Receiver<u32>,
     ping_nonce_seed: AtomicU32,
     window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
+    active_stream_count: Arc<AtomicUsize>,
 }
 
 pub enum Mode {
@@ -70,6 +71,8 @@ impl Connection {
         let (window_update_sender, window_update_receiver) =
             mpsc::unbounded_channel::<(u32, u32)>();
         let wus = window_update_sender.clone();
+        let active_stream_count = Arc::new(AtomicUsize::new(0));
+        let active_stream_count_for_dispatcher = active_stream_count.clone();
         tokio::spawn(async move {
             handle_mux_connection(
                 id,
@@ -81,6 +84,7 @@ impl Connection {
                 pong_sender,
                 wus,
                 window_update_receiver,
+                active_stream_count_for_dispatcher,
             )
             .await;
         });
@@ -93,6 +97,7 @@ impl Connection {
                 pong_rx,
                 ping_nonce_seed: AtomicU32::new(1),
                 window_update_sender,
+                active_stream_count,
             },
             Mode::Server => Self {
                 conn_id: id,
@@ -102,6 +107,7 @@ impl Connection {
                 pong_rx,
                 ping_nonce_seed: AtomicU32::new(1),
                 window_update_sender,
+                active_stream_count,
             },
         }
     }
@@ -176,6 +182,10 @@ impl Connection {
     pub fn close(&self) {
         let _ = self.ev_writer.try_send(Control::Close);
     }
+
+    pub fn active_stream_count(&self) -> usize {
+        self.active_stream_count.load(Ordering::Relaxed)
+    }
 }
 
 async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -188,6 +198,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     pong_sender: mpsc::Sender<u32>,
     window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
     mut window_update_receiver: mpsc::UnboundedReceiver<(u32, u32)>,
+    active_stream_count: Arc<AtomicUsize>,
 ) {
     let ev_writer = ev_writer_orig.clone();
     let read_connection_fut = async move {
@@ -343,6 +354,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             pending_bytes: 0,
                         });
                         metrics::gauge!("mux.streams").increment(1.0);
+                        active_stream_count.fetch_add(1, Ordering::Relaxed);
                         if let Some(rx) = params.receiver {
                             let stream = MuxStream::new(
                                 conn_id,
@@ -379,6 +391,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                 let _ = entry.sender.send(None);
                                 stream_entries.remove(&sid);
                                 metrics::gauge!("mux.streams").decrement(1.0);
+                                active_stream_count.fetch_sub(1, Ordering::Relaxed);
                                 let ev = event::new_fin_event(sid);
                                 let _ = event::write_event(&mut w, ev).await;
                             } else {
@@ -393,6 +406,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                     entry.flow.close();
                                     stream_entries.remove(&sid);
                                     metrics::gauge!("mux.streams").decrement(1.0);
+                                    active_stream_count.fetch_sub(1, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -425,6 +439,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 Control::StreamClose(sid, remote) => {
                     if let Some(entry) = stream_entries.remove(&sid) {
                         metrics::gauge!("mux.streams").decrement(1.0);
+                        active_stream_count.fetch_sub(1, Ordering::Relaxed);
                         entry.flow.close();
                         if !remote {
                             let ev = event::new_fin_event(sid);
@@ -479,6 +494,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             entry.flow.close();
             let _ = entry.sender.send(None);
         }
+        active_stream_count.store(0, Ordering::Relaxed);
         if let Some(cb) = accept_callback {
             let _ = cb.send(Err(anyhow!("connection closed")));
         }
