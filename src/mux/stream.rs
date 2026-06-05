@@ -1,3 +1,4 @@
+use crate::mux::metrics as mux_metrics;
 use crate::utils;
 use anyhow::Result;
 use bytes::Bytes;
@@ -91,6 +92,7 @@ pub struct NewStreamParams {
     pub sender: mpsc::UnboundedSender<Option<Bytes>>,
     pub receiver: Option<StreamDataReceiver>,
     pub flow: Arc<StreamFlow>,
+    pub window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
 }
 
 pub enum Control {
@@ -100,13 +102,13 @@ pub enum Control {
     StreamShutdown(u32, bool),
     StreamClose(u32, bool),
     WindowUpdateFromPeer(u32, u32),
-    WindowUpdateToPeer(u32, u32),
     Ping(u32),
     Pong(u32),
     Close,
 }
 
 pub struct MuxStream {
+    conn_id: u32,
     id: u32,
     ev_writer: PollSender<Control>,
     inbound_reader: mpsc::UnboundedReceiver<Option<Bytes>>,
@@ -117,17 +119,21 @@ pub struct MuxStream {
     flow: Arc<StreamFlow>,
     consumed_since_update: u32,
     window_update_threshold: u32,
+    window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
 }
 
 impl MuxStream {
     pub fn new(
+        conn_id: u32,
         id: u32,
         ev_writer: mpsc::Sender<Control>,
         inbound_reader: mpsc::UnboundedReceiver<Option<Bytes>>,
         flow: Arc<StreamFlow>,
         initial_stream_window: u32,
+        window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
     ) -> Self {
         Self {
+            conn_id,
             id,
             ev_writer: PollSender::new(ev_writer),
             inbound_reader,
@@ -138,6 +144,7 @@ impl MuxStream {
             flow,
             consumed_since_update: 0,
             window_update_threshold: initial_stream_window / 2,
+            window_update_sender,
         }
     }
 
@@ -149,22 +156,21 @@ impl MuxStream {
         self.inbound_reader.close();
     }
 
-    fn maybe_send_window_update(&mut self, bytes_read: u32) {
-        self.consumed_since_update += bytes_read;
+    fn maybe_send_window_update(&mut self) {
         if self.consumed_since_update >= self.window_update_threshold {
-            if let Some(sender) = self.ev_writer.get_ref() {
-                match sender.try_send(Control::WindowUpdateToPeer(
-                    self.id,
-                    self.consumed_since_update,
-                )) {
-                    Ok(()) => {
-                        self.consumed_since_update = 0;
-                    }
-                    Err(_) => {
-                        // Keep consumed_since_update — retry on next poll_read
-                    }
-                }
-            }
+            let _ = self
+                .window_update_sender
+                .send((self.id, self.consumed_since_update));
+            self.consumed_since_update = 0;
+        }
+    }
+
+    fn flush_window_update(&mut self) {
+        if self.consumed_since_update > 0 {
+            let _ = self
+                .window_update_sender
+                .send((self.id, self.consumed_since_update));
+            self.consumed_since_update = 0;
         }
     }
 }
@@ -183,7 +189,8 @@ impl AsyncRead for MuxStream {
             } else {
                 self.recv_buf.slice(copy_n..)
             };
-            self.maybe_send_window_update(copy_n as u32);
+            self.consumed_since_update += copy_n as u32;
+            self.maybe_send_window_update();
             return Poll::Ready(Ok(()));
         }
         if self.read_eof {
@@ -207,7 +214,8 @@ impl AsyncRead for MuxStream {
                     if copy_n < b.len() {
                         self.recv_buf = b.slice(copy_n..);
                     }
-                    self.maybe_send_window_update(copy_n as u32);
+                    self.consumed_since_update += copy_n as u32;
+                    self.maybe_send_window_update();
                     Poll::Ready(Ok(()))
                 }
                 None => {
@@ -269,12 +277,14 @@ impl AsyncWrite for MuxStream {
                 )));
             }
             if self.flow.available() == 0 {
+                mux_metrics::inc_write_window_wait(self.conn_id);
                 return Poll::Pending;
             }
         }
 
         match self.ev_writer.poll_reserve(cx) {
             Poll::Pending => {
+                mux_metrics::inc_poll_reserve_wait(self.conn_id);
                 self.flow.register_waker(cx.waker());
                 if self.flow.is_closed() {
                     return Poll::Ready(Err(std::io::Error::new(
@@ -292,6 +302,9 @@ impl AsyncWrite for MuxStream {
 
         let allowed = self.flow.try_consume(buf.len());
         if allowed == 0 {
+            if self.ev_writer.abort_send() {
+                mux_metrics::inc_poll_reserve_aborted(self.conn_id);
+            }
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "stream closed",
@@ -323,10 +336,9 @@ impl AsyncWrite for MuxStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        if self.read_eof {
-            Poll::Ready(Ok(()))
-        } else if !self.initial_close {
+        if !self.initial_close {
             self.initial_close = true;
+            self.flush_window_update();
             let ctrl = Control::StreamShutdown(self.id, false);
             match ready!(self.ev_writer.poll_reserve(cx)) {
                 Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
@@ -343,10 +355,12 @@ impl AsyncWrite for MuxStream {
 
 impl Drop for MuxStream {
     fn drop(&mut self) {
+        self.flush_window_update();
         if let Some(sender) = self.ev_writer.get_ref() {
             if !self.close_by_remote {
                 let stream_close = Control::StreamClose(self.id, false);
                 if let Err(e) = sender.try_send(stream_close) {
+                    mux_metrics::inc_stream_close_drop_failed(self.conn_id);
                     tracing::debug!("stream {} drop send close failed: {}", self.id, e);
                 }
             }

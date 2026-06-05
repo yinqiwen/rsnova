@@ -39,11 +39,13 @@ struct StreamEntry {
 }
 
 pub struct Connection {
+    conn_id: u32,
     ev_writer: mpsc::Sender<Control>,
     stream_id_seed: AtomicU32,
     initial_stream_window: u32,
     pong_rx: mpsc::Receiver<u32>,
     ping_nonce_seed: AtomicU32,
+    window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
 }
 
 pub enum Mode {
@@ -65,23 +67,41 @@ impl Connection {
         let (sender_orig, receiver) = mpsc::channel::<Control>(CONTROL_CHANNEL_CAPACITY);
         let sender = sender_orig.clone();
         let (pong_sender, pong_rx) = mpsc::channel::<u32>(1);
+        let (window_update_sender, window_update_receiver) =
+            mpsc::unbounded_channel::<(u32, u32)>();
+        let wus = window_update_sender.clone();
         tokio::spawn(async move {
-            handle_mux_connection(id, r, w, receiver, sender, stream_window, pong_sender).await;
+            handle_mux_connection(
+                id,
+                r,
+                w,
+                receiver,
+                sender,
+                stream_window,
+                pong_sender,
+                wus,
+                window_update_receiver,
+            )
+            .await;
         });
         match mode {
             Mode::Client => Self {
+                conn_id: id,
                 ev_writer: sender_orig,
                 stream_id_seed: AtomicU32::new(0),
                 initial_stream_window: stream_window,
                 pong_rx,
                 ping_nonce_seed: AtomicU32::new(1),
+                window_update_sender,
             },
             Mode::Server => Self {
+                conn_id: id,
                 ev_writer: sender_orig,
                 stream_id_seed: AtomicU32::new(1),
                 initial_stream_window: stream_window,
                 pong_rx,
                 ping_nonce_seed: AtomicU32::new(1),
+                window_update_sender,
             },
         }
     }
@@ -111,11 +131,13 @@ impl Connection {
         let flow = Arc::new(StreamFlow::new(self.initial_stream_window));
         let id = self.stream_id_seed.fetch_add(2, Ordering::SeqCst);
         let stream = MuxStream::new(
+            self.conn_id,
             id,
             self.ev_writer.clone(),
             receiver,
             flow.clone(),
             self.initial_stream_window,
+            self.window_update_sender.clone(),
         );
         if let Err(e) = self
             .ev_writer
@@ -124,6 +146,7 @@ impl Connection {
                 sender,
                 receiver: None,
                 flow,
+                window_update_sender: self.window_update_sender.clone(),
             }))
             .await
         {
@@ -163,6 +186,8 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     ev_writer_orig: mpsc::Sender<Control>,
     initial_stream_window: u32,
     pong_sender: mpsc::Sender<u32>,
+    window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
+    mut window_update_receiver: mpsc::UnboundedReceiver<(u32, u32)>,
 ) {
     let ev_writer = ev_writer_orig.clone();
     let read_connection_fut = async move {
@@ -177,6 +202,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         sender,
                         receiver: Some(receiver),
                         flow,
+                        window_update_sender: window_update_sender.clone(),
                     })
                 }
                 event::FLAG_FIN => Control::StreamClose(ev.header.stream_id, true),
@@ -235,8 +261,69 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let mut accept_callback: Option<oneshot::Sender<Result<MuxStream>>> = None;
         let mut stream_entries: HashMap<u32, StreamEntry> = HashMap::new();
 
-        while let Some(ctrl) = ev_reader.recv().await {
+        loop {
+            // Drain all pending window updates first (non-blocking).
+            // This ensures flow-control credits are delivered reliably
+            // and never dropped, regardless of control channel pressure.
+            while let Ok((sid, increment)) = window_update_receiver.try_recv() {
+                if let Some(entry) = stream_entries.get_mut(&sid) {
+                    entry.pending_bytes = entry.pending_bytes.saturating_sub(increment as u64);
+                    entry.recv_window = entry
+                        .recv_window
+                        .saturating_add(increment)
+                        .min(initial_stream_window);
+                    let ev = event::new_window_update_event(sid, increment);
+                    if let Err(e) = event::write_event(&mut w, ev).await {
+                        tracing::error!("write window update failed:{}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Wait for either a window update or a control message.
+            // Using select! is critical: blocking on ev_reader.recv()
+            // alone would never wake up when a window update arrives,
+            // leading to a flow-control deadlock.
+            let ctrl = tokio::select! {
+                // Window update arrived — drain all and retry.
+                Some((sid, increment)) = window_update_receiver.recv() => {
+                    // Process this window update AND drain any additional
+                    // pending updates before looping back.
+                    if let Some(entry) = stream_entries.get_mut(&sid) {
+                        entry.pending_bytes = entry.pending_bytes.saturating_sub(increment as u64);
+                        entry.recv_window = entry
+                            .recv_window
+                            .saturating_add(increment)
+                            .min(initial_stream_window);
+                        let ev = event::new_window_update_event(sid, increment);
+                        if let Err(e) = event::write_event(&mut w, ev).await {
+                            tracing::error!("write window update failed:{}", e);
+                            break;
+                        }
+                    }
+                    while let Ok((sid, inc)) = window_update_receiver.try_recv() {
+                        if let Some(entry) = stream_entries.get_mut(&sid) {
+                            entry.pending_bytes = entry.pending_bytes.saturating_sub(inc as u64);
+                            entry.recv_window = entry
+                                .recv_window
+                                .saturating_add(inc)
+                                .min(initial_stream_window);
+                            let ev = event::new_window_update_event(sid, inc);
+                            if let Err(e) = event::write_event(&mut w, ev).await {
+                                tracing::error!("write window update failed:{}", e);
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                result = ev_reader.recv() => result,
+            };
+
             match ctrl {
+                None => break,
+                Some(ctrl) => match ctrl {
                 Control::AcceptStream(callback) => {
                     if accept_callback.is_some() {
                         let _ = callback.send(Err(anyhow!("duplicate accept")));
@@ -258,11 +345,13 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         metrics::gauge!("mux.streams").increment(1.0);
                         if let Some(rx) = params.receiver {
                             let stream = MuxStream::new(
+                                conn_id,
                                 params.stream_id,
                                 ev_writer.clone(),
                                 rx,
                                 params.flow,
                                 initial_stream_window,
+                                params.window_update_sender,
                             );
                             incoming_streams.push_back(stream);
                         } else {
@@ -320,20 +409,6 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         entry.flow.credit(increment);
                     }
                 }
-                Control::WindowUpdateToPeer(sid, increment) => {
-                    if let Some(entry) = stream_entries.get_mut(&sid) {
-                        entry.pending_bytes = entry.pending_bytes.saturating_sub(increment as u64);
-                        entry.recv_window = entry
-                            .recv_window
-                            .saturating_add(increment)
-                            .min(initial_stream_window);
-                        let ev = event::new_window_update_event(sid, increment);
-                        if let Err(e) = event::write_event(&mut w, ev).await {
-                            tracing::error!("write window update failed:{}", e);
-                            break;
-                        }
-                    }
-                }
                 Control::StreamShutdown(sid, remote) => {
                     if let Some(entry) = stream_entries.get(&sid) {
                         if !remote {
@@ -376,7 +451,8 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 Control::Close => {
                     break;
                 }
-            }
+                }
+            } // close match ctrl outer (match ctrl -> None|Some)
 
             if accept_callback.is_some() && !incoming_streams.is_empty() {
                 let stream = incoming_streams.pop_front().unwrap();
@@ -468,5 +544,95 @@ mod tests {
             "returned too late: {:?}",
             elapsed
         );
+    }
+
+    /// End-to-end flow-control test:
+    /// Client writes TRANSFER_SIZE bytes through a stream, server echoes
+    /// them back, and client verifies the round-trip.  The test validates
+    /// that window-update credits flow in both directions without
+    /// deadlocking, even when the initial send window (SMALL_WINDOW =
+    /// 4096) is much smaller than the transfer size.
+    #[tokio::test]
+    async fn window_update_duplex() {
+        const TRANSFER_SIZE: usize = 64 * 1024; // 64 KiB
+        const SMALL_WINDOW: u32 = 4096;
+        const DEADLINE: Duration = Duration::from_secs(5);
+
+        let (a, b) = tokio::io::duplex(8192);
+        let (a_r, a_w) = tokio::io::split(a);
+        let (b_r, b_w) = tokio::io::split(b);
+
+        let mut client =
+            Connection::new_with_stream_window(a_r, a_w, Mode::Client, 0, SMALL_WINDOW);
+        let server =
+            Connection::new_with_stream_window(b_r, b_w, Mode::Server, 1, SMALL_WINDOW);
+
+        // Quick health check — verifies basic connectivity.
+        client.ping().await.expect("ping before transfer");
+
+        // Open stream (client side).
+        let client_stream = tokio::time::timeout(DEADLINE, client.open_stream())
+            .await
+            .expect("timeout")
+            .expect("open_stream");
+
+        // Accept stream (server side).
+        let server_stream = tokio::time::timeout(DEADLINE, server.accept_stream())
+            .await
+            .expect("timeout")
+            .expect("accept_stream");
+
+        let (mut cr, cw) = tokio::io::split(client_stream);
+        let (sr, sw) = tokio::io::split(server_stream);
+
+        // Spawn writer: client -> server.
+        let payload = vec![0xABu8; TRANSFER_SIZE];
+        let payload_clone = payload.clone();
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut cw = cw;
+            cw.write_all(&payload_clone).await.expect("write_all");
+            cw.shutdown().await.expect("shutdown");
+        });
+
+        // Spawn echo: server reads then writes back.
+        let echo = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            use tokio::io::AsyncWriteExt;
+            let (mut sr, mut sw) = (sr, sw);
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            loop {
+                let n = sr.read(&mut buf).await.expect("echo read");
+                if n == 0 {
+                    break;
+                }
+                sw.write_all(&buf[..n]).await.expect("echo write");
+                total += n;
+            }
+            sw.shutdown().await.expect("shutdown");
+            total
+        });
+
+        // Client reads echoed data back.
+        use tokio::io::AsyncReadExt;
+        let mut echo_buf = Vec::with_capacity(TRANSFER_SIZE);
+        tokio::time::timeout(DEADLINE, cr.read_to_end(&mut echo_buf))
+            .await
+            .expect("timeout")
+            .expect("client read echo");
+
+        tokio::time::timeout(DEADLINE, writer)
+            .await
+            .expect("timeout")
+            .expect("writer task");
+        let nread = tokio::time::timeout(DEADLINE, echo)
+            .await
+            .expect("timeout")
+            .expect("echo task");
+
+        assert_eq!(echo_buf.len(), TRANSFER_SIZE, "echoed data length");
+        assert_eq!(nread, TRANSFER_SIZE, "server echo count");
+        assert_eq!(&echo_buf, &payload, "echoed data matches");
     }
 }
