@@ -2,6 +2,7 @@ use anyhow::anyhow;
 use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -13,6 +14,7 @@ use url::Url;
 use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
+use super::client::PoolConnection;
 use super::client::{ProxySender, PROXY_CHANNEL_CAPACITY};
 use super::Message;
 use crate::mux::event;
@@ -117,6 +119,70 @@ impl MuxConnection for TlsConnection {
     fn set_connection(&mut self, new_c: Self) {
         *self = new_c;
     }
+
+    fn close(&mut self) {
+        if let Some(c) = self.inner.take() {
+            c.close();
+        }
+    }
+
+    fn active_stream_count(&self) -> usize {
+        match &self.inner {
+            Some(c) => c.active_stream_count(),
+            None => 0,
+        }
+    }
+}
+
+fn spawn_tls_replacement(
+    url: Url,
+    cert_path: PathBuf,
+    host: String,
+    stream_window: u32,
+    sender: ProxySender,
+) {
+    tokio::spawn(async move {
+        let max_retries = 5u32;
+        let mut backoff = Duration::from_secs(1);
+        for attempt in 0..max_retries {
+            tracing::info!("TLS replacement connection attempt {}", attempt + 1);
+            let mut tls_conn = TlsConnection::new(stream_window);
+            match tls_conn.connect(&url, &cert_path, &host).await {
+                Ok(()) => {
+                    if let Some(ref mut conn) = tls_conn.inner {
+                        match conn.open_stream().await {
+                            Ok(auth_stream) => {
+                                let (mut auth_r, mut auth_w) = tokio::io::split(auth_stream);
+                                let auth_req = event::AuthRequest::Proxy;
+                                if let Ok(ev) = event::new_auth_event(0, &auth_req) {
+                                    if event::write_event(&mut auth_w, ev).await.is_ok() {
+                                        if let Ok(ack_ev) = event::read_event(&mut auth_r).await {
+                                            if ack_ev.header.flags() == event::FLAG_AUTH_ACK {
+                                                tracing::info!("TLS replacement connection authenticated");
+                                                let _ = sender.send(Message::ReplaceConnection(
+                                                    Box::new(tls_conn),
+                                                )).await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("TLS replacement: open auth stream failed: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("TLS replacement connect failed (attempt {}): {}", attempt + 1, e);
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+        tracing::error!("TLS replacement connection failed after {} attempts", max_retries);
+    });
 }
 
 impl MuxClient<TlsConnection> {
@@ -127,16 +193,20 @@ impl MuxClient<TlsConnection> {
         count: usize,
         idle_timeout_secs: usize,
         stream_window: u32,
+        max_age_secs: u64,
     ) -> anyhow::Result<ProxySender> {
         match url.scheme() {
             "tls" => {
                 let (sender, receiver) = mpsc::channel::<Message>(PROXY_CHANNEL_CAPACITY);
+                let (retirement_tx, mut retirement_rx) = mpsc::unbounded_channel::<usize>();
                 let mut client: MuxClient<TlsConnection> = MuxClient {
                     url: url.clone(),
                     conns: Vec::new(),
                     host: String::from(host),
                     cursor: 0,
                     cert: Some(PathBuf::from(cert_path)),
+                    max_age_secs,
+                    retirement_notify: retirement_tx,
                 };
                 for i in 0..count {
                     let mut tls_conn: TlsConnection = TlsConnection {
@@ -170,9 +240,24 @@ impl MuxClient<TlsConnection> {
                         }
                         tracing::info!("TLS connection:{} auth completed (proxy mode)", i);
                     }
-                    client.conns.push(tls_conn);
+                    client.conns.push(PoolConnection::new(tls_conn, max_age_secs, i));
                 }
                 tokio::spawn(mux_client_loop(client, receiver, idle_timeout_secs));
+                let replacement_sender = sender.clone();
+                let replacement_url = url.clone();
+                let replacement_cert = cert_path.to_path_buf();
+                let replacement_host = host.clone();
+                tokio::spawn(async move {
+                    while let Some(_idx) = retirement_rx.recv().await {
+                        spawn_tls_replacement(
+                            replacement_url.clone(),
+                            replacement_cert.clone(),
+                            replacement_host.clone(),
+                            stream_window,
+                            replacement_sender.clone(),
+                        );
+                    }
+                });
                 Ok(sender)
             }
             _ => Err(anyhow!("unsupported schema:{:?}", url.scheme())),
@@ -232,6 +317,7 @@ pub async fn new_tls_client(
     count: usize,
     idle_timeout_secs: usize,
     stream_window: u32,
+    max_age_secs: u64,
 ) -> anyhow::Result<ProxySender> {
     MuxClient::<TlsConnection>::from(
         url,
@@ -240,6 +326,7 @@ pub async fn new_tls_client(
         count,
         idle_timeout_secs,
         stream_window,
+        max_age_secs,
     )
     .await
 }
