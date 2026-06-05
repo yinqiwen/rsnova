@@ -169,28 +169,26 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
                 pc.conn.close();
                 continue;
             }
-            // Skip retired connections still serving streams
-            if pc.retired {
-                continue;
-            }
-            // Check retirement age
-            if now >= pc.retire_at {
+            // Check retirement age (only for non-retired connections)
+            if !pc.retired && now >= pc.retire_at {
                 tracing::info!("Connection {} reached max age, retiring", i);
                 pc.retired = true;
                 let _ = self.retirement_notify.send(i);
-                continue;
             }
-            // Normal health check for active connections
+            // Health check: ping valid connections (including retired ones still draining)
             if pc.conn.is_valid() {
                 if let Err(e) = pc.conn.ping().await {
                     tracing::error!("ping failed:{}", e);
                 }
-            } else if let Err(e) = pc
-                .conn
-                .connect(&self.url, self.cert.as_ref().unwrap(), &self.host)
-                .await
-            {
-                tracing::error!("reconnect error:{}", e);
+            } else if !pc.retired {
+                // Only reconnect non-retired connections
+                if let Err(e) = pc
+                    .conn
+                    .connect(&self.url, self.cert.as_ref().unwrap(), &self.host)
+                    .await
+                {
+                    tracing::error!("reconnect error:{}", e);
+                }
             }
         }
         Ok(())
