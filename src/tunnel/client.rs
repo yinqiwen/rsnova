@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use std::any::Any;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use url::Url;
@@ -168,7 +169,11 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
         match msg {
             Message::OpenStream(event) => {
                 // tracing::info!("Proxy request to {}", event.event.addr);
-                match client.open_stream().await { Ok((mut send, mut recv)) => {
+                // Wrap open_stream in a timeout to prevent the serial
+                // mux_client_loop from blocking indefinitely when the
+                // control channel is saturated.
+                match tokio::time::timeout(Duration::from_secs(1), client.open_stream()).await {
+                    Ok(Ok((mut send, mut recv))) => {
                     metrics::gauge!("client_proxy_streams").increment(1.0);
                     tokio::spawn(async move {
                         if let Some(mut tcp_stream) = event.tcp_stream {
@@ -236,12 +241,20 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                         }
                         metrics::gauge!("client_proxy_streams").decrement(1.0);
                     });
-                } _ => {
-                    tracing::error!("create remote proxy stream failed");
+                } Err(_) | Ok(Err(_)) => {
+                    crate::mux::metrics::inc_client_open_stream_failed();
+                    tracing::error!("create remote proxy stream failed or timed out");
                 }}
             }
             Message::HealthCheck => {
-                let _ = client.health_check().await;
+                // Use a short timeout to prevent health_check from
+                // blocking the entire mux_client_loop when the control
+                // channel is saturated (Bug 2).
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    client.health_check(),
+                )
+                .await;
             }
             Message::AddConnection(c) => match c.downcast::<T::Connection>().ok() {
                 Some(obj) => {

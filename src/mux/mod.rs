@@ -1,5 +1,6 @@
 mod connection;
 pub mod event;
+pub(crate) mod metrics;
 mod stream;
 
 pub use connection::Connection;
