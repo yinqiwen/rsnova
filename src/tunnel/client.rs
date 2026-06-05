@@ -117,9 +117,9 @@ pub(crate) struct PoolConnection<T> {
 
 impl<T> PoolConnection<T> {
     pub fn new(conn: T, max_age_secs: u64, conn_index: usize) -> Self {
-        let jitter = ((conn_index.wrapping_mul(73)) % 201) as u64;
+        let jitter = ((conn_index.wrapping_mul(73)) % 201) as i64 - 100;
         let created_at = Instant::now();
-        let retire_at = created_at + Duration::from_secs(max_age_secs + jitter);
+        let retire_at = created_at + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
         Self {
             conn,
             created_at,
@@ -201,11 +201,11 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
         let len = self.conns.len();
         for pc in &mut self.conns {
             if !pc.conn.is_valid() {
-                let jitter = ((len.wrapping_mul(73)) % 201) as u64;
+                let jitter = ((len.wrapping_mul(73)) % 201) as i64 - 100;
                 *pc = PoolConnection {
                     conn: new_c,
                     created_at: Instant::now(),
-                    retire_at: Instant::now() + Duration::from_secs(self.max_age_secs + jitter),
+                    retire_at: Instant::now() + Duration::from_secs((self.max_age_secs as i64 + jitter).max(0) as u64),
                     retired: false,
                 };
                 return Ok(());
