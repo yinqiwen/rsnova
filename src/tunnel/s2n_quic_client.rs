@@ -3,7 +3,7 @@ use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use url::Url;
@@ -11,6 +11,7 @@ use url::Url;
 use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
+use super::client::PoolConnection;
 use super::client::{ProxySender, PROXY_CHANNEL_CAPACITY};
 use super::Message;
 use crate::mux::event::{
@@ -80,6 +81,86 @@ impl MuxConnection for S2NQuicConnection {
     fn set_connection(&mut self, new_c: Self) {
         *self = new_c;
     }
+
+    fn close(&mut self) {
+        if let Some(c) = self.inner.take() {
+            c.close(s2n_quic::application::Error::UNKNOWN);
+        }
+    }
+
+    fn active_stream_count(&self) -> usize {
+        // QUIC doesn't use mux::Connection, no stream counter available
+        0
+    }
+}
+
+fn spawn_quic_replacement(
+    url: Url,
+    cert_path: PathBuf,
+    host: String,
+    endpoint: Arc<s2n_quic::client::Client>,
+    sender: ProxySender,
+) {
+    tokio::spawn(async move {
+        let max_retries = 5u32;
+        let mut backoff = Duration::from_secs(1);
+        for attempt in 0..max_retries {
+            tracing::info!("QUIC replacement connection attempt {}", attempt + 1);
+            let mut quic_conn = S2NQuicConnection {
+                endpoint: endpoint.clone(),
+                inner: None,
+            };
+            if let Err(e) = quic_conn.connect(&url, &cert_path, &host).await {
+                tracing::warn!("QUIC replacement connect failed (attempt {}): {}", attempt + 1, e);
+                if attempt + 1 < max_retries {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+                continue;
+            }
+            let success = 'auth: {
+                let Some(ref mut connection) = quic_conn.inner else { break 'auth false; };
+                let auth_stream = match connection.open_bidirectional_stream().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("QUIC replacement: open auth stream failed: {}", e);
+                        break 'auth false;
+                    }
+                };
+                let (mut auth_r, mut auth_w) = auth_stream.split();
+                let auth_req = event::AuthRequest::Proxy;
+                let ev = match event::new_auth_event(0, &auth_req) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        tracing::warn!("QUIC replacement: create auth event failed: {}", e);
+                        break 'auth false;
+                    }
+                };
+                if event::write_event(&mut auth_w, ev).await.is_err() {
+                    tracing::warn!("QUIC replacement: auth write failed");
+                    break 'auth false;
+                }
+                match event::read_event(&mut auth_r).await {
+                    Ok(ack_ev) if ack_ev.header.flags() == event::FLAG_AUTH_ACK => true,
+                    _ => {
+                        tracing::warn!("QUIC replacement: unexpected auth response");
+                        false
+                    }
+                }
+            };
+            if success {
+                tracing::info!("QUIC replacement connection authenticated");
+                let _ = sender.send(Message::ReplaceConnection(Box::new(quic_conn))).await;
+                return;
+            }
+            quic_conn.close();
+            if attempt + 1 < max_retries {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+        tracing::error!("QUIC replacement connection failed after {} attempts", max_retries);
+    });
 }
 
 impl MuxClient<S2NQuicConnection> {
@@ -89,16 +170,20 @@ impl MuxClient<S2NQuicConnection> {
         host: &String,
         count: usize,
         idle_timeout_secs: usize,
+        max_age_secs: u64,
     ) -> anyhow::Result<ProxySender> {
         match url.scheme() {
             "quic" => {
                 let (sender, receiver) = mpsc::channel::<Message>(PROXY_CHANNEL_CAPACITY);
+                let (retirement_tx, mut retirement_rx) = mpsc::unbounded_channel::<usize>();
                 let mut client: MuxClient<S2NQuicConnection> = MuxClient {
                     url: url.clone(),
                     conns: Vec::new(),
                     host: String::from(host),
                     cursor: 0,
                     cert: Some(PathBuf::from(cert_path)),
+                    max_age_secs,
+                    retirement_notify: retirement_tx,
                 };
                 let endpoint = new_s2n_quic_endpoint(url, cert_path)?;
                 let endpoint = Arc::new(endpoint);
@@ -136,9 +221,25 @@ impl MuxClient<S2NQuicConnection> {
                         }
                         tracing::info!("QUIC connection:{} auth completed (proxy mode)", i);
                     }
-                    client.conns.push(quic_conn);
+                    client.conns.push(PoolConnection::new(quic_conn, max_age_secs, i));
                 }
                 tokio::spawn(mux_client_loop(client, receiver, idle_timeout_secs));
+                let replacement_sender = sender.clone();
+                let replacement_url = url.clone();
+                let replacement_cert = cert_path.to_path_buf();
+                let replacement_host = host.clone();
+                let replacement_endpoint = endpoint.clone();
+                tokio::spawn(async move {
+                    while let Some(_idx) = retirement_rx.recv().await {
+                        spawn_quic_replacement(
+                            replacement_url.clone(),
+                            replacement_cert.clone(),
+                            replacement_host.clone(),
+                            replacement_endpoint.clone(),
+                            replacement_sender.clone(),
+                        );
+                    }
+                });
                 Ok(sender)
             }
             _ => Err(anyhow!("unsupported schema:{:?}", url.scheme())),
@@ -181,6 +282,7 @@ pub async fn start_tunnel_client_quic(
     host: &str,
     app_config: Arc<crate::app_config::AppConfig>,
     idle_timeout_secs: usize,
+    max_age_secs: u64,
 ) -> anyhow::Result<()> {
     const INITIAL_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
@@ -203,6 +305,7 @@ pub async fn start_tunnel_client_quic(
                 &client_id,
                 &entries,
                 idle_timeout_secs,
+                max_age_secs,
             ) => r,
             _ = token.cancelled() => {
                 tracing::info!("Config reloaded, reconnecting QUIC tunnel with new entries...");
@@ -237,6 +340,7 @@ async fn run_quic_tunnel_connection(
     client_id: &str,
     entries: &[TunnelEntry],
     idle_timeout_secs: usize,
+    max_age_secs: u64,
 ) -> anyhow::Result<()> {
     let endpoint = new_s2n_quic_endpoint(url, cert_path)?;
     let mut connection = new_s2n_quic_connection(&endpoint, url, host).await?;
@@ -275,21 +379,37 @@ async fn run_quic_tunnel_connection(
 
     let (_handle, mut acceptor) = connection.split();
 
-    while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
-        let (mut recv_stream, mut send_stream) = stream.split();
-        tokio::spawn(async move {
-            if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
-                &mut recv_stream,
-                &mut send_stream,
-                idle_timeout_secs,
-            )
-            .await
-            {
-                tracing::warn!("QUIC reverse stream error: {}", e);
+    let jitter = ((0u32.wrapping_mul(73)) % 201) as i64 - 100;
+    let retire_at = std::time::Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(retire_at.into()) => {
+                tracing::info!("QUIC tunnel connection reached max age, returning for reconnect");
+                return Ok(());
             }
-        });
+            result = acceptor.accept_bidirectional_stream() => {
+                match result {
+                    Ok(Some(stream)) => {
+                        let (mut recv_stream, mut send_stream) = stream.split();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
+                                &mut recv_stream,
+                                &mut send_stream,
+                                idle_timeout_secs,
+                            )
+                            .await
+                            {
+                                tracing::warn!("QUIC reverse stream error: {}", e);
+                            }
+                        });
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(anyhow!("QUIC accept error: {}", e)),
+                }
+            }
+        }
     }
-    Ok(())
 }
 
 pub async fn new_quic_client(
@@ -298,6 +418,7 @@ pub async fn new_quic_client(
     host: &String,
     count: usize,
     idle_timeout_secs: usize,
+    max_age_secs: u64,
 ) -> anyhow::Result<ProxySender> {
-    MuxClient::<S2NQuicConnection>::from(url, cert_path, host, count, idle_timeout_secs).await
+    MuxClient::<S2NQuicConnection>::from(url, cert_path, host, count, idle_timeout_secs, max_age_secs).await
 }

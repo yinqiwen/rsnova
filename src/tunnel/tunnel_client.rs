@@ -21,6 +21,7 @@ pub async fn start_tunnel_client_tls(
     idle_timeout_secs: usize,
     stream_window: u32,
     app_config: Arc<AppConfig>,
+    max_age_secs: u64,
 ) -> Result<()> {
     const INITIAL_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
@@ -44,6 +45,7 @@ pub async fn start_tunnel_client_tls(
                 &client_id,
                 &entries,
                 idle_timeout_secs,
+                max_age_secs,
             ) => r,
             _ = token.cancelled() => {
                 tracing::info!("Config reloaded, reconnecting TLS tunnel with new entries...");
@@ -79,6 +81,7 @@ async fn run_tunnel_connection_tls(
     client_id: &str,
     entries: &[TunnelEntry],
     idle_timeout_secs: usize,
+    max_age_secs: u64,
 ) -> Result<()> {
     let mut conn = TlsConnection::new(stream_window);
     conn.connect(url, cert_path, host).await?;

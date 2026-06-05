@@ -104,6 +104,11 @@ struct Args {
     #[arg(long)]
     mux_stream_window: u32,
 
+    /// Maximum age in seconds before a connection is retired and replaced (0 = disabled)
+    #[default(3600)]
+    #[arg(long)]
+    mux_client_max_age_secs: u64,
+
     #[default("mydomain.io".to_string())]
     #[arg(long)]
     tls_host: String,
@@ -289,6 +294,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     args.idle_timeout_secs,
                     args.mux_stream_window,
                     app_config,
+                    args.mux_client_max_age_secs,
                 )
                 .await?;
                 return Ok(());
@@ -303,6 +309,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             &args.tls_host,
                             args.concurrent,
                             args.idle_timeout_secs,
+                            args.mux_client_max_age_secs,
                         )
                         .await?
                     }
@@ -314,6 +321,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             args.concurrent,
                             args.idle_timeout_secs,
                             args.mux_stream_window,
+                            args.mux_client_max_age_secs,
                         )
                         .await?
                     }
