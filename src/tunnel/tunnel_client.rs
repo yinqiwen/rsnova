@@ -115,16 +115,32 @@ async fn run_tunnel_connection_tls(
     drop(recv);
 
     tracing::info!("Tunnel client ready, waiting for reverse streams...");
-    loop {
-        let (mut stream_send, mut stream_recv) = conn.accept_stream().await?;
+    let jitter = ((0u32.wrapping_mul(73)) % 201) as i64 - 100;
+    let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        tokio::spawn(async move {
-            if let Err(e) =
-                handle_reverse_stream(&mut stream_recv, &mut stream_send, idle_timeout_secs).await
-            {
-                tracing::warn!("Reverse stream error: {}", e);
+    loop {
+        handles.retain(|h| !h.is_finished());
+
+        tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retire_at)) => {
+                tracing::info!("TLS tunnel connection reached max age, draining...");
+                for h in handles {
+                    let _ = h.await;
+                }
+                return Ok(());
             }
-        });
+            result = conn.accept_stream() => {
+                let (mut stream_send, mut stream_recv) = result?;
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) =
+                        handle_reverse_stream(&mut stream_recv, &mut stream_send, idle_timeout_secs).await
+                    {
+                        tracing::warn!("Reverse stream error: {}", e);
+                    }
+                }));
+            }
+        }
     }
 }
 
