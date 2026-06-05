@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use std::any::Any;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use url::Url;
@@ -63,6 +63,7 @@ pub enum Message {
     OpenStream(OpenStreamRequest),
     HealthCheck,
     AddConnection(Box<dyn Any + Send + Sync>),
+    ReplaceConnection(Box<dyn Any + Send + Sync>),
 }
 impl Message {
     pub fn open_tcp_stream(
@@ -94,6 +95,8 @@ pub(crate) trait MuxConnection {
     async fn accept_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)>;
     fn is_valid(&self) -> bool;
     fn set_connection(&mut self, new_c: Self);
+    fn close(&mut self);
+    fn active_stream_count(&self) -> usize;
 }
 
 pub(crate) trait MuxClientTrait {
@@ -105,12 +108,35 @@ pub(crate) trait MuxClientTrait {
     fn add_connection(&mut self, c: Self::Connection) -> anyhow::Result<()>;
 }
 
+pub(crate) struct PoolConnection<T> {
+    pub(crate) conn: T,
+    created_at: Instant,
+    retire_at: Instant,
+    retired: bool,
+}
+
+impl<T> PoolConnection<T> {
+    pub fn new(conn: T, max_age_secs: u64, conn_index: usize) -> Self {
+        let jitter = ((conn_index.wrapping_mul(73)) % 201) as u64;
+        let created_at = Instant::now();
+        let retire_at = created_at + Duration::from_secs(max_age_secs + jitter);
+        Self {
+            conn,
+            created_at,
+            retire_at,
+            retired: false,
+        }
+    }
+}
+
 pub(crate) struct MuxClient<T> {
     pub(crate) url: url::Url,
-    pub(crate) conns: Vec<T>,
+    pub(crate) conns: Vec<PoolConnection<T>>,
     pub(crate) host: String,
     pub(crate) cursor: usize,
     pub(crate) cert: Option<PathBuf>,
+    pub(crate) max_age_secs: u64,
+    pub(crate) retirement_notify: mpsc::UnboundedSender<usize>,
 }
 
 impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
@@ -118,10 +144,15 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
     type RecvStream = T::RecvStream;
     type Connection = T;
     async fn open_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)> {
-        for _i in 0..self.conns.len() {
-            let idx = self.cursor % self.conns.len();
+        let len = self.conns.len();
+        for _i in 0..len {
+            let idx = self.cursor % len;
             self.cursor += 1;
-            if let Ok((send, recv)) = self.conns[idx].open_stream().await {
+            let pc = &mut self.conns[idx];
+            if pc.retired {
+                continue;
+            }
+            if let Ok((send, recv)) = pc.conn.open_stream().await {
                 return Ok((send, recv));
             }
         }
@@ -129,29 +160,60 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
     }
 
     async fn health_check(&mut self) -> anyhow::Result<()> {
-        for c in &mut self.conns {
-            if !c.is_valid() {
-                if let Err(e) = c
-                    .connect(&self.url, self.cert.as_ref().unwrap(), &self.host)
-                    .await
-                {
-                    tracing::error!("reconnect error:{}", e);
+        let now = Instant::now();
+        for i in 0..self.conns.len() {
+            let pc = &mut self.conns[i];
+            // Close fully drained retired connections
+            if pc.retired && pc.conn.is_valid() && pc.conn.active_stream_count() == 0 {
+                tracing::info!("Connection {} retired and drained, closing", i);
+                pc.conn.close();
+                continue;
+            }
+            // Skip retired connections still serving streams
+            if pc.retired {
+                continue;
+            }
+            // Check retirement age
+            if now >= pc.retire_at {
+                tracing::info!("Connection {} reached max age, retiring", i);
+                pc.retired = true;
+                let _ = self.retirement_notify.send(i);
+                continue;
+            }
+            // Normal health check for active connections
+            if pc.conn.is_valid() {
+                if let Err(e) = pc.conn.ping().await {
+                    tracing::error!("ping failed:{}", e);
                 }
-            } else { match c.ping().await { Err(e) => {
-                tracing::error!("ping failed:{}", e);
-            } _ => {}}}
+            } else if let Err(e) = pc
+                .conn
+                .connect(&self.url, self.cert.as_ref().unwrap(), &self.host)
+                .await
+            {
+                tracing::error!("reconnect error:{}", e);
+            }
         }
         Ok(())
     }
 
     fn add_connection(&mut self, new_c: Self::Connection) -> anyhow::Result<()> {
-        for c in &mut self.conns {
-            if !c.is_valid() {
-                c.set_connection(new_c);
+        // First try: replace an invalid (disconnected) slot
+        let len = self.conns.len();
+        for pc in &mut self.conns {
+            if !pc.conn.is_valid() {
+                let jitter = ((len.wrapping_mul(73)) % 201) as u64;
+                *pc = PoolConnection {
+                    conn: new_c,
+                    created_at: Instant::now(),
+                    retire_at: Instant::now() + Duration::from_secs(self.max_age_secs + jitter),
+                    retired: false,
+                };
                 return Ok(());
             }
         }
-        self.conns.push(new_c);
+        // All slots valid — append
+        let idx = self.conns.len();
+        self.conns.push(PoolConnection::new(new_c, self.max_age_secs, idx));
         Ok(())
     }
 }
@@ -262,6 +324,14 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                 }
                 None => {
                     tracing::error!("AddConnection failed: connection type mismatch");
+                }
+            },
+            Message::ReplaceConnection(c) => match c.downcast::<T::Connection>().ok() {
+                Some(obj) => {
+                    let _ = client.add_connection(*obj);
+                }
+                None => {
+                    tracing::error!("ReplaceConnection failed: connection type mismatch");
                 }
             },
         }
