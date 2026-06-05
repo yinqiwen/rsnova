@@ -147,39 +147,54 @@ fn spawn_tls_replacement(
         for attempt in 0..max_retries {
             tracing::info!("TLS replacement connection attempt {}", attempt + 1);
             let mut tls_conn = TlsConnection::new(stream_window);
-            match tls_conn.connect(&url, &cert_path, &host).await {
-                Ok(()) => {
-                    if let Some(ref mut conn) = tls_conn.inner {
-                        match conn.open_stream().await {
-                            Ok(auth_stream) => {
-                                let (mut auth_r, mut auth_w) = tokio::io::split(auth_stream);
-                                let auth_req = event::AuthRequest::Proxy;
-                                if let Ok(ev) = event::new_auth_event(0, &auth_req) {
-                                    if event::write_event(&mut auth_w, ev).await.is_ok() {
-                                        if let Ok(ack_ev) = event::read_event(&mut auth_r).await {
-                                            if ack_ev.header.flags() == event::FLAG_AUTH_ACK {
-                                                tracing::info!("TLS replacement connection authenticated");
-                                                let _ = sender.send(Message::ReplaceConnection(
-                                                    Box::new(tls_conn),
-                                                )).await;
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("TLS replacement: open auth stream failed: {}", e);
-                            }
-                        }
+            if let Err(e) = tls_conn.connect(&url, &cert_path, &host).await {
+                tracing::warn!("TLS replacement connect failed (attempt {}): {}", attempt + 1, e);
+                if attempt + 1 < max_retries {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+                continue;
+            }
+            let success = 'auth: {
+                let Some(ref mut conn) = tls_conn.inner else { break 'auth false; };
+                let auth_stream = match conn.open_stream().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("TLS replacement: open auth stream failed: {}", e);
+                        break 'auth false;
+                    }
+                };
+                let (mut auth_r, mut auth_w) = tokio::io::split(auth_stream);
+                let auth_req = event::AuthRequest::Proxy;
+                let ev = match event::new_auth_event(0, &auth_req) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        tracing::warn!("TLS replacement: create auth event failed: {}", e);
+                        break 'auth false;
+                    }
+                };
+                if event::write_event(&mut auth_w, ev).await.is_err() {
+                    tracing::warn!("TLS replacement: auth write failed");
+                    break 'auth false;
+                }
+                match event::read_event(&mut auth_r).await {
+                    Ok(ack_ev) if ack_ev.header.flags() == event::FLAG_AUTH_ACK => true,
+                    _ => {
+                        tracing::warn!("TLS replacement: unexpected auth response");
+                        false
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("TLS replacement connect failed (attempt {}): {}", attempt + 1, e);
-                }
+            };
+            if success {
+                tracing::info!("TLS replacement connection authenticated");
+                let _ = sender.send(Message::ReplaceConnection(Box::new(tls_conn))).await;
+                return;
             }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(30));
+            tls_conn.close();
+            if attempt + 1 < max_retries {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
         }
         tracing::error!("TLS replacement connection failed after {} attempts", max_retries);
     });
