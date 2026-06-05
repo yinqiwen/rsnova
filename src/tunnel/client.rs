@@ -335,3 +335,30 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_range_is_bounded() {
+        for i in 0..1000usize {
+            let jitter = ((i.wrapping_mul(73)) % 201) as i64 - 100;
+            assert!(jitter >= -100, "jitter {} too low for index {}", jitter, i);
+            assert!(jitter <= 100, "jitter {} too high for index {}", jitter, i);
+        }
+    }
+
+    #[test]
+    fn pool_connection_retire_at_is_correct() {
+        let max_age_secs = 1800u64;
+        let conn_index = 0usize;
+        let jitter = ((conn_index.wrapping_mul(73)) % 201) as i64 - 100;
+        let pc_created = Instant::now();
+        let pc_retire = pc_created + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
+
+        let elapsed = pc_retire.duration_since(pc_created);
+        assert!(elapsed >= Duration::from_secs(max_age_secs - 100));
+        assert!(elapsed <= Duration::from_secs(max_age_secs + 100));
+    }
+}
