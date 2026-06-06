@@ -110,6 +110,12 @@ pub(crate) trait MuxClientTrait {
     fn add_connection(&mut self, c: Self::Connection) -> anyhow::Result<()>;
 }
 
+/// Deterministic jitter for connection retirement, derived from connection index.
+/// Range: [-100, +100] seconds. Spreads retirements across a 200-second window.
+pub(crate) fn retirement_jitter_secs(index: usize) -> i64 {
+    ((index.wrapping_mul(73)) % 201) as i64 - 100
+}
+
 pub(crate) struct PoolConnection<T> {
     pub(crate) conn: T,
     retire_at: Instant,
@@ -118,7 +124,7 @@ pub(crate) struct PoolConnection<T> {
 
 impl<T> PoolConnection<T> {
     pub fn new(conn: T, max_age_secs: u64, conn_index: usize) -> Self {
-        let jitter = ((conn_index.wrapping_mul(73)) % 201) as i64 - 100;
+        let jitter = retirement_jitter_secs(conn_index);
         let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
         Self {
             conn,
@@ -202,7 +208,7 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
         // First try: replace an invalid (disconnected) or retired slot
         for (i, pc) in self.conns.iter_mut().enumerate() {
             if !pc.conn.is_valid() || pc.retired {
-                let jitter = ((i.wrapping_mul(73)) % 201) as i64 - 100;
+                let jitter = retirement_jitter_secs(i);
                 *pc = PoolConnection {
                     conn: new_c,
                     retire_at: Instant::now() + Duration::from_secs((self.max_age_secs as i64 + jitter).max(0) as u64),
@@ -211,7 +217,12 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
                 return Ok(());
             }
         }
-        // All slots valid and active — append
+        // All slots valid and active — append (with pool size limit)
+        const MAX_POOL_SIZE: usize = 32;
+        if self.conns.len() >= MAX_POOL_SIZE {
+            tracing::warn!("Connection pool at maximum size ({}), dropping new connection", MAX_POOL_SIZE);
+            return Ok(());
+        }
         let idx = self.conns.len();
         self.conns.push(PoolConnection::new(new_c, self.max_age_secs, idx));
         Ok(())
@@ -345,7 +356,7 @@ mod tests {
     #[test]
     fn jitter_range_is_bounded() {
         for i in 0..1000usize {
-            let jitter = ((i.wrapping_mul(73)) % 201) as i64 - 100;
+            let jitter = retirement_jitter_secs(i);
             assert!(jitter >= -100, "jitter {} too low for index {}", jitter, i);
             assert!(jitter <= 100, "jitter {} too high for index {}", jitter, i);
         }
@@ -355,12 +366,171 @@ mod tests {
     fn pool_connection_retire_at_is_correct() {
         let max_age_secs = 1800u64;
         let conn_index = 0usize;
-        let jitter = ((conn_index.wrapping_mul(73)) % 201) as i64 - 100;
+        let jitter = retirement_jitter_secs(conn_index);
         let pc_created = Instant::now();
         let pc_retire = pc_created + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
 
         let elapsed = pc_retire.duration_since(pc_created);
         assert!(elapsed >= Duration::from_secs(max_age_secs - 100));
         assert!(elapsed <= Duration::from_secs(max_age_secs + 100));
+    }
+
+    #[test]
+    fn retirement_jitter_uses_shared_function() {
+        // Verify the shared function matches the inline formula
+        for i in 0..100usize {
+            let expected = ((i.wrapping_mul(73)) % 201) as i64 - 100;
+            assert_eq!(retirement_jitter_secs(i), expected);
+        }
+    }
+
+    /// Mock MuxConnection for testing pool behavior.
+    struct MockConnection {
+        valid: bool,
+        stream_count: usize,
+    }
+
+    impl MuxConnection for MockConnection {
+        type SendStream = tokio::io::DuplexStream;
+        type RecvStream = tokio::io::DuplexStream;
+        async fn ping(&mut self) -> anyhow::Result<()> {
+            if self.valid { Ok(()) } else { Err(anyhow!("invalid")) }
+        }
+        async fn connect(&mut self, _url: &Url, _key_path: &Path, _host: &str) -> anyhow::Result<()> {
+            self.valid = true;
+            Ok(())
+        }
+        async fn open_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)> {
+            if self.valid {
+                let (a, b) = tokio::io::duplex(1024);
+                Ok((a, b))
+            } else {
+                Err(anyhow!("invalid"))
+            }
+        }
+        async fn accept_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)> {
+            Err(anyhow!("not implemented"))
+        }
+        fn is_valid(&self) -> bool { self.valid }
+        fn set_connection(&mut self, new_c: Self) { *self = new_c; }
+        fn close(&mut self) { self.valid = false; }
+        fn active_stream_count(&self) -> usize { self.stream_count }
+    }
+
+    fn make_client(max_age_secs: u64) -> (MuxClient<MockConnection>, mpsc::UnboundedReceiver<usize>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = MuxClient {
+            url: "tls://localhost:443".parse().unwrap(),
+            conns: Vec::new(),
+            host: "localhost".to_string(),
+            cursor: 0,
+            cert: None,
+            max_age_secs,
+            retirement_notify: tx,
+        };
+        (client, rx)
+    }
+
+    #[tokio::test]
+    async fn open_stream_skips_retired() {
+        let (mut client, _rx) = make_client(1800);
+        client.conns.push(PoolConnection {
+            conn: MockConnection { valid: true, stream_count: 0 },
+            retire_at: Instant::now() + Duration::from_secs(3600),
+            retired: true, // retired
+        });
+        client.conns.push(PoolConnection {
+            conn: MockConnection { valid: true, stream_count: 0 },
+            retire_at: Instant::now() + Duration::from_secs(3600),
+            retired: false,
+        });
+        // Should skip retired conn[0] and use conn[1]
+        let result = client.open_stream().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn open_stream_fails_when_all_retired() {
+        let (mut client, _rx) = make_client(1800);
+        client.conns.push(PoolConnection {
+            conn: MockConnection { valid: true, stream_count: 0 },
+            retire_at: Instant::now() + Duration::from_secs(3600),
+            retired: true,
+        });
+        let result = client.open_stream().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn add_connection_replaces_retired_slot() {
+        let (mut client, _rx) = make_client(1800);
+        client.conns.push(PoolConnection {
+            conn: MockConnection { valid: true, stream_count: 5 },
+            retire_at: Instant::now() + Duration::from_secs(3600),
+            retired: true,
+        });
+        let new_conn = MockConnection { valid: true, stream_count: 0 };
+        client.add_connection(new_conn).unwrap();
+        assert_eq!(client.conns.len(), 1);
+        assert!(!client.conns[0].retired);
+        assert!(client.conns[0].conn.is_valid());
+    }
+
+    #[tokio::test]
+    async fn add_connection_replaces_invalid_slot() {
+        let (mut client, _rx) = make_client(1800);
+        client.conns.push(PoolConnection {
+            conn: MockConnection { valid: false, stream_count: 0 },
+            retire_at: Instant::now() + Duration::from_secs(3600),
+            retired: false,
+        });
+        let new_conn = MockConnection { valid: true, stream_count: 0 };
+        client.add_connection(new_conn).unwrap();
+        assert_eq!(client.conns.len(), 1);
+        assert!(client.conns[0].conn.is_valid());
+    }
+
+    #[tokio::test]
+    async fn max_age_zero_disables_retirement() {
+        let (mut client, mut rx) = make_client(0); // disabled
+        client.conns.push(PoolConnection {
+            conn: MockConnection { valid: true, stream_count: 0 },
+            retire_at: Instant::now(), // already past
+            retired: false,
+        });
+        client.health_check().await.unwrap();
+        // Should NOT have retired since max_age is 0
+        assert!(!client.conns[0].retired);
+        assert!(rx.try_recv().is_err()); // no notification
+    }
+
+    #[tokio::test]
+    async fn health_check_retires_aged_connection() {
+        let (mut client, mut rx) = make_client(1);
+        client.conns.push(PoolConnection {
+            conn: MockConnection { valid: true, stream_count: 0 },
+            retire_at: Instant::now() - Duration::from_secs(1), // already expired
+            retired: false,
+        });
+        client.health_check().await.unwrap();
+        assert!(client.conns[0].retired);
+        assert!(rx.try_recv().is_ok()); // notification sent
+    }
+
+    #[tokio::test]
+    async fn pool_size_limit_prevents_growth() {
+        let (mut client, _rx) = make_client(1800);
+        // Fill pool to max
+        for i in 0..32 {
+            client.conns.push(PoolConnection::new(
+                MockConnection { valid: true, stream_count: 0 },
+                1800,
+                i,
+            ));
+        }
+        // Try to add one more — should be silently dropped
+        let new_conn = MockConnection { valid: true, stream_count: 0 };
+        client.add_connection(new_conn).unwrap();
+        assert_eq!(client.conns.len(), 32);
     }
 }

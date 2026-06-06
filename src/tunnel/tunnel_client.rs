@@ -120,7 +120,7 @@ async fn run_tunnel_connection_tls(
 
     tracing::info!("Tunnel client ready, waiting for reverse streams...");
     let seed = TUNNEL_CONN_SEED.fetch_add(1, Ordering::Relaxed) as usize;
-    let jitter = ((seed.wrapping_mul(73)) % 201) as i64 - 100;
+    let jitter = crate::tunnel::client::retirement_jitter_secs(seed);
     let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 

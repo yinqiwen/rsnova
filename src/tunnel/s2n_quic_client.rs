@@ -380,20 +380,26 @@ async fn run_quic_tunnel_connection(
     let (_handle, mut acceptor) = connection.split();
 
     let seed = crate::tunnel::tunnel_client::next_tunnel_conn_seed() as usize;
-    let jitter = ((seed.wrapping_mul(73)) % 201) as i64 - 100;
+    let jitter = super::client::retirement_jitter_secs(seed);
     let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     loop {
+        handles.retain(|h| !h.is_finished());
+
         tokio::select! {
-            _ = tokio::time::sleep_until(retire_at.into()) => {
-                tracing::info!("QUIC tunnel connection reached max age, returning for reconnect");
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retire_at)) => {
+                tracing::info!("QUIC tunnel connection reached max age, draining...");
+                for h in handles {
+                    let _ = h.await;
+                }
                 return Ok(());
             }
             result = acceptor.accept_bidirectional_stream() => {
                 match result {
                     Ok(Some(stream)) => {
                         let (mut recv_stream, mut send_stream) = stream.split();
-                        tokio::spawn(async move {
+                        handles.push(tokio::spawn(async move {
                             if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
                                 &mut recv_stream,
                                 &mut send_stream,
@@ -403,10 +409,20 @@ async fn run_quic_tunnel_connection(
                             {
                                 tracing::warn!("QUIC reverse stream error: {}", e);
                             }
-                        });
+                        }));
                     }
-                    Ok(None) => return Ok(()),
-                    Err(e) => return Err(anyhow!("QUIC accept error: {}", e)),
+                    Ok(None) => {
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                        return Err(anyhow!("QUIC accept error: {}", e));
+                    }
                 }
             }
         }
