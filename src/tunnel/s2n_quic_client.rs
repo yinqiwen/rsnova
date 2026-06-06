@@ -275,7 +275,9 @@ pub(crate) async fn new_s2n_quic_connection(
     Ok(connection)
 }
 
-/// Tunnel client loop for QUIC mode with hot-reload support
+/// Tunnel client entry point for QUIC mode with hot-reload support.
+/// Spawns `concurrent` independent tunnel client tasks, each with its own
+/// connection, reconnection loop, and authentication.
 pub async fn start_tunnel_client_quic(
     url: &Url,
     cert_path: &Path,
@@ -283,7 +285,47 @@ pub async fn start_tunnel_client_quic(
     app_config: Arc<crate::app_config::AppConfig>,
     idle_timeout_secs: usize,
     max_age_secs: u64,
+    concurrent: usize,
 ) -> anyhow::Result<()> {
+    if concurrent == 0 {
+        tracing::warn!("--concurrent is 0, defaulting to 1");
+    }
+    let concurrent = concurrent.max(1);
+    let mut handles = Vec::with_capacity(concurrent);
+    for i in 0..concurrent {
+        let url = url.clone();
+        let cert_path = cert_path.to_path_buf();
+        let host = host.to_string();
+        let app_config = app_config.clone();
+        handles.push(tokio::spawn(async move {
+            tunnel_client_loop_quic(
+                &url,
+                &cert_path,
+                &host,
+                app_config,
+                idle_timeout_secs,
+                max_age_secs,
+                i,
+            )
+            .await;
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    Ok(())
+}
+
+/// Per-connection reconnection loop with exponential backoff and config reload.
+async fn tunnel_client_loop_quic(
+    url: &Url,
+    cert_path: &Path,
+    host: &str,
+    app_config: Arc<crate::app_config::AppConfig>,
+    idle_timeout_secs: usize,
+    max_age_secs: u64,
+    conn_index: usize,
+) {
     const INITIAL_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
 
@@ -294,7 +336,7 @@ pub async fn start_tunnel_client_quic(
             (cfg.tunnel_client_id.clone(), cfg.tunnel_entries.clone())
         };
 
-        let start = Instant::now();
+        let start = std::time::Instant::now();
         let token = app_config.reload_token_clone().await;
 
         let result = tokio::select! {
@@ -306,9 +348,10 @@ pub async fn start_tunnel_client_quic(
                 &entries,
                 idle_timeout_secs,
                 max_age_secs,
+                conn_index,
             ) => r,
             _ = token.cancelled() => {
-                tracing::info!("Config reloaded, reconnecting QUIC tunnel with new entries...");
+                tracing::info!("[conn-{}] Config reloaded, reconnecting QUIC tunnel with new entries...", conn_index);
                 backoff_secs = INITIAL_BACKOFF_SECS;
                 continue;
             }
@@ -320,7 +363,8 @@ pub async fn start_tunnel_client_quic(
         }
 
         tracing::info!(
-            "QUIC tunnel connection lost ({}), reconnecting in {}s...",
+            "[conn-{}] QUIC tunnel connection lost ({}), reconnecting in {}s...",
+            conn_index,
             result
                 .as_ref()
                 .err()
@@ -341,6 +385,7 @@ async fn run_quic_tunnel_connection(
     entries: &[TunnelEntry],
     idle_timeout_secs: usize,
     max_age_secs: u64,
+    conn_index: usize,
 ) -> anyhow::Result<()> {
     let endpoint = new_s2n_quic_endpoint(url, cert_path)?;
     let mut connection = new_s2n_quic_connection(&endpoint, url, host).await?;
@@ -379,44 +424,77 @@ async fn run_quic_tunnel_connection(
 
     let (_handle, mut acceptor) = connection.split();
 
-    let seed = crate::tunnel::tunnel_client::next_tunnel_conn_seed() as usize;
-    let jitter = super::client::retirement_jitter_secs(seed);
-    let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    loop {
-        handles.retain(|h| !h.is_finished());
+    if max_age_secs > 0 {
+        let seed = crate::tunnel::tunnel_client::next_tunnel_conn_seed() as usize;
+        let jitter = super::client::retirement_jitter_secs(seed);
+        let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
 
-        tokio::select! {
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retire_at)) => {
-                tracing::info!("QUIC tunnel connection reached max age, draining...");
-                futures::future::join_all(handles).await;
-                return Ok(());
+        loop {
+            handles.retain(|h| !h.is_finished());
+
+            tokio::select! {
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retire_at)) => {
+                    tracing::info!("[conn-{}] QUIC tunnel connection reached max age, draining...", conn_index);
+                    futures::future::join_all(handles).await;
+                    return Ok(());
+                }
+                result = acceptor.accept_bidirectional_stream() => {
+                    match result {
+                        Ok(Some(stream)) => {
+                            let (mut recv_stream, mut send_stream) = stream.split();
+                            handles.push(tokio::spawn(async move {
+                                if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
+                                    &mut recv_stream,
+                                    &mut send_stream,
+                                    idle_timeout_secs,
+                                )
+                                .await
+                                {
+                                    tracing::warn!("QUIC reverse stream error: {}", e);
+                                }
+                            }));
+                        }
+                        Ok(None) => {
+                            futures::future::join_all(handles).await;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            futures::future::join_all(handles).await;
+                            return Err(anyhow!("[conn-{}] QUIC accept error: {}", conn_index, e));
+                        }
+                    }
+                }
             }
-            result = acceptor.accept_bidirectional_stream() => {
-                match result {
-                    Ok(Some(stream)) => {
-                        let (mut recv_stream, mut send_stream) = stream.split();
-                        handles.push(tokio::spawn(async move {
-                            if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
-                                &mut recv_stream,
-                                &mut send_stream,
-                                idle_timeout_secs,
-                            )
-                            .await
-                            {
-                                tracing::warn!("QUIC reverse stream error: {}", e);
-                            }
-                        }));
-                    }
-                    Ok(None) => {
-                        futures::future::join_all(handles).await;
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        futures::future::join_all(handles).await;
-                        return Err(anyhow!("QUIC accept error: {}", e));
-                    }
+        }
+    } else {
+        // No retirement — accept streams forever
+        loop {
+            handles.retain(|h| !h.is_finished());
+
+            match acceptor.accept_bidirectional_stream().await {
+                Ok(Some(stream)) => {
+                    let (mut recv_stream, mut send_stream) = stream.split();
+                    handles.push(tokio::spawn(async move {
+                        if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
+                            &mut recv_stream,
+                            &mut send_stream,
+                            idle_timeout_secs,
+                        )
+                        .await
+                        {
+                            tracing::warn!("QUIC reverse stream error: {}", e);
+                        }
+                    }));
+                }
+                Ok(None) => {
+                    futures::future::join_all(handles).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    futures::future::join_all(handles).await;
+                    return Err(anyhow!("[conn-{}] QUIC accept error: {}", conn_index, e));
                 }
             }
         }

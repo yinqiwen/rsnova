@@ -295,6 +295,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     args.mux_stream_window,
                     app_config,
                     args.connection_max_age,
+                    args.concurrent,
                 )
                 .await?;
                 return Ok(());

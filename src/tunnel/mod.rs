@@ -42,6 +42,7 @@ pub async fn start_tunnel_client(
     stream_window: u32,
     app_config: std::sync::Arc<crate::app_config::AppConfig>,
     max_age_secs: u64,
+    concurrent: usize,
 ) -> anyhow::Result<()> {
     match url.scheme() {
         "tls" => {
@@ -53,11 +54,12 @@ pub async fn start_tunnel_client(
                 stream_window,
                 app_config,
                 max_age_secs,
+                concurrent,
             )
             .await
         }
         "quic" => {
-            start_tunnel_client_quic(url, cert_path, host, app_config, idle_timeout_secs, max_age_secs).await
+            start_tunnel_client_quic(url, cert_path, host, app_config, idle_timeout_secs, max_age_secs, concurrent).await
         }
         _ => Err(anyhow::anyhow!("unsupported scheme: {}", url.scheme())),
     }
