@@ -94,8 +94,10 @@ pub(crate) trait MuxConnection {
     async fn open_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)>;
     async fn accept_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)>;
     fn is_valid(&self) -> bool;
+    #[allow(dead_code)]
     fn set_connection(&mut self, new_c: Self);
     fn close(&mut self);
+    #[allow(dead_code)]
     fn active_stream_count(&self) -> usize;
 }
 

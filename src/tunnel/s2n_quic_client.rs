@@ -294,7 +294,7 @@ pub async fn start_tunnel_client_quic(
             (cfg.tunnel_client_id.clone(), cfg.tunnel_entries.clone())
         };
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let token = app_config.reload_token_clone().await;
 
         let result = tokio::select! {
@@ -381,7 +381,7 @@ async fn run_quic_tunnel_connection(
 
     let seed = crate::tunnel::tunnel_client::next_tunnel_conn_seed() as usize;
     let jitter = ((seed.wrapping_mul(73)) % 201) as i64 - 100;
-    let retire_at = std::time::Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
+    let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
 
     loop {
         tokio::select! {

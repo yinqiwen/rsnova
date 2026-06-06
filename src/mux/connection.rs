@@ -46,6 +46,7 @@ pub struct Connection {
     pong_rx: mpsc::Receiver<u32>,
     ping_nonce_seed: AtomicU32,
     window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
+    #[allow(dead_code)]
     active_stream_count: Arc<AtomicUsize>,
 }
 
@@ -183,6 +184,7 @@ impl Connection {
         let _ = self.ev_writer.try_send(Control::Close);
     }
 
+    #[allow(dead_code)]
     pub fn active_stream_count(&self) -> usize {
         self.active_stream_count.load(Ordering::Relaxed)
     }
