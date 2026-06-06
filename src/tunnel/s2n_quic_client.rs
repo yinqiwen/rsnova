@@ -390,9 +390,7 @@ async fn run_quic_tunnel_connection(
         tokio::select! {
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retire_at)) => {
                 tracing::info!("QUIC tunnel connection reached max age, draining...");
-                for h in handles {
-                    let _ = h.await;
-                }
+                futures::future::join_all(handles).await;
                 return Ok(());
             }
             result = acceptor.accept_bidirectional_stream() => {
@@ -412,15 +410,11 @@ async fn run_quic_tunnel_connection(
                         }));
                     }
                     Ok(None) => {
-                        for h in handles {
-                            let _ = h.await;
-                        }
+                        futures::future::join_all(handles).await;
                         return Ok(());
                     }
                     Err(e) => {
-                        for h in handles {
-                            let _ = h.await;
-                        }
+                        futures::future::join_all(handles).await;
                         return Err(anyhow!("QUIC accept error: {}", e));
                     }
                 }

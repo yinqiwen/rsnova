@@ -387,7 +387,6 @@ mod tests {
     /// Mock MuxConnection for testing pool behavior.
     struct MockConnection {
         valid: bool,
-        stream_count: usize,
     }
 
     impl MuxConnection for MockConnection {
@@ -414,7 +413,7 @@ mod tests {
         fn is_valid(&self) -> bool { self.valid }
         fn set_connection(&mut self, new_c: Self) { *self = new_c; }
         fn close(&mut self) { self.valid = false; }
-        fn active_stream_count(&self) -> usize { self.stream_count }
+        fn active_stream_count(&self) -> usize { 0 }
     }
 
     fn make_client(max_age_secs: u64) -> (MuxClient<MockConnection>, mpsc::UnboundedReceiver<usize>) {
@@ -435,12 +434,12 @@ mod tests {
     async fn open_stream_skips_retired() {
         let (mut client, _rx) = make_client(1800);
         client.conns.push(PoolConnection {
-            conn: MockConnection { valid: true, stream_count: 0 },
+            conn: MockConnection { valid: true },
             retire_at: Instant::now() + Duration::from_secs(3600),
             retired: true, // retired
         });
         client.conns.push(PoolConnection {
-            conn: MockConnection { valid: true, stream_count: 0 },
+            conn: MockConnection { valid: true },
             retire_at: Instant::now() + Duration::from_secs(3600),
             retired: false,
         });
@@ -453,7 +452,7 @@ mod tests {
     async fn open_stream_fails_when_all_retired() {
         let (mut client, _rx) = make_client(1800);
         client.conns.push(PoolConnection {
-            conn: MockConnection { valid: true, stream_count: 0 },
+            conn: MockConnection { valid: true },
             retire_at: Instant::now() + Duration::from_secs(3600),
             retired: true,
         });
@@ -465,11 +464,11 @@ mod tests {
     async fn add_connection_replaces_retired_slot() {
         let (mut client, _rx) = make_client(1800);
         client.conns.push(PoolConnection {
-            conn: MockConnection { valid: true, stream_count: 5 },
+            conn: MockConnection { valid: true },
             retire_at: Instant::now() + Duration::from_secs(3600),
             retired: true,
         });
-        let new_conn = MockConnection { valid: true, stream_count: 0 };
+        let new_conn = MockConnection { valid: true };
         client.add_connection(new_conn).unwrap();
         assert_eq!(client.conns.len(), 1);
         assert!(!client.conns[0].retired);
@@ -480,11 +479,11 @@ mod tests {
     async fn add_connection_replaces_invalid_slot() {
         let (mut client, _rx) = make_client(1800);
         client.conns.push(PoolConnection {
-            conn: MockConnection { valid: false, stream_count: 0 },
+            conn: MockConnection { valid: false },
             retire_at: Instant::now() + Duration::from_secs(3600),
             retired: false,
         });
-        let new_conn = MockConnection { valid: true, stream_count: 0 };
+        let new_conn = MockConnection { valid: true };
         client.add_connection(new_conn).unwrap();
         assert_eq!(client.conns.len(), 1);
         assert!(client.conns[0].conn.is_valid());
@@ -494,7 +493,7 @@ mod tests {
     async fn max_age_zero_disables_retirement() {
         let (mut client, mut rx) = make_client(0); // disabled
         client.conns.push(PoolConnection {
-            conn: MockConnection { valid: true, stream_count: 0 },
+            conn: MockConnection { valid: true },
             retire_at: Instant::now(), // already past
             retired: false,
         });
@@ -508,7 +507,7 @@ mod tests {
     async fn health_check_retires_aged_connection() {
         let (mut client, mut rx) = make_client(1);
         client.conns.push(PoolConnection {
-            conn: MockConnection { valid: true, stream_count: 0 },
+            conn: MockConnection { valid: true },
             retire_at: Instant::now() - Duration::from_secs(1), // already expired
             retired: false,
         });
@@ -523,13 +522,13 @@ mod tests {
         // Fill pool to max
         for i in 0..32 {
             client.conns.push(PoolConnection::new(
-                MockConnection { valid: true, stream_count: 0 },
+                MockConnection { valid: true },
                 1800,
                 i,
             ));
         }
         // Try to add one more — should be silently dropped
-        let new_conn = MockConnection { valid: true, stream_count: 0 };
+        let new_conn = MockConnection { valid: true };
         client.add_connection(new_conn).unwrap();
         assert_eq!(client.conns.len(), 32);
     }

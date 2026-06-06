@@ -130,9 +130,7 @@ async fn run_tunnel_connection_tls(
         tokio::select! {
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retire_at)) => {
                 tracing::info!("TLS tunnel connection reached max age, draining...");
-                for h in handles {
-                    let _ = h.await;
-                }
+                futures::future::join_all(handles).await;
                 return Ok(());
             }
             result = conn.accept_stream() => {
@@ -148,9 +146,7 @@ async fn run_tunnel_connection_tls(
                     }
                     Err(e) => {
                         tracing::error!("accept_stream failed: {}, draining handles", e);
-                        for h in handles {
-                            let _ = h.await;
-                        }
+                        futures::future::join_all(handles).await;
                         return Err(e);
                     }
                 }
