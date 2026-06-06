@@ -110,7 +110,6 @@ pub(crate) trait MuxClientTrait {
 
 pub(crate) struct PoolConnection<T> {
     pub(crate) conn: T,
-    created_at: Instant,
     retire_at: Instant,
     retired: bool,
 }
@@ -118,11 +117,9 @@ pub(crate) struct PoolConnection<T> {
 impl<T> PoolConnection<T> {
     pub fn new(conn: T, max_age_secs: u64, conn_index: usize) -> Self {
         let jitter = ((conn_index.wrapping_mul(73)) % 201) as i64 - 100;
-        let created_at = Instant::now();
-        let retire_at = created_at + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
+        let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
         Self {
             conn,
-            created_at,
             retire_at,
             retired: false,
         }
@@ -163,53 +160,56 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
         let now = Instant::now();
         for i in 0..self.conns.len() {
             let pc = &mut self.conns[i];
-            // Close fully drained retired connections
-            if pc.retired && pc.conn.is_valid() && pc.conn.active_stream_count() == 0 {
-                tracing::info!("Connection {} retired and drained, closing", i);
-                pc.conn.close();
+            // Skip already-dead retired connections
+            if pc.retired && !pc.conn.is_valid() {
                 continue;
             }
-            // Check retirement age (only for non-retired connections)
-            if !pc.retired && now >= pc.retire_at {
+            // Ping retired connections still serving streams to detect failures
+            if pc.retired {
+                if pc.conn.is_valid() {
+                    if let Err(e) = pc.conn.ping().await {
+                        tracing::error!("retired connection ping failed:{}", e);
+                    }
+                }
+                continue;
+            }
+            // Check retirement age (only for non-retired connections, disabled when max_age is 0)
+            if self.max_age_secs > 0 && now >= pc.retire_at {
                 tracing::info!("Connection {} reached max age, retiring", i);
                 pc.retired = true;
                 let _ = self.retirement_notify.send(i);
+                continue;
             }
-            // Health check: ping valid connections (including retired ones still draining)
+            // Normal health check for active connections
             if pc.conn.is_valid() {
                 if let Err(e) = pc.conn.ping().await {
                     tracing::error!("ping failed:{}", e);
                 }
-            } else if !pc.retired {
-                // Only reconnect non-retired connections
-                if let Err(e) = pc
-                    .conn
-                    .connect(&self.url, self.cert.as_ref().unwrap(), &self.host)
-                    .await
-                {
-                    tracing::error!("reconnect error:{}", e);
-                }
+            } else if let Err(e) = pc
+                .conn
+                .connect(&self.url, self.cert.as_ref().unwrap(), &self.host)
+                .await
+            {
+                tracing::error!("reconnect error:{}", e);
             }
         }
         Ok(())
     }
 
     fn add_connection(&mut self, new_c: Self::Connection) -> anyhow::Result<()> {
-        // First try: replace an invalid (disconnected) slot
-        let len = self.conns.len();
-        for pc in &mut self.conns {
-            if !pc.conn.is_valid() {
-                let jitter = ((len.wrapping_mul(73)) % 201) as i64 - 100;
+        // First try: replace an invalid (disconnected) or retired slot
+        for (i, pc) in self.conns.iter_mut().enumerate() {
+            if !pc.conn.is_valid() || pc.retired {
+                let jitter = ((i.wrapping_mul(73)) % 201) as i64 - 100;
                 *pc = PoolConnection {
                     conn: new_c,
-                    created_at: Instant::now(),
                     retire_at: Instant::now() + Duration::from_secs((self.max_age_secs as i64 + jitter).max(0) as u64),
                     retired: false,
                 };
                 return Ok(());
             }
         }
-        // All slots valid — append
+        // All slots valid and active — append
         let idx = self.conns.len();
         self.conns.push(PoolConnection::new(new_c, self.max_age_secs, idx));
         Ok(())

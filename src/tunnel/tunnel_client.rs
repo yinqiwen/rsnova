@@ -1,8 +1,12 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use url::Url;
+
+/// Monotonic counter used to derive unique jitter per tunnel connection attempt.
+static TUNNEL_CONN_SEED: AtomicU64 = AtomicU64::new(0);
 
 use crate::app_config::AppConfig;
 use crate::mux::event::{
@@ -115,7 +119,8 @@ async fn run_tunnel_connection_tls(
     drop(recv);
 
     tracing::info!("Tunnel client ready, waiting for reverse streams...");
-    let jitter = ((0u32.wrapping_mul(73)) % 201) as i64 - 100;
+    let seed = TUNNEL_CONN_SEED.fetch_add(1, Ordering::Relaxed) as usize;
+    let jitter = ((seed.wrapping_mul(73)) % 201) as i64 - 100;
     let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -131,14 +136,24 @@ async fn run_tunnel_connection_tls(
                 return Ok(());
             }
             result = conn.accept_stream() => {
-                let (mut stream_send, mut stream_recv) = result?;
-                handles.push(tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_reverse_stream(&mut stream_recv, &mut stream_send, idle_timeout_secs).await
-                    {
-                        tracing::warn!("Reverse stream error: {}", e);
+                match result {
+                    Ok((mut stream_send, mut stream_recv)) => {
+                        handles.push(tokio::spawn(async move {
+                            if let Err(e) =
+                                handle_reverse_stream(&mut stream_recv, &mut stream_send, idle_timeout_secs).await
+                            {
+                                tracing::warn!("Reverse stream error: {}", e);
+                            }
+                        }));
                     }
-                }));
+                    Err(e) => {
+                        tracing::error!("accept_stream failed: {}, draining handles", e);
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                        return Err(e);
+                    }
+                }
             }
         }
     }
@@ -214,4 +229,9 @@ pub fn handle_register_ack(ack: &RegisterAck) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Returns a monotonically increasing seed for tunnel connection jitter.
+pub fn next_tunnel_conn_seed() -> u64 {
+    TUNNEL_CONN_SEED.fetch_add(1, Ordering::Relaxed)
 }

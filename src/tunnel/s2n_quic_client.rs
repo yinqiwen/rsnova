@@ -379,7 +379,8 @@ async fn run_quic_tunnel_connection(
 
     let (_handle, mut acceptor) = connection.split();
 
-    let jitter = ((0u32.wrapping_mul(73)) % 201) as i64 - 100;
+    let seed = crate::tunnel::tunnel_client::next_tunnel_conn_seed() as usize;
+    let jitter = ((seed.wrapping_mul(73)) % 201) as i64 - 100;
     let retire_at = std::time::Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
 
     loop {
