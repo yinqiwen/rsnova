@@ -215,11 +215,8 @@ impl MuxClient<TlsConnection> {
                 let (sender, receiver) = mpsc::channel::<Message>(PROXY_CHANNEL_CAPACITY);
                 let (retirement_tx, mut retirement_rx) = mpsc::unbounded_channel::<usize>();
                 let mut client: MuxClient<TlsConnection> = MuxClient {
-                    url: url.clone(),
                     conns: Vec::new(),
-                    host: String::from(host),
                     cursor: 0,
-                    cert: Some(PathBuf::from(cert_path)),
                     max_age_secs,
                     retirement_notify: retirement_tx,
                 };

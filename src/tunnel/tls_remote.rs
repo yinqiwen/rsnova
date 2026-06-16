@@ -2,6 +2,8 @@
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Semaphore;
+use tokio::time::Duration;
 
 use crate::mux::event;
 use crate::tunnel::stream::handle_server_stream;
@@ -14,6 +16,10 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::utils::read_private_key;
 use crate::utils::read_tokio_tls_certs;
+
+/// Maximum concurrent outbound TCP connections per TLS client connection.
+/// Limits fd consumption under load and prevents EMFILE cascading failures.
+const MAX_SERVER_PROXY_STREAMS: usize = 256;
 
 pub async fn start_tls_remote_server(
     listen: &SocketAddr,
@@ -106,11 +112,60 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
             drop(auth_r);
             drop(auth_w);
 
+            let semaphore = Arc::new(Semaphore::new(MAX_SERVER_PROXY_STREAMS));
+            // Shared counter for EMFILE detection across all spawned tasks.
+            // When a task detects EMFILE, it increments this counter; the
+            // accept loop reads and resets it to apply backpressure.
+            let emfile_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
             loop {
-                let stream = mux_conn.accept_stream().await?;
+                let stream = match mux_conn.accept_stream().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("[{}] accept_stream failed: {}", id, e);
+                        return Ok(());
+                    }
+                };
+
+                // Backpressure: if recent streams hit EMFILE, pause before
+                // accepting more to avoid a tight retry loop that floods
+                // the system with doomed TcpStream::connect attempts.
+                let recent_emfile = emfile_count.swap(0, std::sync::atomic::Ordering::Relaxed);
+                if recent_emfile > 0 {
+                    let backoff = Duration::from_millis(100 * recent_emfile.min(10) as u64);
+                    tracing::warn!(
+                        "[{}] EMFILE backpressure ({} recent), sleeping {:?}",
+                        id,
+                        recent_emfile,
+                        backoff,
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!(
+                            "[{}] max concurrent proxy streams ({}) reached, dropping stream {}",
+                            id,
+                            MAX_SERVER_PROXY_STREAMS,
+                            stream.id(),
+                        );
+                        // Stream is dropped — MuxStream::Drop sends StreamClose
+                        // to the dispatcher, which sends FIN to the client so it
+                        // knows the stream was rejected rather than silently lost.
+                        metrics::counter!("tls_server_proxy_streams_rejected").increment(1);
+                        continue;
+                    }
+                };
+
                 metrics::gauge!("tls_server_proxy_streams").increment(1.0);
+                let conn_id = id;
+                let emfile_ref = emfile_count.clone();
+
                 tokio::spawn(async move {
                     let stream_id = stream.id();
+                    let _permit = permit; // hold permit until task completes
                     let (mut stream_reader, mut stream_writer) = tokio::io::split(stream);
                     if let Err(e) = handle_server_stream(
                         &mut stream_reader,
@@ -119,11 +174,16 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
                     )
                     .await
                     {
+                        let err_str = e.to_string();
+                        if err_str.contains("file descriptor") || err_str.contains("os error 24") {
+                            emfile_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            metrics::counter!("tls_server_emfile").increment(1);
+                        }
                         tracing::error!(
                             "[{}/{}]failed: {reason}",
-                            id,
+                            conn_id,
                             stream_id,
-                            reason = e.to_string()
+                            reason = err_str
                         );
                     }
                     metrics::gauge!("tls_server_proxy_streams").decrement(1.0);

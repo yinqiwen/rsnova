@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use std::any::Any;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -135,11 +135,8 @@ impl<T> PoolConnection<T> {
 }
 
 pub(crate) struct MuxClient<T> {
-    pub(crate) url: url::Url,
     pub(crate) conns: Vec<PoolConnection<T>>,
-    pub(crate) host: String,
     pub(crate) cursor: usize,
-    pub(crate) cert: Option<PathBuf>,
     pub(crate) max_age_secs: u64,
     pub(crate) retirement_notify: mpsc::UnboundedSender<usize>,
 }
@@ -462,11 +459,8 @@ mod tests {
     fn make_client(max_age_secs: u64) -> (MuxClient<MockConnection>, mpsc::UnboundedReceiver<usize>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let client = MuxClient {
-            url: "tls://localhost:443".parse().unwrap(),
             conns: Vec::new(),
-            host: "localhost".to_string(),
             cursor: 0,
-            cert: None,
             max_age_secs,
             retirement_notify: tx,
         };
