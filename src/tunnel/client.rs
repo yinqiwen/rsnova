@@ -160,7 +160,22 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
             if let Ok((send, recv)) = pc.conn.open_stream().await {
                 return Ok((send, recv));
             }
+            // open_stream failed — the connection is now invalid and will be
+            // retired on the next health_check cycle.
+            tracing::warn!(
+                "open_stream failed on connection {} (valid={}), will be retired on next health check",
+                idx,
+                pc.conn.is_valid(),
+            );
         }
+        // All connections failed — log pool state for diagnosis
+        let active = self.conns.iter().filter(|c| !c.retired && c.conn.is_valid()).count();
+        let retired_valid = self.conns.iter().filter(|c| c.retired && c.conn.is_valid()).count();
+        let dead = self.conns.iter().filter(|c| !c.conn.is_valid()).count();
+        tracing::error!(
+            "no available stream: pool size={}, active={}, retired+serving={}, dead={}",
+            len, active, retired_valid, dead,
+        );
         Err(anyhow!("no available stream"))
     }
 
@@ -168,15 +183,19 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
         let now = Instant::now();
         for i in 0..self.conns.len() {
             let pc = &mut self.conns[i];
-            // Skip already-dead retired connections
+            // Skip already-dead retired connections waiting for replacement
             if pc.retired && !pc.conn.is_valid() {
                 continue;
             }
-            // Ping retired connections still serving streams to detect failures
+            // Ping retired connections still serving streams to detect failures.
+            // If ping fails, the connection is marked invalid and will be
+            // replaced when the next replacement arrives (or by the invalidation
+            // path below). We do NOT reconnect inline — the health_check timeout
+            // is too short for TLS handshakes.
             if pc.retired {
                 if pc.conn.is_valid() {
                     if let Err(e) = pc.conn.ping().await {
-                        tracing::error!("retired connection ping failed:{}", e);
+                        tracing::error!("retired connection {} ping failed: {}", i, e);
                     }
                 }
                 continue;
@@ -191,14 +210,24 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
             // Normal health check for active connections
             if pc.conn.is_valid() {
                 if let Err(e) = pc.conn.ping().await {
-                    tracing::error!("ping failed:{}", e);
+                    tracing::error!("ping failed on connection {}: {}, marking for replacement", i, e);
+                    // Ping failed — the connection is likely dead. Mark it
+                    // retired and request a replacement rather than trying
+                    // to reconnect inline (which is unreliable under the
+                    // health_check timeout). The TlsConnection::ping()
+                    // failure handler already calls close() and sets
+                    // inner = None, so is_valid() will return false.
+                    pc.retired = true;
+                    let _ = self.retirement_notify.send(i);
                 }
-            } else if let Err(e) = pc
-                .conn
-                .connect(&self.url, self.cert.as_ref().unwrap(), &self.host)
-                .await
-            {
-                tracing::error!("reconnect error:{}", e);
+            } else {
+                // Connection is invalid but not yet retired — this can happen
+                // when open_stream() fails and sets inner = None. Retire it
+                // and request a replacement instead of reconnecting inline,
+                // which is unreliable under the 500ms health_check timeout.
+                tracing::warn!("Connection {} is invalid, retiring and requesting replacement", i);
+                pc.retired = true;
+                let _ = self.retirement_notify.send(i);
             }
         }
         Ok(())
@@ -208,7 +237,18 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
         // First try: replace an invalid (disconnected) or retired slot
         for (i, pc) in self.conns.iter_mut().enumerate() {
             if !pc.conn.is_valid() || pc.retired {
+                // Gracefully close the old connection before replacing it.
+                // This ensures the mux dispatcher task exits promptly and
+                // existing streams receive proper EOF rather than hanging
+                // until a TCP keepalive fires.
+                pc.conn.close();
                 let jitter = retirement_jitter_secs(i);
+                tracing::info!(
+                    "Replacing connection {} (valid={}, retired={})",
+                    i,
+                    pc.conn.is_valid(),
+                    pc.retired,
+                );
                 *pc = PoolConnection {
                     conn: new_c,
                     retire_at: Instant::now() + Duration::from_secs((self.max_age_secs as i64 + jitter).max(0) as u64),
@@ -320,11 +360,14 @@ pub(crate) async fn mux_client_loop<T: MuxClientTrait>(
                 }}
             }
             Message::HealthCheck => {
-                // Use a short timeout to prevent health_check from
-                // blocking the entire mux_client_loop when the control
-                // channel is saturated (Bug 2).
+                // Timeout to prevent health_check from blocking the
+                // mux_client_loop indefinitely. Since we no longer
+                // reconnect inline (which is unreliable under short
+                // timeouts), the main cost is pinging each connection.
+                // A 5-second budget is generous for typical pool sizes
+                // (4-8 connections with 2-second ping timeout each).
                 let _ = tokio::time::timeout(
-                    Duration::from_millis(500),
+                    Duration::from_secs(5),
                     client.health_check(),
                 )
                 .await;
