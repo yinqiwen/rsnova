@@ -44,6 +44,7 @@ s2n-quic = "1"
 socket2 = { version = "0.6.3", features = ["all"] }
 cfg-if = "1.0"
 lru = "0.18"
+rand = "0.8"
 # axum = "0.7.9"
 
 [target.'cfg(unix)'.dependencies]

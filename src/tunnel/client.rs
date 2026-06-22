@@ -1,6 +1,8 @@
 use anyhow::anyhow;
 use std::any::Any;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -114,6 +116,81 @@ pub(crate) trait MuxClientTrait {
 /// Range: [-100, +100] seconds. Spreads retirements across a 200-second window.
 pub(crate) fn retirement_jitter_secs(index: usize) -> i64 {
     ((index.wrapping_mul(73)) % 201) as i64 - 100
+}
+
+// =========================================================================
+// New types for self-managed health (v3 refactor, additive in Commit A)
+// These are unused until Commit B lands; the #[allow(dead_code)] silences
+// warnings during the intermediate state.
+// =========================================================================
+
+/// Monotonic generation counter for each pool slot. Incremented on every
+/// successful `replace_slot`. Used to reject late calls from stale health
+/// tasks after a slot has been replaced.
+pub(crate) type Generation = u64;
+
+/// Returned by `mark_retiring` / `mark_dead` / `replace_slot` when the
+/// caller's generation does not match the slot's current generation.
+/// Indicates the slot has been replaced and the caller should exit.
+#[allow(dead_code)]
+pub(crate) struct GenMismatch;
+
+/// State of a pool slot. Transitions: Active → Retiring → Dead → (replace) → Active.
+#[allow(dead_code, dead_code)]  // second allow suppresses derived-trait warning
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotState {
+    Active,
+    Retiring,
+    Dead,
+}
+
+/// One entry in the connection pool.
+#[allow(dead_code)]
+pub(crate) struct SlotEntry<T> {
+    pub(crate) conn: T,
+    pub(crate) state: SlotState,
+    pub(crate) generation: Generation,
+}
+
+/// Static parameters for connection creation. Owned by the pool monitor
+/// and shared (via `Arc<ConnParams>`) with each health task.
+#[allow(dead_code)]
+pub(crate) struct ConnParams {
+    pub url: Url,
+    pub cert_path: PathBuf,
+    pub host: String,
+    pub stream_window: u32,
+    /// `None` disables max-age-driven retirement.
+    pub max_age: Option<Duration>,
+    pub ping_interval: Duration,
+    pub ping_fail_threshold: u32,
+    pub quic_endpoint: Option<Arc<s2n_quic::client::Client>>,
+}
+
+/// Atomic metrics counters, decoupled from the pool's mutex to allow
+/// cheap reads from `/metrics` without lock contention.
+#[allow(dead_code)]
+pub(crate) struct PoolMetrics {
+    pub active: AtomicUsize,
+    pub retiring: AtomicUsize,
+    pub dead: AtomicUsize,
+    pub reconnect_attempts: AtomicU64,
+    pub reconnect_success: AtomicU64,
+    pub generation_mismatch: AtomicU64,
+    pub health_task_exits: AtomicU64,
+}
+
+/// Command sent from a `health_loop` / `reconnect_loop` to the `pool_monitor`.
+/// The monitor is the sole owner of the `JoinSet` of health tasks; on
+/// `Respawn` it spawns a new health task for the given slot.
+#[allow(dead_code)]
+pub(crate) enum MonitorCommand<T> {
+    /// A new connection has been produced (by `reconnect_loop`) and is
+    /// ready to replace the slot. Monitor spawns a new health task.
+    Respawn { slot: usize, conn: T },
+    /// Reconnect abandoned the slot (e.g. gen mismatch). Monitor logs
+    /// and accepts the slot as permanently dead (pool shrinks by 1).
+    DropSlot(usize),
 }
 
 pub(crate) struct PoolConnection<T> {
