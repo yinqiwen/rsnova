@@ -797,15 +797,99 @@ pub(crate) async fn pool_monitor<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use tokio_util::sync::CancellationToken;
 
-    /// `retirement_jitter_secs` is preserved (used by Register-mode paths).
-    #[test]
-    fn jitter_range_is_bounded() {
-        for i in 0..1000usize {
-            let jitter = retirement_jitter_secs(i);
-            assert!(jitter >= -100, "jitter {} too low for index {}", jitter, i);
-            assert!(jitter <= 100, "jitter {} too high for index {}", jitter, i);
+    /// Mock connection for unit tests. Has rich state (valid/close/ping
+    /// failure counts) so tests can drive the pool API.
+    struct MockConnection {
+        valid: AtomicBool,
+        close_called: AtomicBool,
+        ping_count: AtomicU32,
+    }
+
+    impl MockConnection {
+        fn new_valid() -> Self {
+            Self {
+                valid: AtomicBool::new(true),
+                close_called: AtomicBool::new(false),
+                ping_count: AtomicU32::new(0),
+            }
         }
+    }
+
+    impl MuxConnection for MockConnection {
+        type SendStream = tokio::io::DuplexStream;
+        type RecvStream = tokio::io::DuplexStream;
+
+        fn ping(
+            &mut self,
+        ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+            self.ping_count.fetch_add(1, Ordering::Relaxed);
+            let v = self.valid.load(Ordering::Acquire);
+            async move {
+                if v {
+                    Ok(())
+                } else {
+                    Err(anyhow!("mock invalid"))
+                }
+            }
+        }
+
+        fn connect(
+            &mut self,
+            _url: &Url,
+            _key_path: &Path,
+            _host: &str,
+        ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+            async move { Ok(()) }
+        }
+
+        fn open_stream(
+            &mut self,
+        ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>>
+        + Send {
+            let (a, b) = tokio::io::duplex(64);
+            // Return (a, b) directly as the (send, recv) pair. The
+            // production code uses real MuxStream; for unit tests of
+            // the pool API we don't actually transfer data.
+            async move { Ok((a, b)) }
+        }
+
+        fn accept_stream(
+            &mut self,
+        ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>>
+        + Send {
+            async move { Err(anyhow!("not implemented")) }
+        }
+
+        fn is_valid(&self) -> bool {
+            self.valid.load(Ordering::Acquire)
+        }
+        fn set_connection(&mut self, new_c: Self) {
+            *self = new_c;
+        }
+        fn close(&mut self) {
+            self.close_called.store(true, Ordering::Release);
+            self.valid.store(false, Ordering::Release);
+        }
+        fn active_stream_count(&self) -> usize {
+            0
+        }
+
+        fn reconnect_with(
+            _params: &ConnParams,
+        ) -> impl std::future::Future<Output = anyhow::Result<Self>> + Send {
+            async move { Ok(Self::new_valid()) }
+        }
+    }
+
+    fn make_cancel() -> CancellationToken {
+        CancellationToken::new()
+    }
+
+    fn make_pool() -> Arc<MuxClient<MockConnection>> {
+        Arc::new(MuxClient::new(make_cancel()))
     }
 
     #[test]
@@ -814,5 +898,142 @@ mod tests {
             let expected = ((i.wrapping_mul(73)) % 201) as i64 - 100;
             assert_eq!(retirement_jitter_secs(i), expected);
         }
+    }
+
+    #[test]
+    fn jitter_range_is_bounded() {
+        for i in 0..1000usize {
+            let jitter = retirement_jitter_secs(i);
+            assert!(jitter >= -100);
+            assert!(jitter <= 100);
+        }
+    }
+
+    // ----- pick_and_open -----
+
+    #[tokio::test]
+    async fn pick_and_open_skips_dead_and_empty() {
+        let pool = make_pool();
+        let s0 = pool.push_empty_slot().await;
+        let s1 = pool.push_empty_slot().await;
+        let _s2 = pool.push_empty_slot().await;
+        // All slots empty — pick_and_open returns Err
+        let r = pool.pick_and_open().await;
+        assert!(r.is_err());
+        let _ = (s0, s1);
+    }
+
+    #[tokio::test]
+    async fn push_empty_increments_active_counter() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        let _ = pool.push_empty_slot().await;
+        assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 2);
+    }
+
+    // ----- mark_retiring / mark_dead -----
+
+    #[tokio::test]
+    async fn mark_retiring_succeeds_with_matching_gen() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 1);
+        let r = pool.mark_retiring(0, 0).await;
+        assert!(r.is_ok());
+        assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.metrics.retiring.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn mark_retiring_rejects_mismatched_gen() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        let r = pool.mark_retiring(0, 999).await;
+        assert!(matches!(r, Err(GenMismatch)));
+        assert_eq!(pool.metrics.generation_mismatch.load(Ordering::Relaxed), 1);
+        // State unchanged
+        assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn mark_dead_increments_dead_counter() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        let r = pool.mark_dead(0, 0).await;
+        assert!(r.is_ok());
+        assert_eq!(pool.metrics.dead.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn mark_dead_rejects_mismatched_gen() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        let r = pool.mark_dead(0, 42).await;
+        assert!(matches!(r, Err(GenMismatch)));
+        assert_eq!(pool.metrics.generation_mismatch.load(Ordering::Relaxed), 1);
+    }
+
+    // ----- replace_slot -----
+
+    #[tokio::test]
+    async fn replace_slot_increments_generation() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        let new_conn = MockConnection::new_valid();
+        let r = pool.replace_slot(0, new_conn, 0).await;
+        assert!(r.is_ok());
+        assert_eq!(pool.generation(0).await, 1);
+    }
+
+    #[tokio::test]
+    async fn replace_slot_rejects_mismatched_gen() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        let new_conn = MockConnection::new_valid();
+        let r = pool.replace_slot(0, new_conn, 99).await;
+        assert!(matches!(r, Err(GenMismatch)));
+        assert_eq!(pool.generation(0).await, 0);
+    }
+
+    // ----- drop / cancel -----
+
+    #[tokio::test]
+    async fn drop_cancels_token() {
+        let pool = make_pool();
+        let cancel = pool.cancel.clone();
+        assert!(!cancel.is_cancelled());
+        drop(pool);
+        assert!(cancel.is_cancelled());
+    }
+
+    // ----- Concurrent state transitions -----
+
+    #[tokio::test]
+    async fn multiple_slots_have_independent_state() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        let _ = pool.push_empty_slot().await;
+        let _ = pool.push_empty_slot().await;
+        assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 3);
+
+        // Mark slot 0 retiring, slot 2 dead
+        assert!(pool.mark_retiring(0, 0).await.is_ok());
+        assert!(pool.mark_dead(2, 0).await.is_ok());
+
+        assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.metrics.retiring.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.metrics.dead.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn install_replacement_populates_empty_slot() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        let conn = MockConnection::new_valid();
+        pool.install_replacement(0, conn).await;
+        // Now pick_and_open should find slot 0 as valid+active
+        let r = pool.pick_and_open().await;
+        assert!(r.is_ok());
     }
 }
