@@ -11,8 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use tokio::time;
-
 use url::Url;
 
 mod admin;
@@ -332,16 +330,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     }
                 };
 
-            let health_checker = tunnel_sender.clone();
-            tokio::spawn(async move {
-                let mut interval = time::interval(Duration::from_secs(1));
-                loop {
-                    interval.tick().await;
-                    if let Err(e) = health_checker.send(tunnel::Message::HealthCheck).await {
-                        tracing::error!("health check error:{}", e);
-                    }
-                }
-            });
+            // Health checks are now self-managed by each connection's
+            // health_loop (see src/tunnel/client.rs). No external ticker
+            // needed.
 
             // Start local tunnel server
             let listen_addr = args.listen;

@@ -1,7 +1,6 @@
 use anyhow::anyhow;
 use std::net::ToSocketAddrs;
 use std::path::Path;
-use std::path::PathBuf;
 use std::time::Duration;
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -14,8 +13,7 @@ use url::Url;
 use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
-use super::client::PoolConnection;
-use super::client::{ProxySender, PROXY_CHANNEL_CAPACITY};
+use super::client::{ConnParams, ProxySender, PROXY_CHANNEL_CAPACITY};
 use super::Message;
 use crate::mux::event;
 use crate::mux::MuxStream;
@@ -132,64 +130,33 @@ impl MuxConnection for TlsConnection {
             None => 0,
         }
     }
-}
 
-async fn spawn_tls_replacement(
-    url: Url,
-    cert_path: PathBuf,
-    host: String,
-    stream_window: u32,
-    sender: ProxySender,
-) {
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(60);
-    loop {
-        tracing::info!("TLS replacement connection attempt (backoff {:?})", backoff);
-        let mut tls_conn = TlsConnection::new(stream_window);
-        if let Err(e) = tls_conn.connect(&url, &cert_path, &host).await {
-            tracing::warn!("TLS replacement connect failed: {}", e);
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(max_backoff);
-            continue;
-        }
-        let success = 'auth: {
-            let Some(ref mut conn) = tls_conn.inner else { break 'auth false; };
-            let auth_stream = match conn.open_stream().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("TLS replacement: open auth stream failed: {}", e);
-                    break 'auth false;
-                }
-            };
+    fn reconnect_with(
+        params: &ConnParams,
+    ) -> impl std::future::Future<Output = anyhow::Result<Self>> + Send {
+        let url = params.url.clone();
+        let cert = params.cert_path.clone();
+        let host = params.host.clone();
+        let stream_window = params.stream_window;
+        async move {
+            let mut c = TlsConnection::new(stream_window);
+            c.connect(&url, &cert, &host).await?;
+            // Auth handshake (same as initial setup)
+            let conn = c
+                .inner
+                .as_mut()
+                .ok_or_else(|| anyhow!("null connection after connect"))?;
+            let auth_stream = conn.open_stream().await?;
             let (mut auth_r, mut auth_w) = tokio::io::split(auth_stream);
             let auth_req = event::AuthRequest::Proxy;
-            let ev = match event::new_auth_event(0, &auth_req) {
-                Ok(ev) => ev,
-                Err(e) => {
-                    tracing::warn!("TLS replacement: create auth event failed: {}", e);
-                    break 'auth false;
-                }
-            };
-            if event::write_event(&mut auth_w, ev).await.is_err() {
-                tracing::warn!("TLS replacement: auth write failed");
-                break 'auth false;
+            let ev = event::new_auth_event(0, &auth_req)?;
+            event::write_event(&mut auth_w, ev).await?;
+            let ack = event::read_event(&mut auth_r).await?;
+            if ack.header.flags() != event::FLAG_AUTH_ACK {
+                return Err(anyhow!("reconnect auth failed: unexpected flag"));
             }
-            match event::read_event(&mut auth_r).await {
-                Ok(ack_ev) if ack_ev.header.flags() == event::FLAG_AUTH_ACK => true,
-                _ => {
-                    tracing::warn!("TLS replacement: unexpected auth response");
-                    false
-                }
-            }
-        };
-        if success {
-            tracing::info!("TLS replacement connection authenticated");
-            let _ = sender.send(Message::ReplaceConnection(Box::new(tls_conn))).await;
-            return;
+            Ok(c)
         }
-        tls_conn.close();
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(max_backoff);
     }
 }
 
@@ -206,13 +173,9 @@ impl MuxClient<TlsConnection> {
         match url.scheme() {
             "tls" => {
                 let (sender, receiver) = mpsc::channel::<Message>(PROXY_CHANNEL_CAPACITY);
-                let (retirement_tx, mut retirement_rx) = mpsc::unbounded_channel::<usize>();
-                let mut client: MuxClient<TlsConnection> = MuxClient {
-                    conns: Vec::new(),
-                    cursor: 0,
-                    max_age_secs,
-                    retirement_notify: retirement_tx,
-                };
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let pool = Arc::new(MuxClient::<TlsConnection>::new(cancel.clone()));
+                let mut initial: Vec<TlsConnection> = Vec::with_capacity(count);
                 for i in 0..count {
                     let mut tls_conn: TlsConnection = TlsConnection {
                         inner: None,
@@ -245,42 +208,29 @@ impl MuxClient<TlsConnection> {
                         }
                         tracing::info!("TLS connection:{} auth completed (proxy mode)", i);
                     }
-                    client.conns.push(PoolConnection::new(tls_conn, max_age_secs, i));
+                    initial.push(tls_conn);
                 }
-                tokio::spawn(mux_client_loop(client, receiver, idle_timeout_secs));
-                let replacement_sender = sender.clone();
-                let replacement_url = url.clone();
-                let replacement_cert = cert_path.to_path_buf();
-                let replacement_host = host.clone();
-                let pending: Arc<tokio::sync::Mutex<std::collections::HashSet<usize>>> =
-                    Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
-                tokio::spawn(async move {
-                    while let Some(idx) = retirement_rx.recv().await {
-                        {
-                            let p = pending.lock().await;
-                            if p.contains(&idx) {
-                                continue;
-                            }
-                        }
-                        pending.lock().await.insert(idx);
-                        let url_clone = replacement_url.clone();
-                        let cert_clone = replacement_cert.clone();
-                        let host_clone = replacement_host.clone();
-                        let sender_clone = replacement_sender.clone();
-                        let pending_ref = pending.clone();
-                        tokio::spawn(async move {
-                            spawn_tls_replacement(
-                                url_clone,
-                                cert_clone,
-                                host_clone,
-                                stream_window,
-                                sender_clone,
-                            )
-                            .await;
-                            pending_ref.lock().await.remove(&idx);
-                        });
-                    }
+                let params = Arc::new(ConnParams {
+                    url: url.clone(),
+                    cert_path: cert_path.to_path_buf(),
+                    host: host.clone(),
+                    stream_window,
+                    max_age: if max_age_secs == 0 {
+                        None
+                    } else {
+                        Some(Duration::from_secs(max_age_secs))
+                    },
+                    ping_interval: Duration::from_secs(1),
+                    ping_fail_threshold: 3,
+                    quic_endpoint: None,
                 });
+                tokio::spawn(mux_client_loop(pool.clone(), receiver, idle_timeout_secs));
+                tokio::spawn(crate::tunnel::client::pool_monitor(
+                    pool.clone(),
+                    params,
+                    cancel,
+                    initial,
+                ));
                 Ok(sender)
             }
             _ => Err(anyhow!("unsupported schema:{:?}", url.scheme())),
