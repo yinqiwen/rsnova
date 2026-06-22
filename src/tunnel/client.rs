@@ -180,15 +180,18 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
         let now = Instant::now();
         for i in 0..self.conns.len() {
             let pc = &mut self.conns[i];
-            // Skip already-dead retired connections waiting for replacement
             if pc.retired && !pc.conn.is_valid() {
+                // Dead retired connection still waiting for replacement.
+                // Re-send retirement notification to ensure a replacement
+                // is always in flight. The retirement listener may already
+                // have a replacement attempt running for this slot; that's
+                // acceptable — duplicate attempts are caught by add_connection
+                // replacing the first matching slot, and extra connections
+                // simply append to the pool (up to MAX_POOL_SIZE).
+                let _ = self.retirement_notify.send(i);
                 continue;
             }
             // Ping retired connections still serving streams to detect failures.
-            // If ping fails, the connection is marked invalid and will be
-            // replaced when the next replacement arrives (or by the invalidation
-            // path below). We do NOT reconnect inline — the health_check timeout
-            // is too short for TLS handshakes.
             if pc.retired {
                 if pc.conn.is_valid() {
                     if let Err(e) = pc.conn.ping().await {
@@ -208,20 +211,10 @@ impl<T: MuxConnection> MuxClientTrait for MuxClient<T> {
             if pc.conn.is_valid() {
                 if let Err(e) = pc.conn.ping().await {
                     tracing::error!("ping failed on connection {}: {}, marking for replacement", i, e);
-                    // Ping failed — the connection is likely dead. Mark it
-                    // retired and request a replacement rather than trying
-                    // to reconnect inline (which is unreliable under the
-                    // health_check timeout). The TlsConnection::ping()
-                    // failure handler already calls close() and sets
-                    // inner = None, so is_valid() will return false.
                     pc.retired = true;
                     let _ = self.retirement_notify.send(i);
                 }
             } else {
-                // Connection is invalid but not yet retired — this can happen
-                // when open_stream() fails and sets inner = None. Retire it
-                // and request a replacement instead of reconnecting inline,
-                // which is unreliable under the 500ms health_check timeout.
                 tracing::warn!("Connection {} is invalid, retiring and requesting replacement", i);
                 pc.retired = true;
                 let _ = self.retirement_notify.send(i);
