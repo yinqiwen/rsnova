@@ -169,6 +169,8 @@ impl MuxClient<TlsConnection> {
         idle_timeout_secs: usize,
         stream_window: u32,
         max_age_secs: u64,
+        ping_interval_secs: u64,
+        ping_fail_threshold: u32,
     ) -> anyhow::Result<ProxySender> {
         match url.scheme() {
             "tls" => {
@@ -220,8 +222,8 @@ impl MuxClient<TlsConnection> {
                     } else {
                         Some(Duration::from_secs(max_age_secs))
                     },
-                    ping_interval: Duration::from_secs(1),
-                    ping_fail_threshold: 3,
+                    ping_interval: Duration::from_secs(ping_interval_secs),
+                    ping_fail_threshold,
                     quic_endpoint: None,
                 });
                 tokio::spawn(mux_client_loop(pool.clone(), receiver, idle_timeout_secs));
@@ -291,6 +293,8 @@ pub async fn new_tls_client(
     idle_timeout_secs: usize,
     stream_window: u32,
     max_age_secs: u64,
+    ping_interval_secs: u64,
+    ping_fail_threshold: u32,
 ) -> anyhow::Result<ProxySender> {
     MuxClient::<TlsConnection>::from(
         url,
@@ -300,6 +304,8 @@ pub async fn new_tls_client(
         idle_timeout_secs,
         stream_window,
         max_age_secs,
+        ping_interval_secs,
+        ping_fail_threshold,
     )
     .await
 }

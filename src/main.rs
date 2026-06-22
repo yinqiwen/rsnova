@@ -107,6 +107,16 @@ struct Args {
     #[arg(long = "connection-max-age")]
     connection_max_age: u64,
 
+    /// Interval between connection health pings in seconds
+    #[default(1)]
+    #[arg(long = "ping-interval")]
+    ping_interval_secs: u64,
+
+    /// Consecutive ping failures before a connection is retired
+    #[default(3)]
+    #[arg(long = "ping-fail-threshold")]
+    ping_fail_threshold: u32,
+
     #[default("mydomain.io".to_string())]
     #[arg(long)]
     tls_host: String,
@@ -309,6 +319,8 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             args.concurrent,
                             args.idle_timeout_secs,
                             args.connection_max_age,
+                            args.ping_interval_secs,
+                            args.ping_fail_threshold,
                         )
                         .await?
                     }
@@ -321,6 +333,8 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             args.idle_timeout_secs,
                             args.mux_stream_window,
                             args.connection_max_age,
+                            args.ping_interval_secs,
+                            args.ping_fail_threshold,
                         )
                         .await?
                     }
