@@ -140,11 +140,10 @@ pub(crate) type Generation = u64;
 /// Returned by `mark_retiring` / `mark_dead` / `replace_slot` when the
 /// caller's generation does not match the slot's current generation.
 /// Indicates the slot has been replaced and the caller should exit.
-#[allow(dead_code)]
+#[derive(Debug)]
 pub(crate) struct GenMismatch;
 
 /// State of a pool slot. Transitions: Active → Retiring → Dead → (replace) → Active.
-#[allow(dead_code, dead_code)]  // second allow suppresses derived-trait warning
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlotState {
     Active,
@@ -153,19 +152,18 @@ pub(crate) enum SlotState {
 }
 
 /// One entry in the connection pool.
-#[allow(dead_code)]
 pub(crate) struct SlotEntry<T> {
-    /// `None` while a slot is empty (after `replace_slot` took the conn out
-    /// to forward it to the monitor). The monitor re-pushes a new conn
-    /// (or drops the slot) — `pick_and_open` skips `None` entries.
-    pub(crate) conn: Option<T>,
+    /// Shared reference to the connection. Both the pool (via `pick_and_open`)
+    /// and the `health_loop` access the conn through this Arc. `None` only
+    /// during the brief window between `replace_slot` and reconnect_loop
+    /// writing the new conn.
+    pub(crate) conn: Arc<tokio::sync::Mutex<Option<T>>>,
     pub(crate) state: SlotState,
     pub(crate) generation: Generation,
 }
 
 /// Static parameters for connection creation. Owned by the pool monitor
 /// and shared (via `Arc<ConnParams>`) with each health task.
-#[allow(dead_code)]
 pub(crate) struct ConnParams {
     pub url: Url,
     pub cert_path: PathBuf,
@@ -180,7 +178,6 @@ pub(crate) struct ConnParams {
 
 /// Atomic metrics counters, decoupled from the pool's mutex to allow
 /// cheap reads from `/metrics` without lock contention.
-#[allow(dead_code)]
 pub(crate) struct PoolMetrics {
     pub active: AtomicUsize,
     pub retiring: AtomicUsize,
@@ -194,11 +191,10 @@ pub(crate) struct PoolMetrics {
 /// Command sent from a `health_loop` / `reconnect_loop` to the `pool_monitor`.
 /// The monitor is the sole owner of the `JoinSet` of health tasks; on
 /// `Respawn` it spawns a new health task for the given slot.
-#[allow(dead_code)]
-pub(crate) enum MonitorCommand<T> {
-    /// A new connection has been produced (by `reconnect_loop`) and is
-    /// ready to replace the slot. Monitor spawns a new health task.
-    Respawn { slot: usize, conn: T },
+pub(crate) enum MonitorCommand {
+    /// `reconnect_loop` succeeded and wrote the new conn into the slot's
+    /// `conn_ref`. Monitor spawns a new health task for this slot.
+    Respawn { slot: usize },
     /// Reconnect abandoned the slot (e.g. gen_token mismatch). Monitor logs
     /// and accepts the slot as permanently dead (pool shrinks by 1).
     DropSlot(usize),
@@ -229,34 +225,37 @@ impl<T: MuxConnection> MuxClient<T> {
         }
     }
 
-    /// Push an empty slot for a connection whose ownership will be moved
-    /// into a `health_loop`. The slot is `Active` but `conn: None`; only
-    /// `install_replacement` can populate it.
-    pub(crate) async fn push_empty_slot(&self) -> usize {
+    /// Push an empty slot and return the slot index plus a clone of the
+    /// shared `conn_ref`. The caller (pool_monitor) writes the initial conn
+    /// into `conn_ref` and passes clones to health_loop / reconnect_loop.
+    pub(crate) async fn push_empty_slot(&self) -> (usize, Arc<tokio::sync::Mutex<Option<T>>>) {
+        let conn_ref = Arc::new(tokio::sync::Mutex::new(None));
         let mut guard = self.conns.lock().await;
         let slot = guard.len();
         guard.push(SlotEntry {
-            conn: None,
+            conn: conn_ref.clone(),
             state: SlotState::Active,
             generation: 0,
         });
         self.metrics.active.fetch_add(1, Ordering::Relaxed);
-        slot
+        (slot, conn_ref)
     }
 
-    /// Atomic: pick an Active+valid connection and call `open_stream` on it.
-    /// Holds the lock for the entire open_stream call to eliminate TOCTOU.
+    /// Atomic: pick an Active connection and call `open_stream` on it.
+    /// Holds the pool lock and then the slot's conn_ref lock for the
+    /// entire `open_stream` call to eliminate TOCTOU.
     pub(crate) async fn pick_and_open(
         &self,
     ) -> anyhow::Result<(T::SendStream, T::RecvStream)> {
-        let mut guard = self.conns.lock().await;
+        let guard = self.conns.lock().await;
         let len = guard.len();
         for slot in 0..len {
-            let entry = &mut guard[slot];
+            let entry = &guard[slot];
             if entry.state != SlotState::Active {
                 continue;
             }
-            let Some(conn) = entry.conn.as_mut() else {
+            let mut conn_guard = entry.conn.lock().await;
+            let Some(conn) = conn_guard.as_mut() else {
                 continue;
             };
             if !conn.is_valid() {
@@ -326,8 +325,11 @@ impl<T: MuxConnection> MuxClient<T> {
             } else {
                 self.metrics.retiring.fetch_sub(1, Ordering::Relaxed);
             }
-            if let Some(conn) = entry.conn.as_mut() {
-                conn.close();
+            {
+                let mut conn_guard = entry.conn.lock().await;
+                if let Some(mut conn) = conn_guard.take() {
+                    conn.close();
+                }
             }
             entry.state = SlotState::Dead;
             self.metrics.dead.fetch_add(1, Ordering::Relaxed);
@@ -335,28 +337,15 @@ impl<T: MuxConnection> MuxClient<T> {
         Ok(())
     }
 
-    /// Install a new connection into an Active slot (used by `pool_monitor`
-    /// after receiving a `MonitorCommand::Respawn`). The slot must already
-    /// be Active with `conn: None`.
-    #[allow(dead_code)]
-    pub(crate) async fn install_replacement(&self, slot: usize, conn: T) {
-        let mut guard = self.conns.lock().await;
-        let entry = &mut guard[slot];
-        debug_assert!(entry.state == SlotState::Active);
-        debug_assert!(entry.conn.is_none());
-        entry.conn = Some(conn);
-    }
-
-    /// Replace the slot's connection, increment generation, mark Active.
-    /// Returns the new conn so the caller can forward it to the monitor
-    /// (which spawns the next health task). The slot is left with `conn: None`
-    /// until the monitor pushes the new conn (or drops the slot on `DropSlot`).
+    /// Replace the slot's state, increment generation, mark Active.
+    /// The caller (`reconnect_loop`) writes the new conn into the slot's
+    /// `conn_ref` directly after this call succeeds. This method does NOT
+    /// touch the conn — it only updates state and generation.
     pub(crate) async fn replace_slot(
         &self,
         slot: usize,
-        new_conn: T,
         gen_token: Generation,
-    ) -> Result<T, GenMismatch> {
+    ) -> Result<(), GenMismatch> {
         let mut guard = self.conns.lock().await;
         let entry = &mut guard[slot];
         if entry.generation != gen_token {
@@ -365,20 +354,11 @@ impl<T: MuxConnection> MuxClient<T> {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(GenMismatch);
         }
-        // Close the old (Dead) conn before clearing the slot.
-        if let Some(mut old) = entry.conn.take() {
-            old.close();
-        }
         entry.generation = entry.generation.wrapping_add(1);
         entry.state = SlotState::Active;
         self.metrics.dead.fetch_sub(1, Ordering::Relaxed);
         self.metrics.active.fetch_add(1, Ordering::Relaxed);
-        // Note: we do NOT store new_conn in the slot. The caller (reconnect_loop
-        // or health_loop) is expected to forward new_conn to the monitor via
-        // MonitorCommand::Respawn, and the monitor will push it back in.
-        // This two-phase handoff ensures no double-ownership and lets the
-        // monitor log/track respawns centrally.
-        Ok(new_conn)
+        Ok(())
     }
 }
 
@@ -501,24 +481,23 @@ fn reconnect_limiter() -> &'static tokio::sync::Semaphore {
     LIMITER.get_or_init(|| tokio::sync::Semaphore::new(2))
 }
 
-/// Per-connection health loop. Each connection has one. Pings the conn,
-/// transitions to Retiring on N consecutive ping failures or max_age
-/// reached, spawns a `reconnect_loop` child task that produces a fresh
-/// conn. Exits only when:
+/// Per-connection health loop. Each connection has one. Pings the conn
+/// (via `conn_ref`), transitions to Retiring on N consecutive ping failures
+/// or max_age reached, spawns a `reconnect_loop` child task that produces a
+/// fresh conn. Exits only when:
 /// - `cancel` fires (graceful shutdown)
 /// - the original conn dies AND the reconnect child has finished
 ///
 /// The child reconnect_loop is responsible for sending to `monitor_tx`
 /// on success. The parent `health_loop` only waits for the child to
 /// complete before exiting.
-#[allow(dead_code)]
 pub(crate) async fn health_loop<T>(
     slot: usize,
-    mut conn: T,
+    conn_ref: Arc<tokio::sync::Mutex<Option<T>>>,
     pool: Arc<MuxClient<T>>,
     params: Arc<ConnParams>,
     cancel: tokio_util::sync::CancellationToken,
-    monitor_tx: mpsc::Sender<MonitorCommand<T>>,
+    monitor_tx: mpsc::Sender<MonitorCommand>,
 ) where
     T: MuxConnection + Send + 'static,
 {
@@ -544,20 +523,38 @@ pub(crate) async fn health_loop<T>(
                 return;
             }
             _ = interval.tick() => {
-                // Phase 1: ping the original conn
-                if conn.is_valid() {
-                    if conn.ping().await.is_err() {
-                        consecutive_fails += 1;
-                        if consecutive_fails >= params.ping_fail_threshold && !is_retiring {
-                            is_retiring = true;
-                            let _ = pool.mark_retiring(slot, gen_token).await;
+                // Phase 1: ping the conn via conn_ref
+                // We must drop the conn_ref guard before calling mark_retiring /
+                // mark_dead to avoid lock ordering issues (pick_and_open takes
+                // conns lock first, then conn_ref lock; we must not hold
+                // conn_ref while acquiring conns lock).
+                {
+                    let mut should_mark_retiring = false;
+                    {
+                        let mut guard = conn_ref.lock().await;
+                        if let Some(conn) = guard.as_mut() {
+                            if conn.is_valid() {
+                                if conn.ping().await.is_err() {
+                                    consecutive_fails += 1;
+                                    if consecutive_fails >= params.ping_fail_threshold {
+                                        should_mark_retiring = true;
+                                    }
+                                } else {
+                                    consecutive_fails = 0;
+                                }
+                            } else {
+                                should_mark_retiring = true;
+                            }
+                        } else {
+                            // conn taken by reconnect_loop or mark_dead
+                            should_mark_retiring = true;
                         }
-                    } else {
-                        consecutive_fails = 0;
                     }
-                } else if !is_retiring {
-                    is_retiring = true;
-                    let _ = pool.mark_retiring(slot, gen_token).await;
+                    // guard is dropped; safe to acquire conns lock
+                    if should_mark_retiring && !is_retiring {
+                        is_retiring = true;
+                        let _ = pool.mark_retiring(slot, gen_token).await;
+                    }
                 }
 
                 // max_age check
@@ -578,9 +575,11 @@ pub(crate) async fn health_loop<T>(
                     let params_ref = params.clone();
                     let cancel_child = cancel.child_token();
                     let monitor_tx_clone = monitor_tx.clone();
+                    let conn_ref_clone = conn_ref.clone();
                     reconnect_handle = Some(tokio::spawn(async move {
                         let cmd = reconnect_loop(
                             slot,
+                            conn_ref_clone,
                             pool_ref,
                             params_ref,
                             gen_token,
@@ -593,13 +592,24 @@ pub(crate) async fn health_loop<T>(
 
                 // If is_retiring and conn is dead: explicitly mark_dead + close,
                 // wait for the reconnect child, then exit.
-                if is_retiring && !conn.is_valid() {
-                    conn.close();
-                    let _ = pool.mark_dead(slot, gen_token).await;
-                    if let Some(h) = reconnect_handle.take() {
-                        let _ = h.await;
+                if is_retiring {
+                    let conn_dead = {
+                        let guard = conn_ref.lock().await;
+                        guard.as_ref().is_none_or(|c| !c.is_valid())
+                    };
+                    if conn_dead {
+                        {
+                            let mut guard = conn_ref.lock().await;
+                            if let Some(mut conn) = guard.take() {
+                                conn.close();
+                            }
+                        }
+                        let _ = pool.mark_dead(slot, gen_token).await;
+                        if let Some(h) = reconnect_handle.take() {
+                            let _ = h.await;
+                        }
+                        return;
                     }
-                    return;
                 }
             }
         }
@@ -607,23 +617,26 @@ pub(crate) async fn health_loop<T>(
 }
 
 /// Indefinitely retries `T::reconnect_with` with exponential backoff and
-/// ±20% jitter. On success, calls `pool.replace_slot` and forwards the
-/// new conn to `monitor_tx` via `MonitorCommand::Respawn`. On gen_token-mismatch
-/// or other unrecoverable error, sends `MonitorCommand::DropSlot` and
-/// returns.
-#[allow(dead_code)]
+/// ±20% jitter. On success, calls `pool.replace_slot` (updates state +
+/// generation) then writes the new conn directly into `conn_ref`. On
+/// gen_token-mismatch or other unrecoverable error, sends
+/// `MonitorCommand::DropSlot` and returns.
 async fn reconnect_loop<T>(
     slot: usize,
+    conn_ref: Arc<tokio::sync::Mutex<Option<T>>>,
     pool: Arc<MuxClient<T>>,
     params: Arc<ConnParams>,
     gen_token: Generation,
     cancel: tokio_util::sync::CancellationToken,
-) -> MonitorCommand<T>
+) -> MonitorCommand
 where
     T: MuxConnection + Send + 'static,
 {
     use std::sync::atomic::Ordering;
-    let _permit = reconnect_limiter().acquire().await.expect("semaphore closed");
+    let _permit = reconnect_limiter()
+        .acquire()
+        .await
+        .expect("static semaphore never closes");
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -641,13 +654,15 @@ where
         pool.metrics.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
 
         match T::reconnect_with(&params).await {
-            Ok(new_conn) => match pool.replace_slot(slot, new_conn, gen_token).await {
-                Ok(returned_conn) => {
+            Ok(new_conn) => match pool.replace_slot(slot, gen_token).await {
+                Ok(()) => {
+                    // Write the new conn directly into the shared conn_ref.
+                    {
+                        let mut guard = conn_ref.lock().await;
+                        *guard = Some(new_conn);
+                    }
                     pool.metrics.reconnect_success.fetch_add(1, Ordering::Relaxed);
-                    return MonitorCommand::Respawn {
-                        slot,
-                        conn: returned_conn,
-                    };
+                    return MonitorCommand::Respawn { slot };
                 }
                 Err(GenMismatch) => {
                     tracing::warn!(
@@ -668,17 +683,15 @@ where
 /// Pool-level supervisor. Owns the lifecycle of all `health_loop`s.
 /// 
 /// Architecture:
-/// 1. `pool_monitor` calls `health_loop` for each initial conn. `health_loop`
-///    takes the conn by value (for `close()`), pings it, and exits when
-///    the conn dies. The conn is NOT stored in `MuxClient`'s slot during
-///    this time — the slot is `None`. `pick_and_open` skips `None` slots.
-/// 2. When `health_loop` exits (because the conn is dead), it has
-///    already called `mark_dead`. If a `reconnect_loop` child succeeded,
-///    it has called `replace_slot` and sent `Respawn` on `monitor_tx`.
-/// 3. On `Respawn`, monitor calls `install_replacement` (puts new conn
-///    into the slot) and spawns a new `health_loop`.
-/// 4. On `DropSlot`, monitor logs and leaves the slot Dead.
-#[allow(dead_code)]
+/// 1. `pool_monitor` calls `push_empty_slot` for each initial conn, writes
+///    the conn into the slot's `conn_ref`, then spawns `health_loop` with a
+///    clone of the `conn_ref`. The slot is Active with a populated conn_ref.
+/// 2. `health_loop` pings via `conn_ref`, detects death, spawns `reconnect_loop`.
+/// 3. `reconnect_loop` on success: calls `replace_slot` (updates state/gen),
+///    writes new conn directly into `conn_ref`, sends `Respawn` to monitor.
+/// 4. On `Respawn`, monitor clones `conn_ref` from slot entry and spawns a
+///    new `health_loop`.
+/// 5. On `DropSlot`, monitor logs and leaves the slot Dead.
 pub(crate) async fn pool_monitor<T>(
     pool: Arc<MuxClient<T>>,
     params: Arc<ConnParams>,
@@ -690,10 +703,15 @@ pub(crate) async fn pool_monitor<T>(
     use std::sync::atomic::Ordering;
     use tokio::task::JoinSet;
 
-    let (monitor_tx, mut monitor_rx) = mpsc::channel::<MonitorCommand<T>>(64);
+    let (monitor_tx, mut monitor_rx) = mpsc::channel::<MonitorCommand>(64);
     let mut join_set: JoinSet<(usize, Result<(), tokio::task::JoinError>)> = JoinSet::new();
     for conn in initial {
-        let slot = pool.push_empty_slot().await;
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        // Write the initial conn into the shared conn_ref.
+        {
+            let mut guard = conn_ref.lock().await;
+            *guard = Some(conn);
+        }
         let pool_ref = pool.clone();
         let params_ref = params.clone();
         let cancel_child = cancel.child_token();
@@ -701,19 +719,16 @@ pub(crate) async fn pool_monitor<T>(
         join_set.spawn(async move {
             let result = tokio::spawn(health_loop(
                 slot,
-                conn,
+                conn_ref,
                 pool_ref,
                 params_ref,
                 cancel_child,
                 monitor_tx_clone,
             ))
             .await;
-            (slot, result.map(|_| ()).map_err(|e| e))
+            (slot, result.map(|_| ()))
         });
     }
-
-    // Keep monitor_tx alive for the duration of the monitor — it will
-    // be dropped when this function returns.
 
     loop {
         tokio::select! {
@@ -723,26 +738,12 @@ pub(crate) async fn pool_monitor<T>(
             }
             cmd = monitor_rx.recv() => {
                 match cmd {
-                    Some(MonitorCommand::Respawn { slot, conn }) => {
-                        // The slot is already in Active state with conn=None
-                        // (set by `pool.replace_slot`). The new health_loop
-                        // takes the conn by value; it does not go back
-                        // into the slot's `Option<T>`. While the health_loop
-                        // runs, the slot is "Active but conn==None" — this
-                        // means pick_and_open skips it (correct, since the
-                        // health_loop owns the conn and may close it).
-                        //
-                        // When the health_loop exits, the slot stays
-                        // Active+None (dead, in the sense of "no usable
-                        // conn until next respawn"). The new health_loop's
-                        // generation is what the next pick_and_open will
-                        // see... but pick_and_open skips None slots. So
-                        // effectively, the slot is "warm reserve" — it
-                        // gets a new conn from the next health_loop's
-                        // exit-and-respawn cycle. (This is a known
-                        // limitation of the v3 design; for production
-                        // we may want to refactor so the slot also stores
-                        // the conn during the health_loop's lifetime.)
+                    Some(MonitorCommand::Respawn { slot }) => {
+                        // Clone the conn_ref from the slot entry for the new health_loop.
+                        let conn_ref = {
+                            let guard = pool.conns.lock().await;
+                            guard[slot].conn.clone()
+                        };
                         let pool_ref = pool.clone();
                         let params_ref = params.clone();
                         let cancel_child = cancel.child_token();
@@ -750,25 +751,28 @@ pub(crate) async fn pool_monitor<T>(
                         join_set.spawn(async move {
                             let result = tokio::spawn(health_loop(
                                 slot,
-                                conn,
+                                conn_ref,
                                 pool_ref,
                                 params_ref,
                                 cancel_child,
                                 monitor_tx_clone,
                             ))
                             .await;
-                            (slot, result.map(|_| ()).map_err(|e| e))
+                            (slot, result.map(|_| ()))
                         });
                     }
                     Some(MonitorCommand::DropSlot(slot)) => {
                         tracing::warn!("[slot-{}] dropped by reconnect_loop (gen_token mismatch)", slot);
                     }
                     None => {
-                        while let Some(_) = join_set.join_next().await {}
+                        // All monitor_tx senders dropped; drain remaining tasks.
+                        while join_set.join_next().await.is_some() {}
                         return;
                     }
                 }
             }
+            // join_next() returns None when the JoinSet is empty, which means
+            // select! simply doesn't trigger this branch — correct behavior.
             Some(join_result) = join_set.join_next() => {
                 let (slot, task_result) = match join_result {
                     Ok(pair) => pair,
@@ -782,12 +786,6 @@ pub(crate) async fn pool_monitor<T>(
                     Ok(()) => tracing::info!("[slot-{}] health task exited normally", slot),
                     Err(e) => tracing::error!("[slot-{}] health task panicked: {}", slot, e),
                 }
-                // The health_loop should have called mark_dead before exiting.
-                // The reconnect_loop child (if any) is responsible for sending
-                // Respawn to monitor_tx. If the child succeeded, we'll see a
-                // Respawn cmd arrive. If it failed (gen_token mismatch), DropSlot.
-                // If neither, the slot is Dead with no replacement — pool
-                // shrinks by 1 (acceptable).
             }
         }
     }
@@ -914,9 +912,9 @@ mod tests {
     #[tokio::test]
     async fn pick_and_open_skips_dead_and_empty() {
         let pool = make_pool();
-        let s0 = pool.push_empty_slot().await;
-        let s1 = pool.push_empty_slot().await;
-        let _s2 = pool.push_empty_slot().await;
+        let (s0, _) = pool.push_empty_slot().await;
+        let (s1, _) = pool.push_empty_slot().await;
+        let (_s2, _) = pool.push_empty_slot().await;
         // All slots empty — pick_and_open returns Err
         let r = pool.pick_and_open().await;
         assert!(r.is_err());
@@ -980,8 +978,9 @@ mod tests {
     async fn replace_slot_increments_generation() {
         let pool = make_pool();
         let _ = pool.push_empty_slot().await;
-        let new_conn = MockConnection::new_valid();
-        let r = pool.replace_slot(0, new_conn, 0).await;
+        // Must be Dead state for replace_slot to succeed
+        pool.mark_dead(0, 0).await.unwrap();
+        let r = pool.replace_slot(0, 0).await;
         assert!(r.is_ok());
         assert_eq!(pool.generation(0).await, 1);
     }
@@ -990,8 +989,8 @@ mod tests {
     async fn replace_slot_rejects_mismatched_gen() {
         let pool = make_pool();
         let _ = pool.push_empty_slot().await;
-        let new_conn = MockConnection::new_valid();
-        let r = pool.replace_slot(0, new_conn, 99).await;
+        pool.mark_dead(0, 0).await.unwrap();
+        let r = pool.replace_slot(0, 99).await;
         assert!(matches!(r, Err(GenMismatch)));
         assert_eq!(pool.generation(0).await, 0);
     }
@@ -1026,14 +1025,66 @@ mod tests {
         assert_eq!(pool.metrics.dead.load(Ordering::Relaxed), 1);
     }
 
+    // ----- Shared conn_ref -----
+
     #[tokio::test]
-    async fn install_replacement_populates_empty_slot() {
+    async fn conn_ref_shared_access() {
         let pool = make_pool();
-        let _ = pool.push_empty_slot().await;
-        let conn = MockConnection::new_valid();
-        pool.install_replacement(0, conn).await;
-        // Now pick_and_open should find slot 0 as valid+active
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        // Write a conn into the shared ref
+        {
+            let mut guard = conn_ref.lock().await;
+            *guard = Some(MockConnection::new_valid());
+        }
+        // Verify pool sees it via pick_and_open
         let r = pool.pick_and_open().await;
         assert!(r.is_ok());
+        let _ = slot;
+    }
+
+    #[tokio::test]
+    async fn pick_and_open_via_conn_ref() {
+        let pool = make_pool();
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        // Slot is Active but conn_ref is None — pick_and_open should skip
+        assert!(pool.pick_and_open().await.is_err());
+        // Write a valid conn
+        {
+            let mut guard = conn_ref.lock().await;
+            *guard = Some(MockConnection::new_valid());
+        }
+        // Now pick_and_open should succeed
+        assert!(pool.pick_and_open().await.is_ok());
+        let _ = slot;
+    }
+
+    #[tokio::test]
+    async fn mark_dead_takes_conn_from_ref() {
+        let pool = make_pool();
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        let conn = MockConnection::new_valid();
+        {
+            let mut guard = conn_ref.lock().await;
+            *guard = Some(conn);
+        }
+        // mark_dead should take the conn out and close it
+        pool.mark_dead(slot, 0).await.unwrap();
+        let guard = conn_ref.lock().await;
+        assert!(guard.is_none(), "conn_ref should be None after mark_dead");
+    }
+
+    #[tokio::test]
+    async fn reconnect_writes_to_conn_ref() {
+        let pool = make_pool();
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        // Simulate: mark dead, replace_slot, write new conn
+        pool.mark_dead(slot, 0).await.unwrap();
+        pool.replace_slot(slot, 0).await.unwrap();
+        {
+            let mut guard = conn_ref.lock().await;
+            *guard = Some(MockConnection::new_valid());
+        }
+        // Verify the new conn is usable
+        assert!(pool.pick_and_open().await.is_ok());
     }
 }

@@ -8,8 +8,6 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use url::Url;
 
-// use rustls::crypto::{aws_lc_rs as provider, CryptoProvider};
-
 use super::client::mux_client_loop;
 use super::client::MuxClient;
 use super::client::MuxConnection;
@@ -246,7 +244,10 @@ async fn new_tls_connection(
     domain: &str,
 ) -> anyhow::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
     let host = url.host_str().ok_or_else(|| anyhow!("url has no host"))?;
-    let remote = (host, url.port().unwrap_or(443))
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("invalid port in URL"))?;
+    let remote = (host, port)
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
@@ -261,7 +262,6 @@ async fn new_tls_connection(
     }
 
     let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder()
-        // .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
 
@@ -274,14 +274,9 @@ async fn new_tls_connection(
     let domain = pki_types::ServerName::try_from(domain)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?
         .to_owned();
-    // let domain: pki_types::ServerName<'_> = rustls::ServerName::try_from(domain)
-    //     .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?
-    //     .to_owned();
 
     let stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream> =
         connector.connect(domain, stream).await?;
-    // let ciphersuite = stream.get_ref().1.negotiated_cipher_suite().unwrap();
-    // tracing::info!("Current ciphersuite: {:?}", ciphersuite.suite());
     Ok(stream)
 }
 

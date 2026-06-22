@@ -228,7 +228,11 @@ pub(crate) async fn new_s2n_quic_connection(
     url: &Url,
     host: &str,
 ) -> anyhow::Result<s2n_quic::Connection> {
-    let remote: std::net::SocketAddr = (url.host_str().unwrap(), url.port().unwrap_or(4433))
+    let host_str = url.host_str().ok_or_else(|| anyhow!("url has no host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("invalid port in URL"))?;
+    let remote: std::net::SocketAddr = (host_str, port)
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
