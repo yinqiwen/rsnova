@@ -47,37 +47,58 @@ pub async fn start_admin_server(
                     let metrics = utils::format_metrics(&registry);
                     ("200 OK", "text/plain; charset=utf-8", metrics.into_bytes())
                 }
-                ("GET", "/config") => {
-                    match render_config_page(&config, None).await {
-                        Ok(html) => ("200 OK", "text/html; charset=utf-8", html.into_bytes()),
-                        Err(e) => (
-                            "500 Internal Server Error",
-                            "text/plain; charset=utf-8",
-                            format!("Error rendering page: {}", e).into_bytes(),
-                        ),
-                    }
-                }
+                ("GET", "/config") => match render_config_page(&config, None).await {
+                    Ok(html) => ("200 OK", "text/html; charset=utf-8", html.into_bytes()),
+                    Err(e) => (
+                        "500 Internal Server Error",
+                        "text/plain; charset=utf-8",
+                        format!("Error rendering page: {}", e).into_bytes(),
+                    ),
+                },
                 ("POST", "/config") => {
                     let body_str = extract_body(&request);
                     let result = handle_config_save(&config, &body_str).await;
                     match result {
-                        Ok(()) => match render_config_page(&config, Some("Configuration saved. Tunnel client will reconnect.")).await {
+                        Ok(()) => match render_config_page(
+                            &config,
+                            Some("Configuration saved. Tunnel client will reconnect."),
+                        )
+                        .await
+                        {
                             Ok(html) => ("200 OK", "text/html; charset=utf-8", html.into_bytes()),
-                            Err(e) => ("500 Internal Server Error", "text/plain; charset=utf-8", format!("Error: {}", e).into_bytes()),
+                            Err(e) => (
+                                "500 Internal Server Error",
+                                "text/plain; charset=utf-8",
+                                format!("Error: {}", e).into_bytes(),
+                            ),
                         },
-                        Err(e) => match render_config_page(&config, Some(&format!("Error: {}", e))).await {
+                        Err(e) => match render_config_page(&config, Some(&format!("Error: {}", e)))
+                            .await
+                        {
                             Ok(html) => ("200 OK", "text/html; charset=utf-8", html.into_bytes()),
-                            Err(e2) => ("500 Internal Server Error", "text/plain; charset=utf-8", format!("Error: {}", e2).into_bytes()),
+                            Err(e2) => (
+                                "500 Internal Server Error",
+                                "text/plain; charset=utf-8",
+                                format!("Error: {}", e2).into_bytes(),
+                            ),
                         },
                     }
                 }
                 ("GET", "/") => {
                     let body = "rsnova admin server\n\nEndpoints:\n  /metrics - Server metrics\n  /config - Configuration editor\n";
-                    ("200 OK", "text/plain; charset=utf-8", body.as_bytes().to_vec())
+                    (
+                        "200 OK",
+                        "text/plain; charset=utf-8",
+                        body.as_bytes().to_vec(),
+                    )
                 }
                 _ => {
                     let body = "404 Not Found\n\nAvailable endpoints:\n  /metrics - Server metrics\n  /config - Configuration editor\n";
-                    ("404 Not Found", "text/plain; charset=utf-8", body.as_bytes().to_vec())
+                    (
+                        "404 Not Found",
+                        "text/plain; charset=utf-8",
+                        body.as_bytes().to_vec(),
+                    )
                 }
             };
 
@@ -129,12 +150,12 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&result).to_string()
 }
 
-fn parse_form_value<'a>(body: &str, key: &str) -> Option<String> {
+fn parse_form_value(body: &str, key: &str) -> Option<String> {
     for pair in body.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if url_decode(k) == key {
-                return Some(url_decode(v));
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && url_decode(k) == key
+        {
+            return Some(url_decode(v));
         }
     }
     None

@@ -1,20 +1,20 @@
 use anyhow::anyhow;
 use std::net::ToSocketAddrs;
 use std::path::Path;
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use url::Url;
 
-use super::client::mux_client_loop;
+use super::Message;
 use super::client::MuxClient;
 use super::client::MuxConnection;
-use super::client::{ConnParams, ProxySender, PROXY_CHANNEL_CAPACITY};
-use super::Message;
-use crate::mux::event;
+use super::client::mux_client_loop;
+use super::client::{ConnParams, PROXY_CHANNEL_CAPACITY, ProxySender, validate_pool_config};
 use crate::mux::MuxStream;
+use crate::mux::event;
 use crate::mux::{self};
 use crate::tunnel::ALPN_QUIC_HTTP;
 use crate::utils::read_tokio_tls_certs;
@@ -159,10 +159,11 @@ impl MuxConnection for TlsConnection {
 }
 
 impl MuxClient<TlsConnection> {
+    #[allow(clippy::too_many_arguments)]
     pub async fn from(
         url: &Url,
         cert_path: &Path,
-        host: &String,
+        host: &str,
         count: usize,
         idle_timeout_secs: usize,
         stream_window: u32,
@@ -170,6 +171,7 @@ impl MuxClient<TlsConnection> {
         ping_interval_secs: u64,
         ping_fail_threshold: u32,
     ) -> anyhow::Result<ProxySender> {
+        validate_pool_config(count, ping_interval_secs, ping_fail_threshold)?;
         match url.scheme() {
             "tls" => {
                 let (sender, receiver) = mpsc::channel::<Message>(PROXY_CHANNEL_CAPACITY);
@@ -187,6 +189,8 @@ impl MuxClient<TlsConnection> {
                             if i == 0 {
                                 return Err(e);
                             }
+                            tracing::warn!("TLS connection:{} failed during startup: {}", i, e);
+                            continue;
                         }
                         _ => {
                             tracing::info!("TLS connection:{} established!", i);
@@ -213,7 +217,7 @@ impl MuxClient<TlsConnection> {
                 let params = Arc::new(ConnParams {
                     url: url.clone(),
                     cert_path: cert_path.to_path_buf(),
-                    host: host.clone(),
+                    host: host.to_owned(),
                     stream_window,
                     max_age: if max_age_secs == 0 {
                         None
@@ -280,10 +284,11 @@ async fn new_tls_connection(
     Ok(stream)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn new_tls_client(
     url: &Url,
     cert_path: &Path,
-    host: &String,
+    host: &str,
     count: usize,
     idle_timeout_secs: usize,
     stream_window: u32,

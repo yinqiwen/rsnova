@@ -37,7 +37,7 @@ pub async fn new_tcp_listener(
     addr: &SocketAddr,
     transparent: bool,
 ) -> std::io::Result<tokio::net::TcpListener> {
-    let socket2_addr = socket2::SockAddr::from(addr.clone());
+    let socket2_addr = socket2::SockAddr::from(*addr);
     let domain = if socket2_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -47,7 +47,7 @@ pub async fn new_tcp_listener(
     if transparent {
         set_ip_transparent(&listen_tcp_socket, domain)?;
     }
-    listen_tcp_socket.bind(&socket2_addr.into())?;
+    listen_tcp_socket.bind(&socket2_addr)?;
     listen_tcp_socket.listen(128)?;
     tokio::net::TcpListener::from_std(listen_tcp_socket.into())
 }
@@ -63,7 +63,7 @@ pub fn new_udp_listener(
     addr: &SocketAddr,
     transparent: bool,
 ) -> std::io::Result<tokio::net::UdpSocket> {
-    let socket2_addr = socket2::SockAddr::from(addr.clone());
+    let socket2_addr = socket2::SockAddr::from(*addr);
     let domain = if socket2_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -74,7 +74,7 @@ pub fn new_udp_listener(
         set_ip_transparent(&listen_udp_socket, domain)?;
     }
     // Ok(listen_udp_socket)
-    listen_udp_socket.bind(&socket2_addr.into())?;
+    listen_udp_socket.bind(&socket2_addr)?;
     tokio::net::UdpSocket::from_std(listen_udp_socket.into())
 }
 

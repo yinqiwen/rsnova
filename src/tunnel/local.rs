@@ -6,7 +6,7 @@ use crate::tunnel::http_local::{handle_http, handle_https};
 use crate::tunnel::socks5_local::handle_socks5;
 use crate::tunnel::tls_local::{handle_tls, valid_tls_version};
 use crate::utils::new_tcp_listener;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 

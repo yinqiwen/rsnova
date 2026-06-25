@@ -15,9 +15,9 @@ pub use daemon::daemonize;
 pub use daemon_windows::daemonize;
 pub use error::make_io_error;
 pub use io::fill_read_buf;
-pub use metrics::format_metrics;
-pub use metrics::MetricsRegistry;
 pub use metrics::MetricsLogRecorder;
+pub use metrics::MetricsRegistry;
+pub use metrics::format_metrics;
 pub use net::get_original_dst;
 pub use net::new_tcp_listener;
 #[cfg(target_os = "linux")]

@@ -1,6 +1,6 @@
-use crate::tunnel::client::ProxySender;
 use crate::tunnel::Message;
-use anyhow::{anyhow, Result};
+use crate::tunnel::client::ProxySender;
+use anyhow::{Result, anyhow};
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,16 +40,16 @@ fn extract_target(headers_buf: &Vec<u8>, default_port: &str) -> Result<String> {
     let mut req = httparse::Request::new(&mut headers);
     req.parse(headers_buf.as_slice())?;
     let mut target_addr: String = String::new();
-    if let Some(path) = req.path {
-        if path.starts_with("http://") {
-            let url = url::Url::parse(path)?;
-            if url.has_host() {
-                target_addr.push_str(url.host_str().unwrap());
-            }
-            if let Some(p) = url.port() {
-                target_addr.push(':');
-                target_addr.push_str(p.to_string().as_str());
-            }
+    if let Some(path) = req.path
+        && path.starts_with("http://")
+    {
+        let url = url::Url::parse(path)?;
+        if url.has_host() {
+            target_addr.push_str(url.host_str().unwrap());
+        }
+        if let Some(p) = url.port() {
+            target_addr.push(':');
+            target_addr.push_str(p.to_string().as_str());
         }
     }
     if target_addr.is_empty() {

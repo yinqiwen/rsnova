@@ -1,7 +1,7 @@
 use anyhow::Result;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{net::SocketAddr, path::Path};
 
 use crate::mux::event;
@@ -61,22 +61,21 @@ pub async fn start_quic_remote_server(
             }
 
             let config = bincode::config::standard();
-            let auth_req: event::AuthRequest = match bincode::decode_from_slice(
-                ev.body.as_ref(),
-                config,
-            ) {
-                Ok((req, _)) => req,
-                Err(e) => {
-                    tracing::debug!("Failed to decode QUIC AuthRequest: {}", e);
-                    return;
-                }
-            };
+            let auth_req: event::AuthRequest =
+                match bincode::decode_from_slice(ev.body.as_ref(), config) {
+                    Ok((req, _)) => req,
+                    Err(e) => {
+                        tracing::debug!("Failed to decode QUIC AuthRequest: {}", e);
+                        return;
+                    }
+                };
 
             match auth_req {
                 event::AuthRequest::Proxy => {
                     let ack = event::AuthAck::Proxy;
-                    let _ = event::write_event(&mut send, event::new_auth_ack_event(0, &ack).unwrap())
-                        .await;
+                    let _ =
+                        event::write_event(&mut send, event::new_auth_ack_event(0, &ack).unwrap())
+                            .await;
                     drop(recv);
                     drop(send);
 
@@ -105,7 +104,8 @@ pub async fn start_quic_remote_server(
                                     "QUIC max concurrent proxy streams ({}) reached, dropping stream",
                                     MAX_QUIC_PROXY_STREAMS,
                                 );
-                                metrics::counter!("quic_server_proxy_streams_rejected").increment(1);
+                                metrics::counter!("quic_server_proxy_streams_rejected")
+                                    .increment(1);
                                 continue;
                             }
                         };
@@ -181,11 +181,9 @@ pub async fn start_quic_remote_server(
                     };
 
                     let ack = event::AuthAck::RegisterAck(event::RegisterAck { results });
-                    let _ = event::write_event(
-                        &mut send,
-                        event::new_auth_ack_event(0, &ack).unwrap(),
-                    )
-                    .await;
+                    let _ =
+                        event::write_event(&mut send, event::new_auth_ack_event(0, &ack).unwrap())
+                            .await;
                     drop(recv);
                     drop(send);
                 }

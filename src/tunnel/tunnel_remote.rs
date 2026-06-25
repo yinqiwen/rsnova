@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +24,7 @@ pub async fn handle_tunnel_register(
     let mut reg = registry.lock().await;
 
     for entry in &req.tunnels {
-        if let Some(err) = reg.validate_entry(entry) {
+        if let Some(err) = reg.validate_entry(&req.client_id, entry) {
             results.push(TunnelResult {
                 success: false,
                 remote_port: entry.remote_port,
@@ -81,10 +81,7 @@ pub async fn handle_tunnel_register(
         });
     }
 
-    reg.add_connection(
-        &req.client_id,
-        ClientConnection { handler, conn_id },
-    );
+    reg.add_connection(&req.client_id, ClientConnection { handler, conn_id });
 
     results
 }
@@ -139,15 +136,13 @@ async fn handle_visitor(
 
     let (local_addr, handler) = {
         let mut reg = registry.lock().await;
-        let tunnel = reg
-            .lookup_route(port, sni.as_deref())
-            .ok_or_else(|| {
-                anyhow!(
-                    "no route for port {}:{}",
-                    port,
-                    sni.as_deref().unwrap_or("default")
-                )
-            })?;
+        let tunnel = reg.lookup_route(port, sni.as_deref()).ok_or_else(|| {
+            anyhow!(
+                "no route for port {}:{}",
+                port,
+                sni.as_deref().unwrap_or("default")
+            )
+        })?;
 
         let local_addr = tunnel.local_addr.clone();
         let client_id = tunnel.client_id.clone();
@@ -178,7 +173,8 @@ async fn handle_visitor(
             event::write_event(&mut stream_w, ev).await?;
 
             let (mut visitor_r, mut visitor_w) = visitor_stream.into_split();
-            let mut relay = Stream::new(&mut visitor_r, &mut visitor_w, &mut stream_r, &mut stream_w);
+            let mut relay =
+                Stream::new(&mut visitor_r, &mut visitor_w, &mut stream_r, &mut stream_w);
             relay.transfer(idle_timeout_secs).await?;
         }
         ConnectionHandler::Quic(mut handle) => {

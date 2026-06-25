@@ -82,7 +82,7 @@ impl TunnelRegistry {
     }
 
     /// Validate a tunnel entry. Returns error string if invalid.
-    pub fn validate_entry(&self, entry: &TunnelEntry) -> Option<String> {
+    pub fn validate_entry(&self, client_id: &str, entry: &TunnelEntry) -> Option<String> {
         use crate::tunnel::tunnel_config::is_port_allowed;
 
         if entry.remote_port == 0 {
@@ -98,7 +98,9 @@ impl TunnelRegistry {
             remote_port: entry.remote_port,
             sni: entry.sni.clone(),
         };
-        if let Some(existing) = self.routes.get(&key) {
+        if let Some(existing) = self.routes.get(&key)
+            && existing.client_id != client_id
+        {
             return Some(format!(
                 "port {}:{} already registered by client '{}'",
                 entry.remote_port,
@@ -135,10 +137,10 @@ impl TunnelRegistry {
         if !client_state.routes.contains(&key) {
             client_state.routes.push(key.clone());
         }
-        if let Some(port_state) = self.ports.get_mut(&entry.remote_port) {
-            if !port_state.active_routes.contains(&key) {
-                port_state.active_routes.push(key);
-            }
+        if let Some(port_state) = self.ports.get_mut(&entry.remote_port)
+            && !port_state.active_routes.contains(&key)
+        {
+            port_state.active_routes.push(key);
         }
     }
 
@@ -209,3 +211,27 @@ impl TunnelRegistry {
 }
 
 pub type SharedRegistry = Arc<Mutex<TunnelRegistry>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(remote_port: u16, sni: Option<&str>) -> TunnelEntry {
+        TunnelEntry {
+            local_addr: "localhost:80".to_string(),
+            remote_port,
+            sni: sni.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn allows_same_client_to_register_same_route_for_multiple_connections() {
+        let mut reg = TunnelRegistry::new(vec![(8000, 9000)], vec![]);
+        let e = entry(8080, None);
+        assert_eq!(reg.validate_entry("client-a", &e), None);
+        reg.register_route("client-a", &e);
+
+        assert_eq!(reg.validate_entry("client-a", &e), None);
+        assert!(reg.validate_entry("client-b", &e).is_some());
+    }
+}

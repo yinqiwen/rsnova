@@ -87,9 +87,7 @@ impl Message {
 pub(crate) trait MuxConnection {
     type SendStream: AsyncWrite + Unpin + Send;
     type RecvStream: AsyncRead + Unpin + Send;
-    fn ping(
-        &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn ping(&mut self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
     fn connect(
         &mut self,
         url: &Url,
@@ -98,12 +96,10 @@ pub(crate) trait MuxConnection {
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
     fn open_stream(
         &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>>
-    + Send;
+    ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>> + Send;
     fn accept_stream(
         &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>>
-    + Send;
+    ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>> + Send;
     fn is_valid(&self) -> bool;
     #[allow(dead_code)]
     fn set_connection(&mut self, new_c: Self);
@@ -124,6 +120,23 @@ pub(crate) trait MuxConnection {
 /// Range: [-100, +100] seconds. Spreads retirements across a 200-second window.
 pub(crate) fn retirement_jitter_secs(index: usize) -> i64 {
     ((index.wrapping_mul(73)) % 201) as i64 - 100
+}
+
+pub(crate) fn validate_pool_config(
+    count: usize,
+    ping_interval_secs: u64,
+    ping_fail_threshold: u32,
+) -> anyhow::Result<()> {
+    if count == 0 {
+        return Err(anyhow!("connection pool size must be >= 1"));
+    }
+    if ping_interval_secs == 0 {
+        return Err(anyhow!("--ping-interval must be >= 1"));
+    }
+    if ping_fail_threshold == 0 {
+        return Err(anyhow!("--ping-fail-threshold must be >= 1"));
+    }
+    Ok(())
 }
 
 // =========================================================================
@@ -202,6 +215,7 @@ pub(crate) enum MonitorCommand {
 
 pub(crate) struct MuxClient<T> {
     pub(crate) conns: tokio::sync::Mutex<Vec<SlotEntry<T>>>,
+    pub(crate) cursor: AtomicUsize,
     pub(crate) cancel: tokio_util::sync::CancellationToken,
     pub(crate) metrics: Arc<PoolMetrics>,
 }
@@ -212,6 +226,7 @@ impl<T: MuxConnection> MuxClient<T> {
     pub(crate) fn new(cancel: tokio_util::sync::CancellationToken) -> Self {
         Self {
             conns: tokio::sync::Mutex::new(Vec::new()),
+            cursor: AtomicUsize::new(0),
             metrics: Arc::new(PoolMetrics {
                 active: AtomicUsize::new(0),
                 retiring: AtomicUsize::new(0),
@@ -241,34 +256,74 @@ impl<T: MuxConnection> MuxClient<T> {
         (slot, conn_ref)
     }
 
-    /// Atomic: pick an Active connection and call `open_stream` on it.
-    /// Holds the pool lock and then the slot's conn_ref lock for the
-    /// entire `open_stream` call to eliminate TOCTOU.
-    pub(crate) async fn pick_and_open(
-        &self,
-    ) -> anyhow::Result<(T::SendStream, T::RecvStream)> {
-        let guard = self.conns.lock().await;
-        let len = guard.len();
-        for slot in 0..len {
-            let entry = &guard[slot];
-            if entry.state != SlotState::Active {
-                continue;
+    /// Pick an Active connection and call `open_stream` on it.
+    ///
+    /// The pool lock is held only long enough to inspect one slot and clone its
+    /// shared conn_ref. Busy conn_ref locks are skipped with `try_lock`; if all
+    /// usable candidates are busy, we await one busy candidate as a fallback.
+    pub(crate) async fn pick_and_open(&self) -> anyhow::Result<(T::SendStream, T::RecvStream)> {
+        let len = {
+            let guard = self.conns.lock().await;
+            let len = guard.len();
+            if len == 0 {
+                tracing::error!("no available stream: pool is empty");
+                return Err(anyhow!("no available stream"));
             }
-            let mut conn_guard = entry.conn.lock().await;
-            let Some(conn) = conn_guard.as_mut() else {
+            len
+        };
+
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let mut fallback_busy_conn = None;
+
+        for offset in 0..len {
+            let conn_ref = {
+                let guard = self.conns.lock().await;
+                if guard.is_empty() {
+                    None
+                } else {
+                    let slot = (start + offset) % guard.len();
+                    let entry = &guard[slot];
+                    (entry.state == SlotState::Active).then(|| entry.conn.clone())
+                }
+            };
+
+            let Some(conn_ref) = conn_ref else {
                 continue;
             };
-            if !conn.is_valid() {
-                continue;
+
+            if let Ok(mut conn_guard) = conn_ref.try_lock() {
+                let Some(conn) = conn_guard.as_mut() else {
+                    continue;
+                };
+                if !conn.is_valid() {
+                    continue;
+                }
+                return conn.open_stream().await;
             }
-            return conn.open_stream().await;
+
+            if fallback_busy_conn.is_none() {
+                fallback_busy_conn = Some(conn_ref);
+            }
         }
+
+        if let Some(conn_ref) = fallback_busy_conn {
+            let mut conn_guard = conn_ref.lock().await;
+            if let Some(conn) = conn_guard.as_mut()
+                && conn.is_valid()
+            {
+                return conn.open_stream().await;
+            }
+        }
+
         let active = self.metrics.active.load(Ordering::Relaxed);
         let retiring = self.metrics.retiring.load(Ordering::Relaxed);
         let dead = self.metrics.dead.load(Ordering::Relaxed);
         tracing::error!(
             "no available stream: pool size={}, active={}, retiring={}, dead={}",
-            len, active, retiring, dead,
+            len,
+            active,
+            retiring,
+            dead,
         );
         Err(anyhow!("no available stream"))
     }
@@ -354,6 +409,14 @@ impl<T: MuxConnection> MuxClient<T> {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(GenMismatch);
         }
+        if entry.state != SlotState::Dead {
+            tracing::warn!(
+                "[slot-{}] replace_slot rejected: expected Dead, got {:?}",
+                slot,
+                entry.state
+            );
+            return Err(GenMismatch);
+        }
         entry.generation = entry.generation.wrapping_add(1);
         entry.state = SlotState::Active;
         self.metrics.dead.fetch_sub(1, Ordering::Relaxed);
@@ -383,12 +446,7 @@ pub(crate) async fn mux_client_loop<T>(
                 // Wrap pick_and_open in a timeout to prevent the serial
                 // mux_client_loop from blocking indefinitely when the
                 // pool is saturated.
-                match tokio::time::timeout(
-                    Duration::from_secs(1),
-                    client.pick_and_open(),
-                )
-                .await
-                {
+                match tokio::time::timeout(Duration::from_secs(1), client.pick_and_open()).await {
                     Ok(Ok((mut send, mut recv))) => {
                         metrics::gauge!("client_proxy_streams").increment(1.0);
                         tokio::spawn(async move {
@@ -407,12 +465,12 @@ pub(crate) async fn mux_client_loop<T>(
                                     metrics::gauge!("client_proxy_streams").decrement(1.0);
                                     return;
                                 }
-                                if let Some(payload) = event.payload {
-                                    if let Err(e) = send.write_all(&payload).await {
-                                        tracing::error!("write payload failed:{}", e);
-                                        metrics::gauge!("client_proxy_streams").decrement(1.0);
-                                        return;
-                                    }
+                                if let Some(payload) = event.payload
+                                    && let Err(e) = send.write_all(&payload).await
+                                {
+                                    tracing::error!("write payload failed:{}", e);
+                                    metrics::gauge!("client_proxy_streams").decrement(1.0);
+                                    return;
                                 }
                                 let mut stream = Stream::new(
                                     &mut local_reader,
@@ -424,7 +482,8 @@ pub(crate) async fn mux_client_loop<T>(
                                     tracing::debug!("transfer finish:{}", e);
                                 }
                             } else if let Some(udp_stream) = event.udp_stream {
-                                let (mut local_reader, mut local_writer) = tokio::io::split(udp_stream);
+                                let (mut local_reader, mut local_writer) =
+                                    tokio::io::split(udp_stream);
                                 let ev = match event::new_open_stream_event(0, &event.event) {
                                     Ok(ev) => ev,
                                     Err(e) => {
@@ -438,12 +497,12 @@ pub(crate) async fn mux_client_loop<T>(
                                     metrics::gauge!("client_proxy_streams").decrement(1.0);
                                     return;
                                 }
-                                if let Some(payload) = event.payload {
-                                    if let Err(e) = send.write_all(&payload).await {
-                                        tracing::error!("write payload failed:{}", e);
-                                        metrics::gauge!("client_proxy_streams").decrement(1.0);
-                                        return;
-                                    }
+                                if let Some(payload) = event.payload
+                                    && let Err(e) = send.write_all(&payload).await
+                                {
+                                    tracing::error!("write payload failed:{}", e);
+                                    metrics::gauge!("client_proxy_streams").decrement(1.0);
+                                    return;
                                 }
                                 let mut stream = Stream::new(
                                     &mut local_reader,
@@ -504,9 +563,7 @@ pub(crate) async fn health_loop<T>(
     let gen_token = pool.generation(slot).await;
     let mut is_retiring = false;
     let mut consecutive_fails: u32 = 0;
-    let max_age_deadline = params
-        .max_age
-        .map(|d| tokio::time::Instant::now() + d);
+    let max_age_deadline = params.max_age.map(|d| tokio::time::Instant::now() + d);
 
     // Per-slot state for the in-flight reconnect child.
     let mut reconnect_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -553,18 +610,23 @@ pub(crate) async fn health_loop<T>(
                     // guard is dropped; safe to acquire conns lock
                     if should_mark_retiring && !is_retiring {
                         is_retiring = true;
-                        let _ = pool.mark_retiring(slot, gen_token).await;
+                        if pool.mark_retiring(slot, gen_token).await.is_err() {
+                            return;
+                        }
                     }
                 }
 
-                // max_age check
-                if !is_retiring {
-                    if let Some(deadline) = max_age_deadline {
-                        if tokio::time::Instant::now() >= deadline {
-                            tracing::info!("[slot-{}] reached max age, retiring", slot);
-                            is_retiring = true;
-                            let _ = pool.mark_retiring(slot, gen_token).await;
-                        }
+                // max_age check. The current slot model cannot keep both a draining
+                // old connection and a fresh replacement in the same conn_ref. Close
+                // the old connection and move to Dead before reconnecting.
+                if !is_retiring
+                    && let Some(deadline) = max_age_deadline
+                    && tokio::time::Instant::now() >= deadline
+                {
+                    tracing::info!("[slot-{}] reached max age, reconnecting", slot);
+                    is_retiring = true;
+                    if pool.mark_dead(slot, gen_token).await.is_err() {
+                        return;
                     }
                 }
 
@@ -598,13 +660,9 @@ pub(crate) async fn health_loop<T>(
                         guard.as_ref().is_none_or(|c| !c.is_valid())
                     };
                     if conn_dead {
-                        {
-                            let mut guard = conn_ref.lock().await;
-                            if let Some(mut conn) = guard.take() {
-                                conn.close();
-                            }
+                        if pool.mark_dead(slot, gen_token).await.is_err() {
+                            return;
                         }
-                        let _ = pool.mark_dead(slot, gen_token).await;
                         if let Some(h) = reconnect_handle.take() {
                             let _ = h.await;
                         }
@@ -651,7 +709,9 @@ where
             _ = cancel.cancelled() => return MonitorCommand::DropSlot(slot),
             _ = tokio::time::sleep(sleep_for) => {}
         }
-        pool.metrics.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+        pool.metrics
+            .reconnect_attempts
+            .fetch_add(1, Ordering::Relaxed);
 
         match T::reconnect_with(&params).await {
             Ok(new_conn) => match pool.replace_slot(slot, gen_token).await {
@@ -661,7 +721,9 @@ where
                         let mut guard = conn_ref.lock().await;
                         *guard = Some(new_conn);
                     }
-                    pool.metrics.reconnect_success.fetch_add(1, Ordering::Relaxed);
+                    pool.metrics
+                        .reconnect_success
+                        .fetch_add(1, Ordering::Relaxed);
                     return MonitorCommand::Respawn { slot };
                 }
                 Err(GenMismatch) => {
@@ -673,7 +735,12 @@ where
                 }
             },
             Err(e) => {
-                tracing::warn!("[slot-{}] reconnect failed: {}; backoff {:?}", slot, e, backoff);
+                tracing::warn!(
+                    "[slot-{}] reconnect failed: {}; backoff {:?}",
+                    slot,
+                    e,
+                    backoff
+                );
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
@@ -681,7 +748,7 @@ where
 }
 
 /// Pool-level supervisor. Owns the lifecycle of all `health_loop`s.
-/// 
+///
 /// Architecture:
 /// 1. `pool_monitor` calls `push_empty_slot` for each initial conn, writes
 ///    the conn into the slot's `conn_ref`, then spawns `health_loop` with a
@@ -791,7 +858,6 @@ pub(crate) async fn pool_monitor<T>(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,14 +870,38 @@ mod tests {
         valid: AtomicBool,
         close_called: AtomicBool,
         ping_count: AtomicU32,
+        open_count: Arc<AtomicU32>,
+        open_started: Option<Arc<tokio::sync::Notify>>,
+        open_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl MockConnection {
         fn new_valid() -> Self {
+            Self::new_with_open_count(Arc::new(AtomicU32::new(0)))
+        }
+
+        fn new_with_open_count(open_count: Arc<AtomicU32>) -> Self {
             Self {
                 valid: AtomicBool::new(true),
                 close_called: AtomicBool::new(false),
                 ping_count: AtomicU32::new(0),
+                open_count,
+                open_started: None,
+                open_gate: None,
+            }
+        }
+
+        fn new_with_blocked_open(
+            open_started: Arc<tokio::sync::Notify>,
+            open_gate: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            Self {
+                valid: AtomicBool::new(true),
+                close_called: AtomicBool::new(false),
+                ping_count: AtomicU32::new(0),
+                open_count: Arc::new(AtomicU32::new(0)),
+                open_started: Some(open_started),
+                open_gate: Some(open_gate),
             }
         }
     }
@@ -820,9 +910,7 @@ mod tests {
         type SendStream = tokio::io::DuplexStream;
         type RecvStream = tokio::io::DuplexStream;
 
-        fn ping(
-            &mut self,
-        ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        fn ping(&mut self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
             self.ping_count.fetch_add(1, Ordering::Relaxed);
             let v = self.valid.load(Ordering::Acquire);
             async move {
@@ -845,19 +933,30 @@ mod tests {
 
         fn open_stream(
             &mut self,
-        ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>>
-        + Send {
+        ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>> + Send
+        {
+            self.open_count.fetch_add(1, Ordering::Relaxed);
+            let open_started = self.open_started.clone();
+            let open_gate = self.open_gate.clone();
             let (a, b) = tokio::io::duplex(64);
             // Return (a, b) directly as the (send, recv) pair. The
             // production code uses real MuxStream; for unit tests of
             // the pool API we don't actually transfer data.
-            async move { Ok((a, b)) }
+            async move {
+                if let Some(started) = open_started {
+                    started.notify_one();
+                }
+                if let Some(gate) = open_gate {
+                    gate.notified().await;
+                }
+                Ok((a, b))
+            }
         }
 
         fn accept_stream(
             &mut self,
-        ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>>
-        + Send {
+        ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>> + Send
+        {
             async move { Err(anyhow!("not implemented")) }
         }
 
@@ -907,6 +1006,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn validate_pool_config_rejects_zero_values() {
+        assert!(validate_pool_config(0, 1, 1).is_err());
+        assert!(validate_pool_config(1, 0, 1).is_err());
+        assert!(validate_pool_config(1, 1, 0).is_err());
+        assert!(validate_pool_config(1, 1, 1).is_ok());
+    }
+
     // ----- pick_and_open -----
 
     #[tokio::test]
@@ -927,6 +1034,96 @@ mod tests {
         let _ = pool.push_empty_slot().await;
         let _ = pool.push_empty_slot().await;
         assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn pick_and_open_distributes_across_active_slots_round_robin() {
+        let pool = make_pool();
+        let mut counts = Vec::new();
+        for _ in 0..3 {
+            let (_, conn_ref) = pool.push_empty_slot().await;
+            let count = Arc::new(AtomicU32::new(0));
+            {
+                let mut guard = conn_ref.lock().await;
+                *guard = Some(MockConnection::new_with_open_count(count.clone()));
+            }
+            counts.push(count);
+        }
+
+        for _ in 0..6 {
+            assert!(pool.pick_and_open().await.is_ok());
+        }
+
+        let opened: Vec<u32> = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        assert_eq!(opened, vec![2, 2, 2]);
+    }
+
+    #[tokio::test]
+    async fn pick_and_open_does_not_hold_pool_lock_while_open_stream_is_pending() {
+        let pool = make_pool();
+        let (_, conn_ref) = pool.push_empty_slot().await;
+        let open_started = Arc::new(tokio::sync::Notify::new());
+        let open_gate = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut guard = conn_ref.lock().await;
+            *guard = Some(MockConnection::new_with_blocked_open(
+                open_started.clone(),
+                open_gate.clone(),
+            ));
+        }
+
+        let pool_for_open = pool.clone();
+        let open_task = tokio::spawn(async move { pool_for_open.pick_and_open().await });
+        open_started.notified().await;
+
+        let generation = tokio::time::timeout(Duration::from_millis(100), pool.generation(0)).await;
+        assert!(
+            generation.is_ok(),
+            "pool lock should not be held by open_stream"
+        );
+
+        open_gate.notify_one();
+        assert!(open_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn pick_and_open_skips_busy_connection_when_another_active_slot_is_free() {
+        let pool = make_pool();
+        let (_, busy_conn_ref) = pool.push_empty_slot().await;
+        let (_, free_conn_ref) = pool.push_empty_slot().await;
+
+        let busy_started = Arc::new(tokio::sync::Notify::new());
+        let busy_gate = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut guard = busy_conn_ref.lock().await;
+            *guard = Some(MockConnection::new_with_blocked_open(
+                busy_started.clone(),
+                busy_gate.clone(),
+            ));
+        }
+
+        let free_open_count = Arc::new(AtomicU32::new(0));
+        {
+            let mut guard = free_conn_ref.lock().await;
+            *guard = Some(MockConnection::new_with_open_count(free_open_count.clone()));
+        }
+
+        let pool_for_busy = pool.clone();
+        let busy_task = tokio::spawn(async move { pool_for_busy.pick_and_open().await });
+        busy_started.notified().await;
+
+        // Force the next pick to consider the locked slot first. A busy-aware
+        // implementation should try_lock, skip it, and use the second slot.
+        pool.cursor.store(0, Ordering::Relaxed);
+        let skipped_busy = tokio::time::timeout(Duration::from_millis(100), pool.pick_and_open())
+            .await
+            .expect("pick_and_open should skip a locked busy connection");
+
+        assert!(skipped_busy.is_ok());
+        assert_eq!(free_open_count.load(Ordering::Relaxed), 1);
+
+        busy_gate.notify_one();
+        assert!(busy_task.await.unwrap().is_ok());
     }
 
     // ----- mark_retiring / mark_dead -----
@@ -993,6 +1190,22 @@ mod tests {
         let r = pool.replace_slot(0, 99).await;
         assert!(matches!(r, Err(GenMismatch)));
         assert_eq!(pool.generation(0).await, 0);
+    }
+
+    #[tokio::test]
+    async fn replace_slot_rejects_retiring_slot_without_dead_counter_underflow() {
+        let pool = make_pool();
+        let _ = pool.push_empty_slot().await;
+        pool.mark_retiring(0, 0).await.unwrap();
+
+        let r = pool.replace_slot(0, 0).await;
+
+        assert!(r.is_err(), "replace_slot must only replace Dead slots");
+        assert_eq!(pool.generation(0).await, 0);
+        assert_eq!(pool.slot_state(0).await, SlotState::Retiring);
+        assert_eq!(pool.metrics.dead.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.metrics.retiring.load(Ordering::Relaxed), 1);
     }
 
     // ----- drop / cancel -----

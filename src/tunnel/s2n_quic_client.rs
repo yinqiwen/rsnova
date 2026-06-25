@@ -3,18 +3,16 @@ use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use url::Url;
 
-use super::client::mux_client_loop;
+use super::Message;
 use super::client::MuxClient;
 use super::client::MuxConnection;
-use super::client::{ConnParams, ProxySender, PROXY_CHANNEL_CAPACITY};
-use super::Message;
-use crate::mux::event::{
-    self, AuthAck, AuthRequest, RegisterRequest, TunnelEntry, FLAG_AUTH_ACK,
-};
+use super::client::mux_client_loop;
+use super::client::{ConnParams, PROXY_CHANNEL_CAPACITY, ProxySender, validate_pool_config};
+use crate::mux::event::{self, AuthAck, AuthRequest, FLAG_AUTH_ACK, RegisterRequest, TunnelEntry};
 
 pub struct S2NQuicConnection {
     pub(crate) inner: Option<s2n_quic::Connection>,
@@ -73,7 +71,9 @@ impl MuxConnection for S2NQuicConnection {
     }
 
     async fn accept_stream(&mut self) -> anyhow::Result<(Self::SendStream, Self::RecvStream)> {
-        Err(anyhow!("QUIC accept_stream not yet implemented for tunnel mode"))
+        Err(anyhow!(
+            "QUIC accept_stream not yet implemented for tunnel mode"
+        ))
     }
 
     fn set_connection(&mut self, new_c: Self) {
@@ -130,16 +130,18 @@ impl MuxConnection for S2NQuicConnection {
 }
 
 impl MuxClient<S2NQuicConnection> {
+    #[allow(clippy::too_many_arguments)]
     pub async fn from(
         url: &Url,
         cert_path: &Path,
-        host: &String,
+        host: &str,
         count: usize,
         idle_timeout_secs: usize,
         max_age_secs: u64,
         ping_interval_secs: u64,
         ping_fail_threshold: u32,
     ) -> anyhow::Result<ProxySender> {
+        validate_pool_config(count, ping_interval_secs, ping_fail_threshold)?;
         match url.scheme() {
             "quic" => {
                 let (sender, receiver) = mpsc::channel::<Message>(PROXY_CHANNEL_CAPACITY);
@@ -158,6 +160,8 @@ impl MuxClient<S2NQuicConnection> {
                             if i == 0 {
                                 return Err(e);
                             }
+                            tracing::warn!("QUIC connection:{} failed during startup: {}", i, e);
+                            continue;
                         }
                         _ => {
                             tracing::info!("QUIC connection:{} established!", i);
@@ -187,7 +191,7 @@ impl MuxClient<S2NQuicConnection> {
                 let params = Arc::new(ConnParams {
                     url: url.clone(),
                     cert_path: cert_path.to_path_buf(),
-                    host: host.clone(),
+                    host: host.to_owned(),
                     stream_window: 0, // unused for QUIC
                     max_age: if max_age_secs == 0 {
                         None
@@ -247,6 +251,7 @@ pub(crate) async fn new_s2n_quic_connection(
 /// Tunnel client entry point for QUIC mode with hot-reload support.
 /// Spawns `concurrent` independent tunnel client tasks, each with its own
 /// connection, reconnection loop, and authentication.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_tunnel_client_quic(
     url: &Url,
     cert_path: &Path,
@@ -346,6 +351,7 @@ async fn tunnel_client_loop_quic(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_quic_tunnel_connection(
     url: &Url,
     cert_path: &Path,
@@ -392,45 +398,60 @@ async fn run_quic_tunnel_connection(
     drop(recv);
 
     let (_handle, mut acceptor) = connection.split();
+    let semaphore = Arc::new(Semaphore::new(
+        crate::tunnel::tunnel_client::MAX_TUNNEL_REVERSE_STREAMS,
+    ));
 
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let spawn_reverse = |stream: s2n_quic::stream::BidirectionalStream,
+                         semaphore: Arc<Semaphore>| match semaphore
+        .try_acquire_owned()
+    {
+        Ok(permit) => {
+            let (mut recv_stream, mut send_stream) = stream.split();
+            tokio::spawn(async move {
+                let _permit = permit;
+                if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
+                    &mut recv_stream,
+                    &mut send_stream,
+                    idle_timeout_secs,
+                )
+                .await
+                {
+                    tracing::warn!("QUIC reverse stream error: {}", e);
+                }
+            });
+        }
+        Err(_) => {
+            metrics::counter!("tunnel_reverse_streams_rejected").increment(1);
+            tracing::warn!(
+                "[conn-{}] max tunnel reverse streams ({}) reached, dropping QUIC stream",
+                conn_index,
+                crate::tunnel::tunnel_client::MAX_TUNNEL_REVERSE_STREAMS
+            );
+        }
+    };
 
     if max_age_secs > 0 {
         let seed = crate::tunnel::tunnel_client::next_tunnel_conn_seed() as usize;
         let jitter = super::client::retirement_jitter_secs(seed);
-        let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
+        let retire_at =
+            Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
 
         loop {
-            handles.retain(|h| !h.is_finished());
-
             tokio::select! {
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retire_at)) => {
-                    tracing::info!("[conn-{}] QUIC tunnel connection reached max age, draining...", conn_index);
-                    futures::future::join_all(handles).await;
+                    tracing::info!("[conn-{}] QUIC tunnel connection reached max age, stop accepting new streams", conn_index);
                     return Ok(());
                 }
                 result = acceptor.accept_bidirectional_stream() => {
                     match result {
                         Ok(Some(stream)) => {
-                            let (mut recv_stream, mut send_stream) = stream.split();
-                            handles.push(tokio::spawn(async move {
-                                if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
-                                    &mut recv_stream,
-                                    &mut send_stream,
-                                    idle_timeout_secs,
-                                )
-                                .await
-                                {
-                                    tracing::warn!("QUIC reverse stream error: {}", e);
-                                }
-                            }));
+                            spawn_reverse(stream, semaphore.clone());
                         }
                         Ok(None) => {
-                            futures::future::join_all(handles).await;
                             return Ok(());
                         }
                         Err(e) => {
-                            futures::future::join_all(handles).await;
                             return Err(anyhow!("[conn-{}] QUIC accept error: {}", conn_index, e));
                         }
                     }
@@ -440,29 +461,14 @@ async fn run_quic_tunnel_connection(
     } else {
         // No retirement — accept streams forever
         loop {
-            handles.retain(|h| !h.is_finished());
-
             match acceptor.accept_bidirectional_stream().await {
                 Ok(Some(stream)) => {
-                    let (mut recv_stream, mut send_stream) = stream.split();
-                    handles.push(tokio::spawn(async move {
-                        if let Err(e) = crate::tunnel::tunnel_client::handle_reverse_stream(
-                            &mut recv_stream,
-                            &mut send_stream,
-                            idle_timeout_secs,
-                        )
-                        .await
-                        {
-                            tracing::warn!("QUIC reverse stream error: {}", e);
-                        }
-                    }));
+                    spawn_reverse(stream, semaphore.clone());
                 }
                 Ok(None) => {
-                    futures::future::join_all(handles).await;
                     return Ok(());
                 }
                 Err(e) => {
-                    futures::future::join_all(handles).await;
                     return Err(anyhow!("[conn-{}] QUIC accept error: {}", conn_index, e));
                 }
             }
@@ -470,10 +476,11 @@ async fn run_quic_tunnel_connection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn new_quic_client(
     url: &Url,
     cert_path: &Path,
-    host: &String,
+    host: &str,
     count: usize,
     idle_timeout_secs: usize,
     max_age_secs: u64,

@@ -192,7 +192,7 @@ impl TproxyUdpSocket for LinuxTproxyUdpSocket {
     ) -> Poll<io::Result<(usize, SocketAddr, SocketAddr)>> {
         loop {
             let mut read_guard = ready!(self.socket.poll_read_ready(cx))?;
-            match recv_dest_from(&self.socket.get_ref(), buf) {
+            match recv_dest_from(self.socket.get_ref(), buf) {
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     read_guard.clear_ready();
                 }

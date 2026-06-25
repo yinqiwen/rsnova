@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -27,7 +27,7 @@ pub fn daemonize(log_to_file: bool) -> Result<()> {
                 return Err(anyhow!(
                     "second fork failed: {}",
                     io::Error::last_os_error()
-                ))
+                ));
             }
             pid if pid > 0 => libc::_exit(0),
             _ => {}

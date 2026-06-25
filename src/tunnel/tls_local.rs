@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use tokio::net::TcpStream;
 
-use crate::tunnel::client::ProxySender;
 use crate::tunnel::Message;
+use crate::tunnel::client::ProxySender;
 
 /// TLS record and handshake constants (RFC 5246, RFC 6066)
 mod tls {
@@ -121,7 +121,7 @@ impl<'a> Parser<'a> {
 /// ```
 pub async fn peek_sni_v2(stream: &TcpStream) -> Result<String> {
     // Peek data from socket without consuming
-    let mut buf = vec![0u8; 4096];
+    let mut buf = [0u8; 4096];
     let n = stream.peek(&mut buf).await?;
     if n == 0 {
         return Err(anyhow!("connection closed"));
@@ -240,11 +240,7 @@ pub fn valid_tls_version(buf: &[u8]) -> bool {
     true
 }
 
-pub async fn handle_tls(
-    tunnel_id: u32,
-    inbound: TcpStream,
-    sender: ProxySender,
-) -> Result<()> {
+pub async fn handle_tls(tunnel_id: u32, inbound: TcpStream, sender: ProxySender) -> Result<()> {
     let target_addr = match peek_sni_v2(&inbound).await {
         Ok(mut sni) => {
             sni.push_str(":443");

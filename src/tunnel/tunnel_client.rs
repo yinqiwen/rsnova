@@ -1,17 +1,19 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use url::Url;
 
 /// Monotonic counter used to derive unique jitter per tunnel connection attempt.
 static TUNNEL_CONN_SEED: AtomicU64 = AtomicU64::new(0);
+pub const MAX_TUNNEL_REVERSE_STREAMS: usize = 256;
 
 use crate::app_config::AppConfig;
 use crate::mux::event::{
-    self, AuthAck, AuthRequest, OpenStreamEvent, RegisterAck, RegisterRequest, TunnelEntry,
-    FLAG_AUTH_ACK, FLAG_REVERSE_OPEN,
+    self, AuthAck, AuthRequest, FLAG_AUTH_ACK, FLAG_REVERSE_OPEN, OpenStreamEvent, RegisterAck,
+    RegisterRequest, TunnelEntry,
 };
 use crate::tunnel::client::MuxConnection;
 use crate::tunnel::stream::Stream;
@@ -20,6 +22,7 @@ use crate::tunnel::tls_client::TlsConnection;
 /// Entry point for tunnel client mode (TLS) with hot-reload support.
 /// Spawns `concurrent` independent tunnel client tasks, each with its own
 /// connection, reconnection loop, and authentication.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_tunnel_client_tls(
     url: &Url,
     cert_path: &Path,
@@ -61,6 +64,7 @@ pub async fn start_tunnel_client_tls(
 }
 
 /// Per-connection reconnection loop with exponential backoff and config reload.
+#[allow(clippy::too_many_arguments)]
 async fn tunnel_client_loop_tls(
     url: &Url,
     cert_path: &Path,
@@ -123,6 +127,7 @@ async fn tunnel_client_loop_tls(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tunnel_connection_tls(
     url: &Url,
     cert_path: &Path,
@@ -165,37 +170,56 @@ async fn run_tunnel_connection_tls(
     drop(send);
     drop(recv);
 
-    tracing::info!("[conn-{}] Tunnel client ready, waiting for reverse streams...", conn_index);
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    tracing::info!(
+        "[conn-{}] Tunnel client ready, waiting for reverse streams...",
+        conn_index
+    );
+    let semaphore = Arc::new(Semaphore::new(MAX_TUNNEL_REVERSE_STREAMS));
+
+    let spawn_reverse =
+        |mut stream_send, mut stream_recv, semaphore: Arc<Semaphore>| match semaphore
+            .try_acquire_owned()
+        {
+            Ok(permit) => {
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) =
+                        handle_reverse_stream(&mut stream_recv, &mut stream_send, idle_timeout_secs)
+                            .await
+                    {
+                        tracing::warn!("Reverse stream error: {}", e);
+                    }
+                });
+            }
+            Err(_) => {
+                metrics::counter!("tunnel_reverse_streams_rejected").increment(1);
+                tracing::warn!(
+                    "[conn-{}] max tunnel reverse streams ({}) reached, dropping stream",
+                    conn_index,
+                    MAX_TUNNEL_REVERSE_STREAMS
+                );
+            }
+        };
 
     if max_age_secs > 0 {
         let seed = next_tunnel_conn_seed() as usize;
         let jitter = crate::tunnel::client::retirement_jitter_secs(seed);
-        let retire_at = Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
+        let retire_at =
+            Instant::now() + Duration::from_secs((max_age_secs as i64 + jitter).max(0) as u64);
 
         loop {
-            handles.retain(|h| !h.is_finished());
-
             tokio::select! {
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retire_at)) => {
-                    tracing::info!("[conn-{}] TLS tunnel connection reached max age, draining...", conn_index);
-                    futures::future::join_all(handles).await;
+                    tracing::info!("[conn-{}] TLS tunnel connection reached max age, stop accepting new streams", conn_index);
                     return Ok(());
                 }
                 result = conn.accept_stream() => {
                     match result {
-                        Ok((mut stream_send, mut stream_recv)) => {
-                            handles.push(tokio::spawn(async move {
-                                if let Err(e) =
-                                    handle_reverse_stream(&mut stream_recv, &mut stream_send, idle_timeout_secs).await
-                                {
-                                    tracing::warn!("Reverse stream error: {}", e);
-                                }
-                            }));
+                        Ok((stream_send, stream_recv)) => {
+                            spawn_reverse(stream_send, stream_recv, semaphore.clone());
                         }
                         Err(e) => {
-                            tracing::error!("[conn-{}] accept_stream failed: {}, draining handles", conn_index, e);
-                            futures::future::join_all(handles).await;
+                            tracing::error!("[conn-{}] accept_stream failed: {}", conn_index, e);
                             return Err(e);
                         }
                     }
@@ -203,23 +227,13 @@ async fn run_tunnel_connection_tls(
             }
         }
     } else {
-        // No retirement — accept streams forever
         loop {
-            handles.retain(|h| !h.is_finished());
-
             match conn.accept_stream().await {
-                Ok((mut stream_send, mut stream_recv)) => {
-                    handles.push(tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_reverse_stream(&mut stream_recv, &mut stream_send, idle_timeout_secs).await
-                        {
-                            tracing::warn!("Reverse stream error: {}", e);
-                        }
-                    }));
+                Ok((stream_send, stream_recv)) => {
+                    spawn_reverse(stream_send, stream_recv, semaphore.clone());
                 }
                 Err(e) => {
-                    tracing::error!("[conn-{}] accept_stream failed: {}, draining handles", conn_index, e);
-                    futures::future::join_all(handles).await;
+                    tracing::error!("[conn-{}] accept_stream failed: {}", conn_index, e);
                     return Err(e);
                 }
             }

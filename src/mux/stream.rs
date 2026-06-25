@@ -2,12 +2,12 @@ use crate::mux::metrics as mux_metrics;
 use crate::utils;
 use anyhow::Result;
 use bytes::Bytes;
+use futures::SinkExt;
 use futures::ready;
 use futures::task::AtomicWaker;
-use futures::SinkExt;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -356,13 +356,13 @@ impl AsyncWrite for MuxStream {
 impl Drop for MuxStream {
     fn drop(&mut self) {
         self.flush_window_update();
-        if let Some(sender) = self.ev_writer.get_ref() {
-            if !self.close_by_remote {
-                let stream_close = Control::StreamClose(self.id, false);
-                if let Err(e) = sender.try_send(stream_close) {
-                    mux_metrics::inc_stream_close_drop_failed(self.conn_id);
-                    tracing::debug!("stream {} drop send close failed: {}", self.id, e);
-                }
+        if let Some(sender) = self.ev_writer.get_ref()
+            && !self.close_by_remote
+        {
+            let stream_close = Control::StreamClose(self.id, false);
+            if let Err(e) = sender.try_send(stream_close) {
+                mux_metrics::inc_stream_close_drop_failed(self.conn_id);
+                tracing::debug!("stream {} drop send close failed: {}", self.id, e);
             }
         }
     }

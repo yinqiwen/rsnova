@@ -34,6 +34,7 @@ pub use self::local::start_local_tunnel_server;
 pub use self::tls_client::new_tls_client;
 pub use self::tls_remote::start_tls_remote_server;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_tunnel_client(
     url: &url::Url,
     cert_path: &std::path::Path,
@@ -59,7 +60,16 @@ pub async fn start_tunnel_client(
             .await
         }
         "quic" => {
-            start_tunnel_client_quic(url, cert_path, host, app_config, idle_timeout_secs, max_age_secs, concurrent).await
+            start_tunnel_client_quic(
+                url,
+                cert_path,
+                host,
+                app_config,
+                idle_timeout_secs,
+                max_age_secs,
+                concurrent,
+            )
+            .await
         }
         _ => Err(anyhow::anyhow!("unsupported scheme: {}", url.scheme())),
     }

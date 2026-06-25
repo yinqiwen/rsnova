@@ -1,9 +1,9 @@
 use std::{net::SocketAddr, num::NonZeroUsize};
 
-use super::client::ProxySender;
 use super::Message;
+use super::client::ProxySender;
 use crate::utils::{
-    new_udp_listener, LinuxTproxyUdpSocket, UdpServerStream, MAXIMUM_UDP_PAYLOAD_SIZE,
+    LinuxTproxyUdpSocket, MAXIMUM_UDP_PAYLOAD_SIZE, UdpServerStream, new_udp_listener,
 };
 use bytes::Bytes;
 use lru::LruCache;
@@ -80,13 +80,7 @@ pub(crate) fn start_local_udp_tunnel_server(
 
                 }
                 to_write_back = tunnel_data_receiver.recv()=>{
-                    match to_write_back{
-                        Some((_data, _addr))=>{
-
-                        }
-                        None=>{
-
-                        }
+                    if let Some((_data, _addr)) = to_write_back {
                     }
                 }
 

@@ -86,8 +86,16 @@ pub fn format_metrics(registry: &MetricsRegistry) -> String {
     metrics_info.push_str("=================Metrics=====================\n");
     if let Some(mem) = get_memory_info() {
         metrics_info.push_str("Memory:\n");
-        metrics_info.push_str(&format!("  rss: {} ({} MB)\n", mem.rss_bytes, mem.rss_bytes / 1024 / 1024));
-        metrics_info.push_str(&format!("  peak_rss: {} ({} MB)\n", mem.peak_rss_bytes, mem.peak_rss_bytes / 1024 / 1024));
+        metrics_info.push_str(&format!(
+            "  rss: {} ({} MB)\n",
+            mem.rss_bytes,
+            mem.rss_bytes / 1024 / 1024
+        ));
+        metrics_info.push_str(&format!(
+            "  peak_rss: {} ({} MB)\n",
+            mem.peak_rss_bytes,
+            mem.peak_rss_bytes / 1024 / 1024
+        ));
     }
     metrics_info.push_str("Gauges:\n");
     registry.visit_gauges(|name, gauge| {

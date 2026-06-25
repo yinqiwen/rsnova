@@ -1,5 +1,5 @@
 use anyhow::Result;
-use bincode::{config, Decode, Encode};
+use bincode::{Decode, Encode, config};
 use bytes::{Bytes, BytesMut};
 use std::io::IoSlice;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};

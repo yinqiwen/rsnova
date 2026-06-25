@@ -1,10 +1,10 @@
 use crate::mux::stream::{MuxStream, StreamFlow};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -14,10 +14,27 @@ use super::event;
 use super::stream::{Control, NewStreamParams};
 
 pub const INITIAL_STREAM_WINDOW: u32 = 256 * 1024;
+pub const MIN_STREAM_WINDOW: u32 = 16 * 1024;
+pub const MAX_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 /// Documentation only — actual threshold is computed per-MuxStream as initial_stream_window / 2.
 #[allow(dead_code)]
 pub const WINDOW_UPDATE_THRESHOLD: u32 = INITIAL_STREAM_WINDOW / 2;
 pub const CONTROL_CHANNEL_CAPACITY: usize = 256;
+pub const MAX_PENDING_INCOMING_STREAMS: usize = 1024;
+pub const MAX_MUX_STREAMS_PER_CONNECTION: usize = 1024;
+
+fn incoming_stream_rejection_reason(
+    pending_incoming_streams: usize,
+    active_streams: usize,
+) -> Option<&'static str> {
+    if pending_incoming_streams >= MAX_PENDING_INCOMING_STREAMS {
+        Some("pending")
+    } else if active_streams >= MAX_MUX_STREAMS_PER_CONNECTION {
+        Some("active")
+    } else {
+        None
+    }
+}
 
 /// How long a single ping waits for its matching pong before declaring the
 /// connection unhealthy. The health-check loop in `tunnel/client.rs` fires
@@ -190,6 +207,7 @@ impl Connection {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     conn_id: u32,
     r: R,
@@ -337,138 +355,160 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             match ctrl {
                 None => break,
                 Some(ctrl) => match ctrl {
-                Control::AcceptStream(callback) => {
-                    if accept_callback.is_some() {
-                        let _ = callback.send(Err(anyhow!("duplicate accept")));
-                        continue;
+                    Control::AcceptStream(callback) => {
+                        if accept_callback.is_some() {
+                            let _ = callback.send(Err(anyhow!("duplicate accept")));
+                            continue;
+                        }
+                        accept_callback = Some(callback);
                     }
-                    accept_callback = Some(callback);
-                }
-                Control::NewStream(params) => match stream_entries.entry(params.stream_id) {
-                    Entry::Occupied(_) => {
-                        tracing::error!("Duplicate stream id:{}", params.stream_id);
-                    }
-                    Entry::Vacant(v) => {
-                        v.insert(StreamEntry {
-                            sender: params.sender,
-                            recv_window: initial_stream_window,
-                            flow: params.flow.clone(),
-                            pending_bytes: 0,
-                        });
-                        metrics::gauge!("mux.streams").increment(1.0);
-                        active_stream_count.fetch_add(1, Ordering::Relaxed);
-                        if let Some(rx) = params.receiver {
-                            let stream = MuxStream::new(
+                    Control::NewStream(params) => {
+                        let is_incoming = params.receiver.is_some();
+                        let current_active_streams = stream_entries.len();
+                        if is_incoming
+                            && let Some(reason) = incoming_stream_rejection_reason(
+                                incoming_streams.len(),
+                                current_active_streams,
+                            )
+                        {
+                            metrics::counter!("mux.incoming_streams_rejected", "reason" => reason)
+                                .increment(1);
+                            tracing::warn!(
+                                "[{}/{}] reject incoming stream: {} limit reached",
                                 conn_id,
                                 params.stream_id,
-                                ev_writer.clone(),
-                                rx,
-                                params.flow,
-                                initial_stream_window,
-                                params.window_update_sender,
+                                reason
                             );
-                            incoming_streams.push_back(stream);
-                        } else {
-                            let ev = event::new_syn_event(params.stream_id);
-                            if let Err(e) = event::write_event(&mut w, ev).await {
-                                tracing::error!("write syn failed:{}", e);
-                                break;
-                            }
+                            let ev = event::new_fin_event(params.stream_id);
+                            let _ = event::write_event(&mut w, ev).await;
+                            continue;
                         }
-                    }
-                },
-                Control::StreamData(sid, data, incoming) => {
-                    if incoming {
-                        if let Some(entry) = stream_entries.get_mut(&sid) {
-                            let data_len = data.len() as u32;
-                            if data_len > entry.recv_window {
-                                tracing::error!(
-                                    "[{}/{}] flow control violation: {} > recv_window {}",
-                                    conn_id,
-                                    sid,
-                                    data_len,
-                                    entry.recv_window
-                                );
-                                entry.flow.close();
-                                let _ = entry.sender.send(None);
-                                stream_entries.remove(&sid);
-                                metrics::gauge!("mux.streams").decrement(1.0);
-                                active_stream_count.fetch_sub(1, Ordering::Relaxed);
-                                let ev = event::new_fin_event(sid);
-                                let _ = event::write_event(&mut w, ev).await;
-                            } else {
-                                entry.recv_window -= data_len;
-                                entry.pending_bytes += data_len as u64;
-                                if entry.sender.send(Some(data)).is_err() {
-                                    tracing::error!(
-                                        "[{}/{}] stream receiver dropped",
+                        match stream_entries.entry(params.stream_id) {
+                            Entry::Occupied(_) => {
+                                tracing::error!("Duplicate stream id:{}", params.stream_id);
+                            }
+                            Entry::Vacant(v) => {
+                                v.insert(StreamEntry {
+                                    sender: params.sender,
+                                    recv_window: initial_stream_window,
+                                    flow: params.flow.clone(),
+                                    pending_bytes: 0,
+                                });
+                                metrics::gauge!("mux.streams").increment(1.0);
+                                active_stream_count.fetch_add(1, Ordering::Relaxed);
+                                if let Some(rx) = params.receiver {
+                                    let stream = MuxStream::new(
                                         conn_id,
-                                        sid
+                                        params.stream_id,
+                                        ev_writer.clone(),
+                                        rx,
+                                        params.flow,
+                                        initial_stream_window,
+                                        params.window_update_sender,
                                     );
-                                    entry.flow.close();
-                                    stream_entries.remove(&sid);
-                                    metrics::gauge!("mux.streams").decrement(1.0);
-                                    active_stream_count.fetch_sub(1, Ordering::Relaxed);
+                                    incoming_streams.push_back(stream);
+                                } else {
+                                    let ev = event::new_syn_event(params.stream_id);
+                                    if let Err(e) = event::write_event(&mut w, ev).await {
+                                        tracing::error!("write syn failed:{}", e);
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    } else {
-                        let ev = event::new_data_event(sid, data);
+                    }
+                    Control::StreamData(sid, data, incoming) => {
+                        if incoming {
+                            if let Some(entry) = stream_entries.get_mut(&sid) {
+                                let data_len = data.len() as u32;
+                                if data_len > entry.recv_window {
+                                    tracing::error!(
+                                        "[{}/{}] flow control violation: {} > recv_window {}",
+                                        conn_id,
+                                        sid,
+                                        data_len,
+                                        entry.recv_window
+                                    );
+                                    entry.flow.close();
+                                    let _ = entry.sender.send(None);
+                                    stream_entries.remove(&sid);
+                                    metrics::gauge!("mux.streams").decrement(1.0);
+                                    active_stream_count.fetch_sub(1, Ordering::Relaxed);
+                                    let ev = event::new_fin_event(sid);
+                                    let _ = event::write_event(&mut w, ev).await;
+                                } else {
+                                    entry.recv_window -= data_len;
+                                    entry.pending_bytes += data_len as u64;
+                                    if entry.sender.send(Some(data)).is_err() {
+                                        tracing::error!(
+                                            "[{}/{}] stream receiver dropped",
+                                            conn_id,
+                                            sid
+                                        );
+                                        entry.flow.close();
+                                        stream_entries.remove(&sid);
+                                        metrics::gauge!("mux.streams").decrement(1.0);
+                                        active_stream_count.fetch_sub(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        } else {
+                            let ev = event::new_data_event(sid, data);
+                            if let Err(e) = event::write_event(&mut w, ev).await {
+                                tracing::error!("write stream data failed:{}", e);
+                                break;
+                            }
+                        }
+                    }
+                    Control::WindowUpdateFromPeer(sid, increment) => {
+                        if let Some(entry) = stream_entries.get(&sid) {
+                            entry.flow.credit(increment);
+                        }
+                    }
+                    Control::StreamShutdown(sid, remote) => {
+                        if let Some(entry) = stream_entries.get(&sid) {
+                            if !remote {
+                                let ev = event::new_shutdown_event(sid);
+                                if let Err(e) = event::write_event(&mut w, ev).await {
+                                    tracing::error!("write shutdown failed:{}", e);
+                                    break;
+                                }
+                            } else {
+                                let _ = entry.sender.send(Some(Bytes::new()));
+                            }
+                        }
+                    }
+                    Control::StreamClose(sid, remote) => {
+                        if let Some(entry) = stream_entries.remove(&sid) {
+                            metrics::gauge!("mux.streams").decrement(1.0);
+                            active_stream_count.fetch_sub(1, Ordering::Relaxed);
+                            entry.flow.close();
+                            if !remote {
+                                let ev = event::new_fin_event(sid);
+                                let _ = event::write_event(&mut w, ev).await;
+                            } else {
+                                let _ = entry.sender.send(None);
+                            }
+                        }
+                    }
+                    Control::Ping(nonce) => {
+                        let ev = event::new_ping_event(nonce);
                         if let Err(e) = event::write_event(&mut w, ev).await {
-                            tracing::error!("write stream data failed:{}", e);
+                            tracing::error!("write ping failed:{}", e);
                             break;
                         }
                     }
-                }
-                Control::WindowUpdateFromPeer(sid, increment) => {
-                    if let Some(entry) = stream_entries.get(&sid) {
-                        entry.flow.credit(increment);
-                    }
-                }
-                Control::StreamShutdown(sid, remote) => {
-                    if let Some(entry) = stream_entries.get(&sid) {
-                        if !remote {
-                            let ev = event::new_shutdown_event(sid);
-                            if let Err(e) = event::write_event(&mut w, ev).await {
-                                tracing::error!("write shutdown failed:{}", e);
-                                break;
-                            }
-                        } else {
-                            let _ = entry.sender.send(Some(Bytes::new()));
+                    Control::Pong(nonce) => {
+                        let ev = event::new_pong_event(nonce);
+                        if let Err(e) = event::write_event(&mut w, ev).await {
+                            tracing::error!("write pong failed:{}", e);
+                            break;
                         }
                     }
-                }
-                Control::StreamClose(sid, remote) => {
-                    if let Some(entry) = stream_entries.remove(&sid) {
-                        metrics::gauge!("mux.streams").decrement(1.0);
-                        active_stream_count.fetch_sub(1, Ordering::Relaxed);
-                        entry.flow.close();
-                        if !remote {
-                            let ev = event::new_fin_event(sid);
-                            let _ = event::write_event(&mut w, ev).await;
-                        } else {
-                            let _ = entry.sender.send(None);
-                        }
-                    }
-                }
-                Control::Ping(nonce) => {
-                    let ev = event::new_ping_event(nonce);
-                    if let Err(e) = event::write_event(&mut w, ev).await {
-                        tracing::error!("write ping failed:{}", e);
+                    Control::Close => {
                         break;
                     }
-                }
-                Control::Pong(nonce) => {
-                    let ev = event::new_pong_event(nonce);
-                    if let Err(e) = event::write_event(&mut w, ev).await {
-                        tracing::error!("write pong failed:{}", e);
-                        break;
-                    }
-                }
-                Control::Close => {
-                    break;
-                }
-                }
+                },
             } // close match ctrl outer (match ctrl -> None|Some)
 
             if accept_callback.is_some() && !incoming_streams.is_empty() {
@@ -507,6 +547,19 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incoming_stream_limits_reject_pending_and_active_overflow() {
+        assert_eq!(incoming_stream_rejection_reason(0, 0), None);
+        assert_eq!(
+            incoming_stream_rejection_reason(MAX_PENDING_INCOMING_STREAMS, 0),
+            Some("pending")
+        );
+        assert_eq!(
+            incoming_stream_rejection_reason(0, MAX_MUX_STREAMS_PER_CONNECTION),
+            Some("active")
+        );
+    }
 
     /// Two Connections wired back-to-back over `tokio::io::duplex` should
     /// successfully complete a ping round-trip: the client sends FLAG_PING,
@@ -582,8 +635,7 @@ mod tests {
 
         let mut client =
             Connection::new_with_stream_window(a_r, a_w, Mode::Client, 0, SMALL_WINDOW);
-        let server =
-            Connection::new_with_stream_window(b_r, b_w, Mode::Server, 1, SMALL_WINDOW);
+        let server = Connection::new_with_stream_window(b_r, b_w, Mode::Server, 1, SMALL_WINDOW);
 
         // Quick health check — verifies basic connectivity.
         client.ping().await.expect("ping before transfer");

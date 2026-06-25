@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use clap_serde_derive::{
-    clap::{self, Parser, ValueEnum},
     ClapSerde,
+    clap::{self, Parser, ValueEnum},
 };
 use serde::Deserialize;
 
@@ -168,6 +168,17 @@ struct Args {
     tunnel_port_range: String,
 }
 
+fn validate_mux_stream_window(window: u32) -> anyhow::Result<()> {
+    if !(mux::MIN_STREAM_WINDOW..=mux::MAX_STREAM_WINDOW).contains(&window) {
+        return Err(anyhow!(
+            "--mux-stream-window must be between {} and {} bytes",
+            mux::MIN_STREAM_WINDOW,
+            mux::MAX_STREAM_WINDOW
+        ));
+    }
+    Ok(())
+}
+
 fn rcgen(tls_host: &String) -> anyhow::Result<()> {
     let cert_path = std::path::PathBuf::from(r"./cert.pem");
     let key_path = std::path::PathBuf::from(r"./key.pem");
@@ -214,6 +225,8 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
     }
 
     tracing::info!("{args:?}");
+
+    validate_mux_stream_window(args.mux_stream_window)?;
 
     let tunnel_entries = if !args.tunnel.is_empty() {
         if args.tunnel_client_id.is_empty() {
@@ -352,13 +365,8 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
             let listen_addr = args.listen;
             let tproxy = args.tproxy;
             let max_connections = args.max_connections;
-            tunnel::start_local_tunnel_server(
-                &listen_addr,
-                tunnel_sender,
-                tproxy,
-                max_connections,
-            )
-            .await?;
+            tunnel::start_local_tunnel_server(&listen_addr, tunnel_sender, tproxy, max_connections)
+                .await?;
 
             // Keep the main task running
             loop {
@@ -426,6 +434,19 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 }
 
 extern crate cfg_if;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_mux_stream_window_rejects_out_of_range_values() {
+        assert!(validate_mux_stream_window(mux::MIN_STREAM_WINDOW - 1).is_err());
+        assert!(validate_mux_stream_window(mux::MIN_STREAM_WINDOW).is_ok());
+        assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW).is_ok());
+        assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW + 1).is_err());
+    }
+}
+
 fn main() {
     // Install rustls crypto provider (required for rustls 0.23+)
     rustls::crypto::ring::default_provider()
@@ -460,11 +481,11 @@ fn main() {
         return;
     }
 
-    if args.daemon {
-        if let Err(e) = utils::daemonize(!args.log.is_empty()) {
-            eprintln!("daemonize failed: {}", e);
-            std::process::exit(1);
-        }
+    if args.daemon
+        && let Err(e) = utils::daemonize(!args.log.is_empty())
+    {
+        eprintln!("daemonize failed: {}", e);
+        std::process::exit(1);
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

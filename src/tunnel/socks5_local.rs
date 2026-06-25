@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::tunnel::client::ProxySender;
 use crate::tunnel::Message;
+use crate::tunnel::client::ProxySender;
 
 mod v5 {
     pub const VERSION: u8 = 5;
