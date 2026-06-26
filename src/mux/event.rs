@@ -54,6 +54,9 @@ impl Header {
     pub fn len(&self) -> u32 {
         self.flag_len >> 8
     }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     #[allow(dead_code)]
     pub fn set_len(&mut self, v: u32) {
         let f = self.flags();
@@ -65,9 +68,30 @@ impl Header {
     }
 }
 
+#[derive(Encode, Decode, PartialEq, Debug, Clone, Copy)]
+pub enum StreamProto {
+    Tcp,
+    Udp,
+}
+
+impl StreamProto {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+impl std::fmt::Display for StreamProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub struct OpenStreamEvent {
-    pub proto: String,
+    pub proto: StreamProto,
     pub addr: String,
 }
 
@@ -184,7 +208,7 @@ pub fn new_ping_event(nonce: u32) -> Event {
             flag_len: get_flag_len(4, FLAG_PING),
             stream_id: 0,
         },
-        body: Bytes::copy_from_slice(&nonce.to_le_bytes()),
+        body: nonce_bytes(nonce),
     }
 }
 
@@ -194,7 +218,7 @@ pub fn new_pong_event(nonce: u32) -> Event {
             flag_len: get_flag_len(4, FLAG_PONG),
             stream_id: 0,
         },
-        body: Bytes::copy_from_slice(&nonce.to_le_bytes()),
+        body: nonce_bytes(nonce),
     }
 }
 
@@ -204,8 +228,18 @@ pub fn new_window_update_event(sid: u32, increment: u32) -> Event {
             flag_len: get_flag_len(4, FLAG_WIN_UPDATE),
             stream_id: sid,
         },
-        body: Bytes::copy_from_slice(&increment.to_le_bytes()),
+        body: nonce_bytes(increment),
     }
+}
+
+/// Pack a `u32` into a `Bytes` without going through `Bytes::copy_from_slice`,
+/// which would call `to_le_bytes()` (stack array) then allocate + memcpy.
+/// `BytesMut::with_capacity(4)` + `extend_from_slice` + `freeze` is one alloc
+/// and one memcpy, with no intermediate `[u8; 4]` promotion through `&[u8]`.
+fn nonce_bytes(value: u32) -> Bytes {
+    let mut b = BytesMut::with_capacity(4);
+    b.extend_from_slice(&value.to_le_bytes());
+    b.freeze()
 }
 
 pub fn new_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> anyhow::Result<Event> {
@@ -305,9 +339,24 @@ where
             format!("event body too large: {}", body_data_len),
         ));
     }
-    let mut dbuf = BytesMut::zeroed(body_data_len as usize);
+    // Use `with_capacity` + `read_buf` (via `BufMut`) instead of `BytesMut::zeroed`,
+    // so the body buffer is never memset to zero before being filled. For a
+    // 256KB data frame this saves a memset on the read hot path. `read_buf`
+    // returns the number of bytes written into the `BufMut`; we loop until
+    // `body_data_len` bytes are filled (mirrors `read_exact` semantics).
+    let mut dbuf = BytesMut::with_capacity(body_data_len as usize);
     if body_data_len > 0 {
-        let _ = reader.read_exact(&mut dbuf).await?;
+        let mut remaining = body_data_len as usize;
+        while remaining > 0 {
+            let n = reader.read_buf(&mut dbuf).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before event body complete",
+                ));
+            }
+            remaining = remaining.saturating_sub(n);
+        }
     }
     let ev = Event {
         header,

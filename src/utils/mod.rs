@@ -1,3 +1,9 @@
+// These re-exports serve the binary target (src/main.rs declares `mod utils`
+// and consumes them via `crate::utils::*`). The library facade (`src/lib.rs`)
+// only exposes `mux`, so under the lib target these imports appear unused.
+// Suppress the noise rather than weakening the module's public surface.
+#![allow(unused_imports, dead_code)]
+
 #[cfg(unix)]
 mod daemon;
 #[cfg(windows)]

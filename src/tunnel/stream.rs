@@ -57,7 +57,9 @@ async fn timeout_copy_impl<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     timeout_sec: u64,
     state: Arc<TransferState>,
 ) -> Result<()> {
-    let mut buf = [0u8; 8192];
+    // Larger buffer reduces syscall count on high-throughput links.
+    // The mux flow-control window can be up to 4MB; 8KB was needlessly small.
+    let mut buf = [0u8; 32768];
 
     let check_timeout_secs = Duration::from_secs(CHECK_TIMEOUT_SECS);
     state.touch();
@@ -165,7 +167,7 @@ pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteEx
             let (open_event, _len): (OpenStreamEvent, usize) =
                 bincode::decode_from_slice(ev.body.as_ref(), config)?;
             tracing::info!("[{}]recv open event:{:?}", ev.header.stream_id, open_event);
-            if open_event.proto == "udp" {
+            if open_event.proto == crate::mux::event::StreamProto::Udp {
                 let udp_socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
                 udp_socket.connect(&open_event.addr).await?;
                 let udp_stream = UdpClientStream::new(udp_socket);

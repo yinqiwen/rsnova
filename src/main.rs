@@ -15,7 +15,7 @@ use url::Url;
 
 mod admin;
 mod app_config;
-mod mux;
+pub mod mux;
 mod tunnel;
 mod utils;
 

@@ -37,7 +37,7 @@ impl UdpAssociateManager {
 
 pub(crate) fn start_local_udp_tunnel_server(
     addr: &SocketAddr,
-    _msg_sender: ProxySender,
+    msg_sender: ProxySender,
 ) -> Result<(), std::io::Error> {
     let udp_socket = new_udp_listener(addr, true)?;
     let tproxy_udp_server = LinuxTproxyUdpSocket::new(udp_socket)?;
@@ -73,14 +73,34 @@ pub(crate) fn start_local_udp_tunnel_server(
                     let (sender, receiver) = manager.get(src);
                     if let Some(rx) = receiver{
                         let stream = UdpServerStream::new(rx, tunnel_data_sender.clone(), src);
-                        let _msg = Message::open_udp_stream(stream, dst.to_string(), None);
+                        let msg = Message::open_udp_stream(stream, dst.to_string(), None);
+                        // Forward to the mux client loop for tunneling. If the
+                        // proxy channel is full or closed, drop this datagram
+                        // rather than blocking the local UDP listener.
+                        if let Err(e) = msg_sender.try_send(msg) {
+                            tracing::warn!(
+                                "drop UDP visitor from {}: proxy channel send failed: {}",
+                                src,
+                                e
+                            );
+                        }
                     }else{
                         let _ = sender.send(data).await;
                     }
 
                 }
+                // Reply datagrams from the remote end: forward back to the
+                // visitor's source address via the bound tproxy socket. UDP
+                // allows concurrent recv+send on the same socket.
                 to_write_back = tunnel_data_receiver.recv()=>{
-                    if let Some((_data, _addr)) = to_write_back {
+                    if let Some((data, addr)) = to_write_back
+                        && let Err(e) = tproxy_udp_server.socket().send_to(&data, addr).await
+                    {
+                        tracing::warn!(
+                            "send_to visitor {} failed: {}",
+                            addr,
+                            e
+                        );
                     }
                 }
 

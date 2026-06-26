@@ -187,21 +187,25 @@ impl TunnelRegistry {
     }
 
     /// Lookup a route by (remote_port, sni). Falls back to (remote_port, None) if SNI not found.
+    ///
+    /// We avoid constructing a `RouteKey { sni: Some(sni.to_string()) }` on every
+    /// lookup (the previous implementation did, allocating a `String` per
+    /// visitor). Instead, we iterate the routes map and compare by value. The
+    /// number of routes per port is typically small (<= 10), so O(n) here is
+    /// cheaper than the avoided allocation + hash.
     pub fn lookup_route(&self, remote_port: u16, sni: Option<&str>) -> Option<&ActiveTunnel> {
         if let Some(sni_str) = sni {
-            let key = RouteKey {
-                remote_port,
-                sni: Some(sni_str.to_string()),
-            };
-            if let Some(tunnel) = self.routes.get(&key) {
-                return Some(tunnel);
+            // Look for an exact (port, Some(sni)) match first.
+            if let Some(t) = self.routes.values().find(|t| {
+                t.remote_port == remote_port && t.sni.as_deref() == Some(sni_str)
+            }) {
+                return Some(t);
             }
         }
-        let default_key = RouteKey {
-            remote_port,
-            sni: None,
-        };
-        self.routes.get(&default_key)
+        // Fall back to (port, None).
+        self.routes.values().find(|t| {
+            t.remote_port == remote_port && t.sni.is_none()
+        })
     }
 
     /// Check if a port already has a listener registered.

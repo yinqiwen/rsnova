@@ -207,6 +207,25 @@ impl Connection {
     }
 }
 
+async fn apply_window_update<W: AsyncWrite + Unpin>(
+    sid: u32,
+    increment: u32,
+    stream_entries: &mut HashMap<u32, StreamEntry>,
+    w: &mut W,
+    initial_stream_window: u32,
+) -> anyhow::Result<()> {
+    if let Some(entry) = stream_entries.get_mut(&sid) {
+        entry.pending_bytes = entry.pending_bytes.saturating_sub(increment as u64);
+        entry.recv_window = entry
+            .recv_window
+            .saturating_add(increment)
+            .min(initial_stream_window);
+        let ev = event::new_window_update_event(sid, increment);
+        event::write_event(w, ev).await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     conn_id: u32,
@@ -291,65 +310,68 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let mut incoming_streams: VecDeque<MuxStream> = VecDeque::new();
         let mut accept_callback: Option<oneshot::Sender<Result<MuxStream>>> = None;
         let mut stream_entries: HashMap<u32, StreamEntry> = HashMap::new();
+        // Sample flow-control metrics every 1s instead of on every control
+        // message. With MAX_MUX_STREAMS_PER_CONNECTION = 1024, the previous
+        // per-message iteration cost 1024 atomic loads + 3 registry lookups
+        // per frame, which dominates at high frame rates.
+        let mut metrics_interval = tokio::time::interval(Duration::from_millis(1000));
+        metrics_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Discard the first immediate tick.
+        metrics_interval.tick().await;
 
         loop {
-            // Drain all pending window updates first (non-blocking).
-            // This ensures flow-control credits are delivered reliably
-            // and never dropped, regardless of control channel pressure.
-            while let Ok((sid, increment)) = window_update_receiver.try_recv() {
-                if let Some(entry) = stream_entries.get_mut(&sid) {
-                    entry.pending_bytes = entry.pending_bytes.saturating_sub(increment as u64);
-                    entry.recv_window = entry
-                        .recv_window
-                        .saturating_add(increment)
-                        .min(initial_stream_window);
-                    let ev = event::new_window_update_event(sid, increment);
-                    if let Err(e) = event::write_event(&mut w, ev).await {
+            // Wait for either a window update or a control message (or the
+            // periodic metrics tick). Using select! is critical: blocking on
+            // ev_reader.recv() alone would never wake up when a window update
+            // arrives, leading to a flow-control deadlock.
+            let ctrl = tokio::select! {
+                // Window update arrived — process it and drain any additional
+                // pending updates before looping back.
+                Some((sid, increment)) = window_update_receiver.recv() => {
+                    if let Err(e) = apply_window_update(
+                        sid,
+                        increment,
+                        &mut stream_entries,
+                        &mut w,
+                        initial_stream_window,
+                    ).await {
                         tracing::error!("write window update failed:{}", e);
                         break;
                     }
-                }
-            }
-
-            // Wait for either a window update or a control message.
-            // Using select! is critical: blocking on ev_reader.recv()
-            // alone would never wake up when a window update arrives,
-            // leading to a flow-control deadlock.
-            let ctrl = tokio::select! {
-                // Window update arrived — drain all and retry.
-                Some((sid, increment)) = window_update_receiver.recv() => {
-                    // Process this window update AND drain any additional
-                    // pending updates before looping back.
-                    if let Some(entry) = stream_entries.get_mut(&sid) {
-                        entry.pending_bytes = entry.pending_bytes.saturating_sub(increment as u64);
-                        entry.recv_window = entry
-                            .recv_window
-                            .saturating_add(increment)
-                            .min(initial_stream_window);
-                        let ev = event::new_window_update_event(sid, increment);
-                        if let Err(e) = event::write_event(&mut w, ev).await {
+                    while let Ok((sid, inc)) = window_update_receiver.try_recv() {
+                        if let Err(e) = apply_window_update(
+                            sid,
+                            inc,
+                            &mut stream_entries,
+                            &mut w,
+                            initial_stream_window,
+                        ).await {
                             tracing::error!("write window update failed:{}", e);
                             break;
-                        }
-                    }
-                    while let Ok((sid, inc)) = window_update_receiver.try_recv() {
-                        if let Some(entry) = stream_entries.get_mut(&sid) {
-                            entry.pending_bytes = entry.pending_bytes.saturating_sub(inc as u64);
-                            entry.recv_window = entry
-                                .recv_window
-                                .saturating_add(inc)
-                                .min(initial_stream_window);
-                            let ev = event::new_window_update_event(sid, inc);
-                            if let Err(e) = event::write_event(&mut w, ev).await {
-                                tracing::error!("write window update failed:{}", e);
-                                break;
-                            }
                         }
                     }
                     continue;
                 }
 
                 result = ev_reader.recv() => result,
+
+                // Periodically aggregate flow-control gauges across all streams.
+                // Sampled at most once per second rather than once per frame.
+                _ = metrics_interval.tick() => {
+                    let mut total_recv_window: u64 = 0;
+                    let mut total_send_window: u64 = 0;
+                    let mut total_pending_bytes: u64 = 0;
+                    for entry in stream_entries.values() {
+                        total_recv_window += entry.recv_window as u64;
+                        total_send_window += entry.flow.available() as u64;
+                        total_pending_bytes += entry.pending_bytes;
+                    }
+                    metrics::gauge!("mux.stream.total_recv_window").set(total_recv_window as f64);
+                    metrics::gauge!("mux.stream.total_send_window").set(total_send_window as f64);
+                    metrics::gauge!("mux.stream.total_pending_bytes")
+                        .set(total_pending_bytes as f64);
+                    continue;
+                }
             };
 
             match ctrl {
@@ -516,19 +538,6 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 let _ = accept_callback.unwrap().send(Ok(stream));
                 accept_callback = None;
             }
-
-            // Aggregate flow control and channel depth metrics across all streams.
-            let mut total_recv_window: u64 = 0;
-            let mut total_send_window: u64 = 0;
-            let mut total_pending_bytes: u64 = 0;
-            for entry in stream_entries.values() {
-                total_recv_window += entry.recv_window as u64;
-                total_send_window += entry.flow.available() as u64;
-                total_pending_bytes += entry.pending_bytes;
-            }
-            metrics::gauge!("mux.stream.total_recv_window").set(total_recv_window as f64);
-            metrics::gauge!("mux.stream.total_send_window").set(total_send_window as f64);
-            metrics::gauge!("mux.stream.total_pending_bytes").set(total_pending_bytes as f64);
         }
 
         metrics::gauge!("mux.streams").decrement(stream_entries.len() as f64);

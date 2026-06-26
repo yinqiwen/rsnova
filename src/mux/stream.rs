@@ -1,7 +1,7 @@
 use crate::mux::metrics as mux_metrics;
 use crate::utils;
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::SinkExt;
 use futures::ready;
 use futures::task::AtomicWaker;
@@ -311,7 +311,13 @@ impl AsyncWrite for MuxStream {
             )));
         }
 
-        let data = Bytes::copy_from_slice(&buf[..allowed]);
+        // Avoid `Bytes::copy_from_slice`, which does a memset + memcpy.
+        // `BytesMut::with_capacity` then `extend_from_slice` only does the
+        // memcpy, skipping the zero-fill. `freeze()` is a zero-cost ownership
+        // transfer into `Bytes`.
+        let mut data = BytesMut::with_capacity(allowed);
+        data.extend_from_slice(&buf[..allowed]);
+        let data = data.freeze();
         let stream_id = self.id;
         match self
             .ev_writer

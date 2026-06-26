@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use crate::mux::event::{self, OpenStreamEvent, RegisterRequest, TunnelResult};
+use crate::mux::event::{self, OpenStreamEvent, RegisterRequest, StreamProto, TunnelResult};
 use crate::tunnel::stream::Stream;
 use crate::tunnel::tls_local::peek_sni_v2;
 use crate::tunnel::tunnel_registry::{
@@ -165,7 +165,7 @@ async fn handle_visitor(
             let mux_stream = mux_conn.open_stream().await?;
 
             let open_ev = OpenStreamEvent {
-                proto: "tcp".to_string(),
+                proto: StreamProto::Tcp,
                 addr: local_addr,
             };
             let ev = event::new_reverse_open_stream_event(0, &open_ev)?;
@@ -185,7 +185,7 @@ async fn handle_visitor(
             let (mut recv_stream, mut send_stream) = stream.split();
 
             let open_ev = OpenStreamEvent {
-                proto: "tcp".to_string(),
+                proto: StreamProto::Tcp,
                 addr: local_addr,
             };
             let ev = event::new_reverse_open_stream_event(0, &open_ev)?;

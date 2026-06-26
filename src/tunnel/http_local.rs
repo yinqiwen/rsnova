@@ -13,8 +13,15 @@ const MAX_HTTP_HEADER_SIZE: usize = 64 * 1024; // 64KB
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn read_http_headers(inbound: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut buf: Vec<u8> = Vec::new();
-    let crlf2 = b"\r\n\r\n";
+    // Pre-allocate to avoid reallocation on the first few extends.
+    // Most HTTP request headers fit in 1-2 KB.
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let crlf2: &[u8] = b"\r\n\r\n";
+    // Scan only newly-appended bytes for `\r\n\r\n`. We track the index of the
+    // last byte we've already considered so we never re-scan the whole buffer
+    // (the previous `windows().position()` was O(n²) under slowloris-style
+    // 1-byte-at-a-time sends).
+    let mut scan_from: usize = 0;
     loop {
         let mut tmp_buf = [0; 4096];
         let n = match timeout(HTTP_HEADER_READ_TIMEOUT, inbound.read(&mut tmp_buf)).await {
@@ -29,9 +36,17 @@ async fn read_http_headers(inbound: &mut TcpStream) -> Result<Vec<u8>> {
         if buf.len() > MAX_HTTP_HEADER_SIZE {
             return Err(anyhow!("http header too large"));
         }
-        if let Some(_pos) = buf.windows(crlf2.len()).position(|window| window == crlf2) {
+        // Search for `\r\n\r\n` only in the tail we haven't scanned. Because the
+        // pattern can span the boundary, back up by `crlf2.len() - 1` bytes.
+        let start = scan_from.saturating_sub(crlf2.len() - 1);
+        if let Some(pos) = buf[start..]
+            .windows(crlf2.len())
+            .position(|window| window == crlf2)
+        {
+            let _absolute_pos = start + pos;
             return Ok(buf);
         }
+        scan_from = buf.len();
     }
 }
 

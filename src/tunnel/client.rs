@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::mux::event;
-use crate::mux::event::OpenStreamEvent;
+use crate::mux::event::{OpenStreamEvent, StreamProto};
 
 /// Bounded channel capacity for the proxy message queue.
 /// Limits memory growth under load via backpressure.
@@ -39,7 +39,7 @@ impl OpenStreamRequest {
             tcp_stream: Some(stream),
             udp_stream: None,
             event: OpenStreamEvent {
-                proto: String::from("tcp"),
+                proto: StreamProto::Tcp,
                 addr: target,
             },
             payload,
@@ -51,7 +51,7 @@ impl OpenStreamRequest {
             tcp_stream: None,
             udp_stream: Some(stream),
             event: OpenStreamEvent {
-                proto: String::from("udp"),
+                proto: StreamProto::Udp,
                 addr: target,
             },
             payload,
@@ -258,38 +258,35 @@ impl<T: MuxConnection> MuxClient<T> {
 
     /// Pick an Active connection and call `open_stream` on it.
     ///
-    /// The pool lock is held only long enough to inspect one slot and clone its
-    /// shared conn_ref. Busy conn_ref locks are skipped with `try_lock`; if all
-    /// usable candidates are busy, we await one busy candidate as a fallback.
+    /// The pool lock is held only once per call — long enough to snapshot the
+    /// list of `(conn_ref, state)` pairs. The snapshot is then iterated without
+    /// further mutex contention. Busy conn_ref locks are skipped with
+    /// `try_lock`; if all usable candidates are busy, we await one busy
+    /// candidate as a fallback.
     pub(crate) async fn pick_and_open(&self) -> anyhow::Result<(T::SendStream, T::RecvStream)> {
-        let len = {
+        // Single lock to snapshot the slot list. Each `conn_ref` is an
+        // `Arc<Mutex<Option<T>>>`, so cloning it is cheap (refcount bump).
+        let snapshot: Vec<(Arc<tokio::sync::Mutex<Option<T>>>, SlotState)> = {
             let guard = self.conns.lock().await;
-            let len = guard.len();
-            if len == 0 {
-                tracing::error!("no available stream: pool is empty");
-                return Err(anyhow!("no available stream"));
-            }
-            len
+            guard
+                .iter()
+                .map(|e| (e.conn.clone(), e.state))
+                .collect::<Vec<_>>()
         };
+        let len = snapshot.len();
+        if len == 0 {
+            tracing::error!("no available stream: pool is empty");
+            return Err(anyhow!("no available stream"));
+        }
 
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let mut fallback_busy_conn = None;
 
         for offset in 0..len {
-            let conn_ref = {
-                let guard = self.conns.lock().await;
-                if guard.is_empty() {
-                    None
-                } else {
-                    let slot = (start + offset) % guard.len();
-                    let entry = &guard[slot];
-                    (entry.state == SlotState::Active).then(|| entry.conn.clone())
-                }
-            };
-
-            let Some(conn_ref) = conn_ref else {
+            let (conn_ref, state) = &snapshot[(start + offset) % len];
+            if *state != SlotState::Active {
                 continue;
-            };
+            }
 
             if let Ok(mut conn_guard) = conn_ref.try_lock() {
                 let Some(conn) = conn_guard.as_mut() else {
@@ -302,7 +299,7 @@ impl<T: MuxConnection> MuxClient<T> {
             }
 
             if fallback_busy_conn.is_none() {
-                fallback_busy_conn = Some(conn_ref);
+                fallback_busy_conn = Some(conn_ref.clone());
             }
         }
 

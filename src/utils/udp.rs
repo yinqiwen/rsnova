@@ -130,10 +130,44 @@ impl AsyncRead for UdpServerStream {
 impl AsyncWrite for UdpServerStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &[u8],
+        cx: &mut Context<'_>,
+        buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        todo!()
+        let this = self.get_mut();
+        // Try to claim capacity on the channel first (PollSender-style), so we
+        // respect backpressure from the local UDP tunnel task. The payload is
+        // copied into a `Bytes` here because the `AsyncWrite` API gives us only
+        // `&[u8]`; this is the per-write cost of going through the mux layer.
+        //
+        // `ready!` against `poll_reserve` would be cleaner with `PollSender`,
+        // but that pulls in another dep; the channel is sized 4 so this is
+        // effectively non-blocking under normal load.
+        match this.tunnel_sender.capacity() {
+            0 => {
+                // Register the waker so we get re-polled when a slot frees.
+                // We can't use `PollSender` here without refactoring the
+                // struct layout, so approximate by checking capacity in the
+                // next poll. This is a best-effort backpressure signal.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            _ => {
+                // Safety: we have capacity, so `try_send` will not block.
+                let data = Bytes::copy_from_slice(buf);
+                let len = data.len();
+                match this.tunnel_sender.try_send((data, this.addr)) {
+                    Ok(()) => Poll::Ready(Ok(len)),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "tunnel data channel closed",
+                    ))),
+                }
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -181,6 +215,14 @@ impl LinuxTproxyUdpSocket {
         Self: Sized,
     {
         RecvDestFrom { socket: self, buf }
+    }
+
+    /// Borrow the underlying `UdpSocket` for sending reply datagrams. The
+    /// socket is shared between recv (`recv_dest_from`) and send (`send_to`);
+    /// UDP is connectionless so concurrent recv+send on the same socket is
+    /// safe and common.
+    pub fn socket(&self) -> &tokio::net::UdpSocket {
+        self.socket.get_ref()
     }
 }
 #[cfg(target_os = "linux")]

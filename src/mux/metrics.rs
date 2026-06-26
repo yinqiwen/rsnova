@@ -91,6 +91,7 @@ pub(crate) fn inc_ping_enqueue_failed(conn_id: u32) {
     metrics::counter!("mux.ping.enqueue_failed", "conn_id" => conn(conn_id)).increment(1);
 }
 
+#[allow(dead_code)]
 pub(crate) fn inc_client_open_stream_failed() {
     metrics::counter!("client.open_stream.failed").increment(1);
 }
