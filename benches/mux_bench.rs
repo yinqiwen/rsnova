@@ -43,7 +43,6 @@ fn bench_mux_stream_write(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.to_async(&rt()).iter(|| {
-                let size = size;
                 async move {
                     let (a, b) = tokio::io::duplex(8 * 1024 * 1024);
                     let (a_r, a_w) = tokio::io::split(a);
@@ -164,7 +163,6 @@ fn bench_connection_duplex(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.to_async(&rt()).iter(|| {
-                let size = size;
                 async move {
                     let (a, b) = tokio::io::duplex(8 * 1024 * 1024);
                     let (a_r, a_w) = tokio::io::split(a);

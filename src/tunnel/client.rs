@@ -919,6 +919,7 @@ mod tests {
             }
         }
 
+        #[allow(clippy::manual_async_fn)]
         fn connect(
             &mut self,
             _url: &Url,
@@ -950,6 +951,7 @@ mod tests {
             }
         }
 
+        #[allow(clippy::manual_async_fn)]
         fn accept_stream(
             &mut self,
         ) -> impl std::future::Future<Output = anyhow::Result<(Self::SendStream, Self::RecvStream)>> + Send
@@ -971,6 +973,7 @@ mod tests {
             0
         }
 
+        #[allow(clippy::manual_async_fn)]
         fn reconnect_with(
             _params: &ConnParams,
         ) -> impl std::future::Future<Output = anyhow::Result<Self>> + Send {

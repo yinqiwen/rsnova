@@ -434,18 +434,6 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 }
 
 extern crate cfg_if;
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_mux_stream_window_rejects_out_of_range_values() {
-        assert!(validate_mux_stream_window(mux::MIN_STREAM_WINDOW - 1).is_err());
-        assert!(validate_mux_stream_window(mux::MIN_STREAM_WINDOW).is_ok());
-        assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW).is_ok());
-        assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW + 1).is_err());
-    }
-}
 
 fn main() {
     // Install rustls crypto provider (required for rustls 0.23+)
@@ -500,4 +488,17 @@ fn main() {
             std::process::exit(1);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_mux_stream_window_rejects_out_of_range_values() {
+        assert!(validate_mux_stream_window(mux::MIN_STREAM_WINDOW - 1).is_err());
+        assert!(validate_mux_stream_window(mux::MIN_STREAM_WINDOW).is_ok());
+        assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW).is_ok());
+        assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW + 1).is_err());
+    }
 }

@@ -173,6 +173,92 @@ impl MuxStream {
             self.consumed_since_update = 0;
         }
     }
+
+    /// Zero-copy write path for callers that already hold a `Bytes`.
+///
+/// The standard `AsyncWrite::poll_write` takes `&[u8]`, forcing an internal
+/// `extend_from_slice` copy into an owned `BytesMut` before the bytes can
+/// travel across the dispatcher's mpsc channel. When a caller (e.g. the
+/// relay loop in `tunnel::stream`) has read data into a `BytesMut` and
+/// `split_to`/`freeze`d it into a `Bytes`, this method skips that copy
+/// entirely — the `Bytes` is moved straight into the `Control::StreamData`
+/// message with only a refcount bump.
+///
+/// Returns `Poll::Ready(Ok(()))` when the full `data` has been accepted
+/// (subject to flow-control window). If the window can't cover all of
+/// `data.len()`, returns `Pending` after registering the waker; the caller
+/// should retry the same `data` when woken. If `data.len()` exceeds the
+/// initial stream window the caller must split it first.
+pub fn poll_write_bytes(
+    &mut self,
+    cx: &mut Context<'_>,
+    data: Bytes,
+) -> Poll<Result<(), std::io::Error>> {
+    if self.close_by_remote || self.flow.is_closed() {
+        return Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "stream closed",
+        )));
+    }
+    let len = data.len();
+    if len == 0 {
+        return Poll::Ready(Ok(()));
+    }
+
+    if self.flow.available() < len as u32 {
+        self.flow.register_waker(cx.waker());
+        if self.flow.is_closed() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stream closed",
+            )));
+        }
+        if self.flow.available() < len as u32 {
+            mux_metrics::inc_write_window_wait(self.conn_id);
+            return Poll::Pending;
+        }
+    }
+
+    match self.ev_writer.poll_reserve(cx) {
+        Poll::Pending => {
+            mux_metrics::inc_poll_reserve_wait(self.conn_id);
+            self.flow.register_waker(cx.waker());
+            if self.flow.is_closed() {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stream closed",
+                )));
+            }
+            return Poll::Pending;
+        }
+        Poll::Ready(Err(e)) => {
+            return Poll::Ready(Err(utils::make_io_error(&e.to_string())));
+        }
+        Poll::Ready(Ok(_)) => {}
+    }
+
+    let consumed = self.flow.try_consume(len);
+    if consumed < len {
+        // Window shrank between the check above and try_consume. Abort the
+        // reservation and let the caller retry — partial writes via this
+        // path would require the caller to split the Bytes, which loses the
+        // zero-copy benefit.
+        if self.ev_writer.abort_send() {
+            mux_metrics::inc_poll_reserve_aborted(self.conn_id);
+        }
+        self.flow.register_waker(cx.waker());
+        return Poll::Pending;
+    }
+
+    let stream_id = self.id;
+    match self
+        .ev_writer
+        .send_item(Control::StreamData(stream_id, data, false))
+    {
+        Ok(()) => Poll::Ready(Ok(())),
+        Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
+    }
+}
 }
 
 impl AsyncRead for MuxStream {
