@@ -65,6 +65,14 @@ pub struct Connection {
     window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
     #[allow(dead_code)]
     active_stream_count: Arc<AtomicUsize>,
+    /// Handle to the spawned dispatcher task. Aborted on Drop as
+    /// defense-in-depth: `Connection::close()` is best-effort
+    /// (`try_send(Control::Close)`), which can silently fail if the channel
+    /// is full or the dispatcher has already exited. Without abort, a
+    /// half-open TCP link (peer never sends FIN) keeps the dispatcher's
+    /// `read_connection_fut` blocked forever, leaking the socket FD.
+    #[allow(dead_code)]
+    dispatch_task: tokio::task::JoinHandle<()>,
 }
 
 pub enum Mode {
@@ -91,7 +99,7 @@ impl Connection {
         let wus = window_update_sender.clone();
         let active_stream_count = Arc::new(AtomicUsize::new(0));
         let active_stream_count_for_dispatcher = active_stream_count.clone();
-        tokio::spawn(async move {
+        let dispatch_task = tokio::spawn(async move {
             handle_mux_connection(
                 id,
                 r,
@@ -116,6 +124,7 @@ impl Connection {
                 ping_nonce_seed: AtomicU32::new(1),
                 window_update_sender,
                 active_stream_count,
+                dispatch_task,
             },
             Mode::Server => Self {
                 conn_id: id,
@@ -126,6 +135,7 @@ impl Connection {
                 ping_nonce_seed: AtomicU32::new(1),
                 window_update_sender,
                 active_stream_count,
+                dispatch_task,
             },
         }
     }
@@ -204,6 +214,20 @@ impl Connection {
     #[allow(dead_code)]
     pub fn active_stream_count(&self) -> usize {
         self.active_stream_count.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Best-effort graceful shutdown via the control channel, then force
+        // the dispatcher task to exit. `close()` alone is insufficient: if the
+        // channel is full or the dispatcher is blocked on a read from a
+        // half-open peer, the Close message is lost or never consumed. Aborting
+        // the task guarantees the underlying socket is dropped and the FD
+        // released — critical for the reconnect path, which fires close()
+        // before replacing the slot.
+        let _ = self.ev_writer.try_send(Control::Close);
+        self.dispatch_task.abort();
     }
 }
 
@@ -550,7 +574,28 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             let _ = cb.send(Err(anyhow!("connection closed")));
         }
     };
-    tokio::join!(read_connection_fut, read_ctrl_fut);
+    // Either future exiting must cancel the other. Previously this was
+    // `tokio::join!`, which waits for BOTH futures — when `Connection::close()`
+    // sends `Control::Close`, `read_ctrl_fut` exits but `read_connection_fut`
+    // stays blocked on `event::read_event` waiting for peer data. If the peer
+    // never closes TCP (half-open link, the exact case ping detection is meant
+    // to catch), the dispatcher never exits and the socket FD leaks. Each
+    // reconnect leaked one FD until `os error 24` (EMFILE), which then surfaced
+    // as `failed to read certificate chain` (std::fs::read needs an FD).
+    tokio::pin!(read_connection_fut, read_ctrl_fut);
+    tokio::select! {
+        _ = &mut read_connection_fut => {
+            // Read side finished (peer closed or error). It already sent
+            // Control::Close before completing; drain the ctrl side so its
+            // cleanup (stream_entries drain, accept_callback notify) runs.
+            let _ = (&mut read_ctrl_fut).await;
+        }
+        _ = &mut read_ctrl_fut => {
+            // Ctrl side finished (Control::Close received, or all senders
+            // dropped). Dropping read_connection_fut releases `r: R` and the
+            // underlying TCP/TLS socket — no FD leak.
+        }
+    }
 }
 
 #[cfg(test)]
@@ -624,6 +669,46 @@ mod tests {
             "returned too late: {:?}",
             elapsed
         );
+    }
+
+    /// Regression test for the FD-leak bug: after `close()` (or Drop), the
+    /// dispatcher task must exit promptly even when the peer never closes the
+    /// TCP link — exactly the half-open case ping detection surfaces.
+    ///
+    /// Before the fix, `tokio::join!` waited for BOTH `read_connection_fut`
+    /// (blocked on peer read) and `read_ctrl_fut` (exited on Close), so the
+    /// dispatcher hung forever and the socket FD leaked. With `select!` +
+    /// `Drop`-abort, the task exits as soon as either side finishes.
+    #[tokio::test]
+    async fn dispatcher_exits_after_close_even_when_peer_silent() {
+        use tokio::io::AsyncReadExt;
+        // duplex whose peer end we keep alive but never service — simulates
+        // a half-open TCP link where the peer never sends FIN.
+        let (a, mut b) = tokio::io::duplex(8192);
+        let (a_r, a_w) = tokio::io::split(a);
+
+        let conn =
+            Connection::new_with_stream_window(a_r, a_w, Mode::Client, 0, INITIAL_STREAM_WINDOW);
+        // Signal the dispatcher to exit. With join! this would leave
+        // read_connection_fut blocked; with select! + Drop-abort the task
+        // must terminate and release the socket.
+        conn.close();
+        drop(conn);
+
+        // The peer read returns 0 (EOF) once the dispatcher's `a` side is
+        // dropped. Give the runtime a chance to schedule the abort/cleanup.
+        let mut buf = [0u8; 1];
+        let read_result = tokio::time::timeout(Duration::from_secs(2), b.read(&mut buf)).await;
+        assert!(
+            read_result.is_ok(),
+            "peer read did not complete within 2s; dispatcher likely still holds the socket (FD leak)"
+        );
+        let n = read_result.unwrap().expect("read should not error");
+        assert_eq!(
+            n, 0,
+            "expected EOF (n=0) after dispatcher exit, got n={n}"
+        );
+        let _ = b;
     }
 
     /// End-to-end flow-control test:

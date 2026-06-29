@@ -9,6 +9,25 @@ pub struct MemoryInfo {
     pub peak_rss_bytes: u64,
 }
 
+/// Number of currently open file descriptors for this process.
+///
+/// On Linux this counts entries in `/proc/self/fd` — the actual count of open
+/// FDs, not the size of the fd table. Used to surface FD leaks (the kind that
+/// leads to `os error 24` / EMFILE and cascading failures such as cert reads
+/// failing during reconnect).
+#[cfg(target_os = "linux")]
+pub fn get_open_fd_count() -> Option<u64> {
+    // readdir on /proc/self/fd. std::fs::read_dir is fine here — this runs at
+    // metrics scrape cadence (not hot path), and /proc/self/fd is a small
+    // synthetic directory.
+    Some(std::fs::read_dir("/proc/self/fd").ok()?.count() as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_open_fd_count() -> Option<u64> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 pub fn get_memory_info() -> Option<MemoryInfo> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -96,6 +115,10 @@ pub fn format_metrics(registry: &MetricsRegistry) -> String {
             mem.peak_rss_bytes,
             mem.peak_rss_bytes / 1024 / 1024
         ));
+    }
+    if let Some(fds) = get_open_fd_count() {
+        metrics_info.push_str("Process:\n");
+        metrics_info.push_str(&format!("  open_fds: {}\n", fds));
     }
     metrics_info.push_str("Gauges:\n");
     registry.visit_gauges(|name, gauge| {
