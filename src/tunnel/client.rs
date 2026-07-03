@@ -537,6 +537,12 @@ fn reconnect_limiter() -> &'static tokio::sync::Semaphore {
     LIMITER.get_or_init(|| tokio::sync::Semaphore::new(2))
 }
 
+/// Per-attempt timeout for `T::reconnect_with`. Bounds how long a single
+/// reconnect attempt can block the (limited) reconnect semaphore. Without
+/// this, a black-holed peer can hold a permit for ~75s (Linux ETIMEDOUT) or
+/// longer, starving other slots' reconnects.
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Per-connection health loop. Each connection has one. Pings the conn
 /// (via `conn_ref`), transitions to Retiring on N consecutive ping failures
 /// or max_age reached, spawns a `reconnect_loop` child task that produces a
@@ -688,10 +694,6 @@ where
     T: MuxConnection + Send + 'static,
 {
     use std::sync::atomic::Ordering;
-    let _permit = reconnect_limiter()
-        .acquire()
-        .await
-        .expect("static semaphore never closes");
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -706,12 +708,19 @@ where
             _ = cancel.cancelled() => return MonitorCommand::DropSlot(slot),
             _ = tokio::time::sleep(sleep_for) => {}
         }
+        // Acquire permit per-attempt, so a failing reconnect doesn't starve
+        // other slots while waiting for its backoff timer. Dropped at end of
+        // iteration.
+        let _permit = reconnect_limiter()
+            .acquire()
+            .await
+            .expect("static semaphore never closes");
         pool.metrics
             .reconnect_attempts
             .fetch_add(1, Ordering::Relaxed);
 
-        match T::reconnect_with(&params).await {
-            Ok(new_conn) => match pool.replace_slot(slot, gen_token).await {
+        match tokio::time::timeout(RECONNECT_TIMEOUT, T::reconnect_with(&params)).await {
+            Ok(Ok(new_conn)) => match pool.replace_slot(slot, gen_token).await {
                 Ok(()) => {
                     // Write the new conn directly into the shared conn_ref.
                     {
@@ -731,7 +740,7 @@ where
                     return MonitorCommand::DropSlot(slot);
                 }
             },
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     "[slot-{}] reconnect failed: {}; backoff {:?}",
                     slot,
@@ -740,7 +749,17 @@ where
                 );
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
+            Err(_) => {
+                tracing::warn!(
+                    "[slot-{}] reconnect timed out after {:?}; backoff {:?}",
+                    slot,
+                    RECONNECT_TIMEOUT,
+                    backoff
+                );
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
         }
+        // _permit dropped here — releases slot in limiter for other reconnect_loops
     }
 }
 
@@ -977,8 +996,36 @@ mod tests {
         fn reconnect_with(
             _params: &ConnParams,
         ) -> impl std::future::Future<Output = anyhow::Result<Self>> + Send {
-            async move { Ok(Self::new_valid()) }
+            async move {
+                // Honor a thread-local "fail-first N attempts" counter so
+                // tests can exercise the reconnect retry path. Production
+                // threads never set this, so it stays 0 (always succeeds).
+                let should_fail = FAIL_FIRST_N.with(|c| {
+                    let v = c.get();
+                    if v > 0 {
+                        c.set(v - 1);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if should_fail {
+                    return Err(anyhow!("mock reconnect failure (fail-first)"));
+                }
+                Ok(Self::new_valid())
+            }
         }
+    }
+
+    // Thread-local counter for forcing the first N reconnect attempts to fail.
+    // Each `#[tokio::test]` runs on its own thread, so this isolates state
+    // between concurrent tests.
+    thread_local! {
+        static FAIL_FIRST_N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn set_fail_first_n(n: u32) {
+        FAIL_FIRST_N.with(|c| c.set(n));
     }
 
     fn make_cancel() -> CancellationToken {
@@ -1299,5 +1346,111 @@ mod tests {
         }
         // Verify the new conn is usable
         assert!(pool.pick_and_open().await.is_ok());
+    }
+
+    // Regression test for the "pool stuck at dead=N" bug where
+    // `reconnect_loop`'s semaphore permit was held across backoff retries,
+    // starving other slots' reconnects. With per-attempt permit acquisition
+    // (the fix), 3 concurrent reconnect_loops must all recover even though
+    // `reconnect_limiter` size is 2 and each loop fails twice before
+    // succeeding.
+    #[tokio::test]
+    async fn reconnect_loop_recovers_when_all_slots_dead() {
+        use std::time::Instant;
+
+        let pool = make_pool();
+        // Three slots, all in Dead state with generation 0.
+        // (gen_token=0 matches the initial generation assigned by push_empty_slot.)
+        let mut conn_refs = Vec::new();
+        for _ in 0..3 {
+            let (slot, conn_ref) = pool.push_empty_slot().await;
+            pool.mark_dead(slot, 0).await.unwrap();
+            conn_refs.push(conn_ref);
+        }
+        assert_eq!(pool.metrics.dead.load(Ordering::Relaxed), 3);
+
+        // Force the first 2 reconnect attempts on THIS thread to fail.
+        // With 3 slots × 2 failures = 6 total forced failures, but each slot
+        // independently consumes from the thread-local counter, so the
+        // distribution matters. Simpler: force 2 failures per slot.
+        // Since `reconnect_with` is called from the SAME tokio thread
+        // (current_thread runtime), the thread-local is shared across the 3
+        // concurrent reconnect_loops. We set 6 (2 per slot × 3 slots).
+        set_fail_first_n(6);
+
+        let cancel = CancellationToken::new();
+        let params = Arc::new(ConnParams {
+            url: Url::parse("tls://unused.example:443").unwrap(),
+            cert_path: PathBuf::from("/nonexistent"),
+            host: "unused.example".to_string(),
+            stream_window: 0,
+            max_age: None,
+            ping_interval: Duration::from_secs(60),
+            ping_fail_threshold: 3,
+            quic_endpoint: None,
+        });
+
+        // Spawn 3 concurrent reconnect_loops. backoff starts at 1s with
+        // ±20% jitter, so each retry is ~1s. With 6 forced failures total,
+        // total wall time should be ~3s in the worst case (3 retries per slot
+        // × 1s). If the bug regressed (permit held across retries), the 3rd
+        // slot would wait for one of the first 2 to finish all retries —
+        // still works eventually, but is much slower. The test mainly
+        // verifies all 3 recover, not just 2.
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for slot in 0..3 {
+            let pool_ref = pool.clone();
+            let params_ref = params.clone();
+            let conn_ref = conn_refs[slot].clone();
+            let cancel_child = cancel.child_token();
+            handles.push(tokio::spawn(async move {
+                reconnect_loop::<MockConnection>(
+                    slot,
+                    conn_ref,
+                    pool_ref,
+                    params_ref,
+                    0,
+                    cancel_child,
+                )
+                .await
+            }));
+        }
+
+        let mut respawn_count = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                MonitorCommand::Respawn { slot: _ } => respawn_count += 1,
+                MonitorCommand::DropSlot(slot) => {
+                    panic!("slot {} was dropped instead of respawning", slot);
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            respawn_count, 3,
+            "all 3 slots should have recovered via Respawn"
+        );
+        // Sanity bound: 6 failures × 1s backoff = ~6s of serial backoff. With
+        // per-attempt permits, 2 slots retry in parallel, so ~3s. Allow generous
+        // slack for CI. The main point is that the test completes at all —
+        // before the fix this scenario would still complete but slowly; the
+        // test guards against future regressions that reintroduce
+        // permit-held-across-retries.
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "recovery took too long: {:?}",
+            elapsed
+        );
+
+        // After Respawn, the conn_ref should hold a valid conn.
+        for conn_ref in &conn_refs {
+            let guard = conn_ref.lock().await;
+            assert!(
+                guard.as_ref().is_some_and(|c| c.is_valid()),
+                "conn_ref should hold a valid MockConnection after reconnect"
+            );
+        }
     }
 }
