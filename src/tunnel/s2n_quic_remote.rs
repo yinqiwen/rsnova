@@ -76,6 +76,7 @@ pub async fn start_quic_remote_server(
                     let _ =
                         event::write_event(&mut send, event::new_auth_ack_event(0, &ack).unwrap())
                             .await;
+                    let _ = send.flush().await;
                     drop(recv);
                     drop(send);
 
@@ -184,6 +185,12 @@ pub async fn start_quic_remote_server(
                     let _ =
                         event::write_event(&mut send, event::new_auth_ack_event(0, &ack).unwrap())
                             .await;
+                    // Flush so the client receives the ACK before this scope
+                    // ends and `send`/`recv` drop. Without flushing the ACK
+                    // can be lost when the QUIC stream tears down, leaving the
+                    // client to surface a misleading stream-closed error instead
+                    // of the real registration result.
+                    let _ = send.flush().await;
                     drop(recv);
                     drop(send);
                 }

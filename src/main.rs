@@ -243,13 +243,16 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
         Vec::new()
     };
 
-    let tunnel_port_ranges = if !args.tunnel_port_range.is_empty() {
-        Some(tunnel::tunnel_config::parse_port_range(
-            &args.tunnel_port_range,
-        )?)
+    // Server-side tunnel port allow-list. Defaults to all non-privileged ports
+    // (1024-65535) so a plain `--role server` enables tunnel registration
+    // without requiring --tunnel-port-range. Explicit --tunnel-port-range still
+    // restricts further (e.g. "8000-9000,10000-10100"). Privileged ports (<1024)
+    // are always rejected by parse_port_range regardless of the default.
+    let tunnel_port_ranges = Some(if args.tunnel_port_range.is_empty() {
+        tunnel::tunnel_config::parse_port_range("1024-65535")?
     } else {
-        None
-    };
+        tunnel::tunnel_config::parse_port_range(&args.tunnel_port_range)?
+    });
 
     let recorder = utils::MetricsLogRecorder::new();
     let metrics_registry = recorder.get_registry();
@@ -500,5 +503,27 @@ mod tests {
         assert!(validate_mux_stream_window(mux::MIN_STREAM_WINDOW).is_ok());
         assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW).is_ok());
         assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW + 1).is_err());
+    }
+
+    /// Server-side tunnel registration must be enabled by default so that
+    /// `--role server` (without --tunnel-port-range) accepts tunnel
+    /// registrations. The default allow-list is all non-privileged ports
+    /// (1024-65535); this verifies a typical client-requested port (15721) is
+    /// permitted while a privileged port (<1024) is rejected. Regression guard
+    /// for the "tunnel not enabled on server" reconnect loop.
+    #[test]
+    fn default_tunnel_port_range_allows_nonprivileged_ports() {
+        let default_range = tunnel::tunnel_config::parse_port_range("1024-65535").unwrap();
+        use tunnel::tunnel_config::is_port_allowed;
+        // A client `--tunnel 15721` requests remote_port=15721 — must be allowed.
+        assert!(
+            is_port_allowed(15721, &default_range),
+            "default range must allow a typical non-privileged tunnel port"
+        );
+        assert!(is_port_allowed(1024, &default_range));
+        assert!(is_port_allowed(65535, &default_range));
+        // Privileged ports are never permitted even with the wide default.
+        assert!(!is_port_allowed(80, &default_range));
+        assert!(!is_port_allowed(1023, &default_range));
     }
 }

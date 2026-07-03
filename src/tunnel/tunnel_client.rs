@@ -317,3 +317,64 @@ pub fn handle_register_ack(ack: &RegisterAck) -> Result<()> {
 pub fn next_tunnel_conn_seed() -> u64 {
     TUNNEL_CONN_SEED.fetch_add(1, Ordering::Relaxed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mux::event::{RegisterAck, TunnelResult};
+
+    /// When every registration fails, `handle_register_ack` returns an error
+    /// whose text is the aggregate "all tunnel registrations failed" — NOT a
+    /// generic stream error like "close by remote". The server previously
+    /// dropped its mux::Connection right after writing the (unflushed) failure
+    /// ACK, racing the teardown so the client sometimes lost the ACK and
+    /// reported "close by remote" instead of reaching `handle_register_ack`
+    /// at all. This test pins the client-side contract: with the server flush
+    /// fix in place, the client reliably decodes the RegisterAck and surfaces
+    /// the aggregate registration-failure error rather than a stream teardown.
+    #[test]
+    fn handle_register_ack_surfaces_registration_failure_not_close_by_remote() {
+        let ack = RegisterAck {
+            results: vec![TunnelResult {
+                success: false,
+                remote_port: 15721,
+                sni: None,
+                error: Some("tunnel not enabled on server".to_string()),
+            }],
+        };
+        let err = handle_register_ack(&ack).expect_err("all-failed ack must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("registration"),
+            "expected an aggregate registration-failure error, got: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("close by remote"),
+            "must not surface a stream-teardown error"
+        );
+    }
+
+    /// A single successful registration is enough for the client to proceed —
+    /// failures among other entries are logged but do not block readiness.
+    #[test]
+    fn handle_register_ack_ok_when_any_entry_succeeds() {
+        let ack = RegisterAck {
+            results: vec![
+                TunnelResult {
+                    success: false,
+                    remote_port: 80,
+                    sni: None,
+                    error: Some("bind failed".to_string()),
+                },
+                TunnelResult {
+                    success: true,
+                    remote_port: 15721,
+                    sni: None,
+                    error: None,
+                },
+            ],
+        };
+        assert!(handle_register_ack(&ack).is_ok());
+    }
+}
