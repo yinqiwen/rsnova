@@ -231,6 +231,46 @@ impl Drop for Connection {
     }
 }
 
+/// Remove `stream_entries` whose MuxStream receiver has been dropped.
+///
+/// `MuxStream::drop` sends `Control::StreamClose` via `try_send`; when the
+/// control channel is saturated this fails silently and the `StreamEntry`
+/// stays in the map forever. Over time, leaked entries accumulate toward
+/// `MAX_MUX_STREAMS_PER_CONNECTION`, after which every new stream is rejected
+/// — a slow, connection-lifetime DoS. The dispatcher calls this on its
+/// periodic metrics tick to reclaim leaked slots.
+///
+/// Detection relies on `UnboundedSender::is_closed()`, which is `true` once
+/// the receiver (held by `MuxStream::inbound_reader`) is dropped. Entries
+/// still in active use keep their receiver alive and are left untouched.
+///
+/// Returns the number of entries removed. Updates `mux.streams` gauge and
+/// `active_stream_count` so admission checks reflect reality.
+fn reap_closed_stream_entries(
+    stream_entries: &mut HashMap<u32, StreamEntry>,
+    active_stream_count: &AtomicUsize,
+) -> usize {
+    let before = stream_entries.len();
+    stream_entries.retain(|sid, entry| {
+        if entry.sender.is_closed() {
+            entry.flow.close();
+            metrics::gauge!("mux.streams").decrement(1.0);
+            tracing::debug!(
+                "reaped stale stream entry (receiver dropped, StreamClose lost): sid={}",
+                sid
+            );
+            false
+        } else {
+            true
+        }
+    });
+    let reaped = before - stream_entries.len();
+    if reaped > 0 {
+        active_stream_count.fetch_sub(reaped, Ordering::Relaxed);
+    }
+    reaped
+}
+
 async fn apply_window_update<W: AsyncWrite + Unpin>(
     sid: u32,
     increment: u32,
@@ -382,6 +422,10 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 // Periodically aggregate flow-control gauges across all streams.
                 // Sampled at most once per second rather than once per frame.
                 _ = metrics_interval.tick() => {
+                    // Reap entries whose MuxStream dropped while the control
+                    // channel was saturated (StreamClose try_send failed).
+                    // See `reap_closed_stream_entries` for the leak this fixes.
+                    reap_closed_stream_entries(&mut stream_entries, &active_stream_count);
                     let mut total_recv_window: u64 = 0;
                     let mut total_send_window: u64 = 0;
                     let mut total_pending_bytes: u64 = 0;
@@ -613,6 +657,97 @@ mod tests {
             incoming_stream_rejection_reason(0, MAX_MUX_STREAMS_PER_CONNECTION),
             Some("active")
         );
+    }
+
+    /// `reap_closed_stream_entries` removes entries whose MuxStream receiver
+    /// has been dropped (sender.is_closed()), as happens when
+    /// `MuxStream::drop`'s `try_send(Control::StreamClose)` failed because the
+    /// control channel was full. Without reaping, these entries accumulate in
+    /// `stream_entries` forever, eventually hitting MAX_MUX_STREAMS_PER_CONNECTION
+    /// and rejecting all new streams (DoS).
+    #[test]
+    fn reap_removes_entries_whose_receiver_dropped() {
+        let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
+        let active_stream_count = Arc::new(AtomicUsize::new(0));
+
+        // Entry 0: live stream (receiver still held) — must NOT be reaped.
+        let (live_tx, _live_rx) = mpsc::unbounded_channel::<Option<Bytes>>();
+        entries.insert(
+            0,
+            StreamEntry {
+                sender: live_tx,
+                recv_window: INITIAL_STREAM_WINDOW,
+                flow: Arc::new(StreamFlow::new(INITIAL_STREAM_WINDOW)),
+                pending_bytes: 0,
+            },
+        );
+        active_stream_count.fetch_add(1, Ordering::Relaxed);
+
+        // Entry 1: dead stream (receiver already dropped) — must be reaped.
+        // This is exactly the state left behind when StreamClose's try_send
+        // failed: the MuxStream is gone but stream_entries still holds the entry.
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<Option<Bytes>>();
+        drop(dead_rx);
+        entries.insert(
+            1,
+            StreamEntry {
+                sender: dead_tx,
+                recv_window: INITIAL_STREAM_WINDOW,
+                flow: Arc::new(StreamFlow::new(INITIAL_STREAM_WINDOW)),
+                pending_bytes: 0,
+            },
+        );
+        active_stream_count.fetch_add(1, Ordering::Relaxed);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(active_stream_count.load(Ordering::Relaxed), 2);
+
+        let reaped = reap_closed_stream_entries(&mut entries, &active_stream_count);
+
+        assert_eq!(reaped, 1, "exactly the dead entry should be reaped");
+        assert!(entries.contains_key(&0), "live entry must remain");
+        assert!(!entries.contains_key(&1), "dead entry must be removed");
+        assert_eq!(
+            active_stream_count.load(Ordering::Relaxed),
+            1,
+            "active_stream_count must be decremented by reaped count"
+        );
+    }
+
+    /// A live entry whose receiver is then dropped between reap calls must be
+    /// removed on the next reap — verifies reaping is not a one-shot and the
+    /// dispatcher's periodic tick eventually clears leaked entries.
+    #[test]
+    fn reap_is_idempotent_and_progressive() {
+        let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
+        let active_stream_count = Arc::new(AtomicUsize::new(0));
+
+        let (tx, rx) = mpsc::unbounded_channel::<Option<Bytes>>();
+        entries.insert(
+            7,
+            StreamEntry {
+                sender: tx,
+                recv_window: INITIAL_STREAM_WINDOW,
+                flow: Arc::new(StreamFlow::new(INITIAL_STREAM_WINDOW)),
+                pending_bytes: 0,
+            },
+        );
+        active_stream_count.fetch_add(1, Ordering::Relaxed);
+
+        // First reap: still live, nothing removed.
+        assert_eq!(reap_closed_stream_entries(&mut entries, &active_stream_count), 0);
+        assert!(entries.contains_key(&7));
+
+        // Now drop the receiver — entry becomes reapable.
+        drop(rx);
+
+        // Second reap: removed.
+        assert_eq!(reap_closed_stream_entries(&mut entries, &active_stream_count), 1);
+        assert!(entries.is_empty());
+        assert_eq!(active_stream_count.load(Ordering::Relaxed), 0);
+
+        // Third reap on empty map: no-op, no panic.
+        assert_eq!(reap_closed_stream_entries(&mut entries, &active_stream_count), 0);
     }
 
     /// Two Connections wired back-to-back over `tokio::io::duplex` should

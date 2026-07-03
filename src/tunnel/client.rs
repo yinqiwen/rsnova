@@ -122,6 +122,31 @@ pub(crate) fn retirement_jitter_secs(index: usize) -> i64 {
     ((index.wrapping_mul(73)) % 201) as i64 - 100
 }
 
+/// Apply the slot-indexed retirement jitter to a base `max_age`.
+///
+/// A pool of N connections started together all reach `max_age` at the same
+/// instant. Without jitter, that concentrates N reconnects into one burst every
+/// `max_age` interval; with the 15s reconnect timeout and limited permits that
+/// burst is exactly the "all slots dead for 30s+" DoS. Adding
+/// `retirement_jitter_secs(slot)` spreads retirements across a 200s window so
+/// at most one slot retires at a time.
+///
+/// `None` (max_age disabled) stays `None` — jitter never forces retirement.
+/// Negative jitter is clamped so a small `max_age` can never go to zero.
+pub(crate) fn max_age_with_jitter(max_age: Option<Duration>, slot: usize) -> Option<Duration> {
+    let base = max_age?;
+    let jittered = if retirement_jitter_secs(slot) >= 0 {
+        base + Duration::from_secs(retirement_jitter_secs(slot) as u64)
+    } else {
+        // Clamp so a large negative jitter can't shrink the lifetime below 1s.
+        let sub = Duration::from_secs((-retirement_jitter_secs(slot)) as u64);
+        base.checked_sub(sub).unwrap_or(Duration::from_secs(1))
+    };
+    // Final floor: never shorter than 1s, even if base was tiny.
+    let jittered = jittered.max(Duration::from_secs(1));
+    Some(jittered)
+}
+
 pub(crate) fn validate_pool_config(
     count: usize,
     ping_interval_secs: u64,
@@ -204,10 +229,16 @@ pub(crate) struct PoolMetrics {
 /// Command sent from a `health_loop` / `reconnect_loop` to the `pool_monitor`.
 /// The monitor is the sole owner of the `JoinSet` of health tasks; on
 /// `Respawn` it spawns a new health task for the given slot.
+#[derive(Debug)]
 pub(crate) enum MonitorCommand {
     /// `reconnect_loop` succeeded and wrote the new conn into the slot's
     /// `conn_ref`. Monitor spawns a new health task for this slot.
     Respawn { slot: usize },
+    /// `reconnect_loop` panicked and the parent `health_loop` is sending this
+    /// on its way out so the monitor spawns a fresh health task that retries
+    /// reconnect. `panic_retries` carries the count across health-loop
+    /// instances so an infinite panic loop is eventually capped.
+    RespawnAfterPanic { slot: usize, panic_retries: u32 },
     /// Reconnect abandoned the slot (e.g. gen_token mismatch). Monitor logs
     /// and accepts the slot as permanently dead (pool shrinks by 1).
     DropSlot(usize),
@@ -531,10 +562,17 @@ pub(crate) async fn mux_client_loop<T>(
 
 /// Limits how many `reconnect_loop`s run concurrently across the process.
 /// Prevents thundering herd when many connections die at once.
+///
+/// Sized to cover a typical pool (default 5) with headroom so that when ALL
+/// slots die simultaneously — the exact scenario behind the "dead=N for 30s+"
+/// DoS — every slot can attempt its first reconnect promptly rather than
+/// queueing 2-at-a-time behind a 15s timeout each. With 2 permits and a 15s
+/// timeout, 5 dead slots took ~46s for all to attempt once; with 8 permits
+/// they all attempt in the first round.
 fn reconnect_limiter() -> &'static tokio::sync::Semaphore {
     use std::sync::OnceLock;
     static LIMITER: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    LIMITER.get_or_init(|| tokio::sync::Semaphore::new(2))
+    LIMITER.get_or_init(|| tokio::sync::Semaphore::new(8))
 }
 
 /// Per-attempt timeout for `T::reconnect_with`. Bounds how long a single
@@ -560,13 +598,15 @@ pub(crate) async fn health_loop<T>(
     params: Arc<ConnParams>,
     cancel: tokio_util::sync::CancellationToken,
     monitor_tx: mpsc::Sender<MonitorCommand>,
+    panic_retries: u32,
 ) where
     T: MuxConnection + Send + 'static,
 {
     let gen_token = pool.generation(slot).await;
     let mut is_retiring = false;
     let mut consecutive_fails: u32 = 0;
-    let max_age_deadline = params.max_age.map(|d| tokio::time::Instant::now() + d);
+    let max_age_deadline = max_age_with_jitter(params.max_age, slot)
+        .map(|d| tokio::time::Instant::now() + d);
 
     // Per-slot state for the in-flight reconnect child.
     let mut reconnect_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -666,8 +706,42 @@ pub(crate) async fn health_loop<T>(
                         if pool.mark_dead(slot, gen_token).await.is_err() {
                             return;
                         }
-                        if let Some(h) = reconnect_handle.take() {
-                            let _ = h.await;
+                        // Await the reconnect child. A successful child has
+                        // already sent its own MonitorCommand (Respawn or
+                        // DropSlot). But if the child *panicked*, it never got
+                        // to send anything — and without a remedy here the slot
+                        // would be orphaned Dead forever (DoS until process
+                        // restart). On panic we send Respawn ourselves so the
+                        // monitor spawns a fresh health task that retries
+                        // reconnect, up to a bounded number of attempts to avoid
+                        // an infinite panic loop.
+                        if let Some(h) = reconnect_handle.take()
+                            && let Err(_join_err) = h.await
+                        {
+                            const MAX_RECONNECT_PANIC_RETRIES: u32 = 3;
+                            if panic_retries < MAX_RECONNECT_PANIC_RETRIES {
+                                tracing::warn!(
+                                    "[slot-{}] reconnect_loop panicked; retry {}/{}",
+                                    slot,
+                                    panic_retries + 1,
+                                    MAX_RECONNECT_PANIC_RETRIES
+                                );
+                                let _ = monitor_tx
+                                    .send(MonitorCommand::RespawnAfterPanic {
+                                        slot,
+                                        panic_retries: panic_retries + 1,
+                                    })
+                                    .await;
+                            } else {
+                                tracing::error!(
+                                    "[slot-{}] reconnect_loop panicked {} times; dropping slot",
+                                    slot,
+                                    MAX_RECONNECT_PANIC_RETRIES
+                                );
+                                let _ = monitor_tx
+                                    .send(MonitorCommand::DropSlot(slot))
+                                    .await;
+                            }
                         }
                         return;
                     }
@@ -696,18 +770,27 @@ where
     use std::sync::atomic::Ordering;
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
+    // Skip the pre-reconnect sleep on the very first attempt. A freshly-dead
+    // slot should try to reconnect immediately — if the remote is already
+    // reachable (the common case for a transient blip), the slot recovers in
+    // ~1 RTT instead of `backoff` (1s). Backoff still applies to subsequent
+    // retries, bounding thundering-herd pressure on a sustained outage.
+    let mut first_attempt = true;
 
     loop {
         if cancel.is_cancelled() {
             return MonitorCommand::DropSlot(slot);
         }
-        // ±20% jitter
-        let jitter_factor = 0.8 + rand::random::<f64>() * 0.4;
-        let sleep_for = backoff.mul_f64(jitter_factor);
-        tokio::select! {
-            _ = cancel.cancelled() => return MonitorCommand::DropSlot(slot),
-            _ = tokio::time::sleep(sleep_for) => {}
+        if !first_attempt {
+            // ±20% jitter
+            let jitter_factor = 0.8 + rand::random::<f64>() * 0.4;
+            let sleep_for = backoff.mul_f64(jitter_factor);
+            tokio::select! {
+                _ = cancel.cancelled() => return MonitorCommand::DropSlot(slot),
+                _ = tokio::time::sleep(sleep_for) => {}
+            }
         }
+        first_attempt = false;
         // Acquire permit per-attempt, so a failing reconnect doesn't starve
         // other slots while waiting for its backoff timer. Dropped at end of
         // iteration.
@@ -763,6 +846,44 @@ where
     }
 }
 
+/// Spawn a `health_loop` for `slot` onto the monitor's `JoinSet`.
+///
+/// `panic_retries` carries the count of prior reconnect_loop panics across
+/// health-loop instances, so an infinite panic loop is eventually capped (see
+/// `MAX_RECONNECT_PANIC_RETRIES` inside `health_loop`). Fresh slots and
+/// successful-respawn slots pass 0; `RespawnAfterPanic` passes the prior count.
+async fn spawn_health_task<T>(
+    join_set: &mut tokio::task::JoinSet<(usize, Result<(), tokio::task::JoinError>)>,
+    pool: Arc<MuxClient<T>>,
+    params: Arc<ConnParams>,
+    cancel_child: tokio_util::sync::CancellationToken,
+    monitor_tx: mpsc::Sender<MonitorCommand>,
+    slot: usize,
+    panic_retries: u32,
+) where
+    T: MuxConnection + Send + 'static,
+{
+    // Clone the conn_ref from the slot entry for the new health_loop. The pool
+    // lock is held only briefly to snapshot the Arc.
+    let conn_ref = {
+        let guard = pool.conns.lock().await;
+        guard[slot].conn.clone()
+    };
+    join_set.spawn(async move {
+        let result = tokio::spawn(health_loop(
+            slot,
+            conn_ref,
+            pool,
+            params,
+            cancel_child,
+            monitor_tx,
+            panic_retries,
+        ))
+        .await;
+        (slot, result.map(|_| ()))
+    });
+}
+
 /// Pool-level supervisor. Owns the lifecycle of all `health_loop`s.
 ///
 /// Architecture:
@@ -795,22 +916,16 @@ pub(crate) async fn pool_monitor<T>(
             let mut guard = conn_ref.lock().await;
             *guard = Some(conn);
         }
-        let pool_ref = pool.clone();
-        let params_ref = params.clone();
-        let cancel_child = cancel.child_token();
-        let monitor_tx_clone = monitor_tx.clone();
-        join_set.spawn(async move {
-            let result = tokio::spawn(health_loop(
-                slot,
-                conn_ref,
-                pool_ref,
-                params_ref,
-                cancel_child,
-                monitor_tx_clone,
-            ))
-            .await;
-            (slot, result.map(|_| ()))
-        });
+        spawn_health_task(
+            &mut join_set,
+            pool.clone(),
+            params.clone(),
+            cancel.child_token(),
+            monitor_tx.clone(),
+            slot,
+            0,
+        )
+        .await;
     }
 
     loop {
@@ -822,27 +937,28 @@ pub(crate) async fn pool_monitor<T>(
             cmd = monitor_rx.recv() => {
                 match cmd {
                     Some(MonitorCommand::Respawn { slot }) => {
-                        // Clone the conn_ref from the slot entry for the new health_loop.
-                        let conn_ref = {
-                            let guard = pool.conns.lock().await;
-                            guard[slot].conn.clone()
-                        };
-                        let pool_ref = pool.clone();
-                        let params_ref = params.clone();
-                        let cancel_child = cancel.child_token();
-                        let monitor_tx_clone = monitor_tx.clone();
-                        join_set.spawn(async move {
-                            let result = tokio::spawn(health_loop(
-                                slot,
-                                conn_ref,
-                                pool_ref,
-                                params_ref,
-                                cancel_child,
-                                monitor_tx_clone,
-                            ))
-                            .await;
-                            (slot, result.map(|_| ()))
-                        });
+                        spawn_health_task(
+                            &mut join_set,
+                            pool.clone(),
+                            params.clone(),
+                            cancel.child_token(),
+                            monitor_tx.clone(),
+                            slot,
+                            0,
+                        )
+                        .await;
+                    }
+                    Some(MonitorCommand::RespawnAfterPanic { slot, panic_retries }) => {
+                        spawn_health_task(
+                            &mut join_set,
+                            pool.clone(),
+                            params.clone(),
+                            cancel.child_token(),
+                            monitor_tx.clone(),
+                            slot,
+                            panic_retries,
+                        )
+                        .await;
                     }
                     Some(MonitorCommand::DropSlot(slot)) => {
                         tracing::warn!("[slot-{}] dropped by reconnect_loop (gen_token mismatch)", slot);
@@ -1012,6 +1128,21 @@ mod tests {
                 if should_fail {
                     return Err(anyhow!("mock reconnect failure (fail-first)"));
                 }
+                // Honor a thread-local "panic-first N attempts" counter so
+                // tests can exercise the reconnect_loop panic recovery path.
+                // Production threads never set this, so it stays 0.
+                let should_panic = PANIC_FIRST_N.with(|c| {
+                    let v = c.get();
+                    if v > 0 {
+                        c.set(v - 1);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if should_panic {
+                    panic!("mock reconnect panic (panic-first)");
+                }
                 Ok(Self::new_valid())
             }
         }
@@ -1022,10 +1153,15 @@ mod tests {
     // between concurrent tests.
     thread_local! {
         static FAIL_FIRST_N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PANIC_FIRST_N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     fn set_fail_first_n(n: u32) {
         FAIL_FIRST_N.with(|c| c.set(n));
+    }
+
+    fn set_panic_first_n(n: u32) {
+        PANIC_FIRST_N.with(|c| c.set(n));
     }
 
     fn make_cancel() -> CancellationToken {
@@ -1051,6 +1187,49 @@ mod tests {
             assert!(jitter >= -100);
             assert!(jitter <= 100);
         }
+    }
+
+    /// `max_age_with_jitter` must add the slot-indexed jitter to the base
+    /// max_age so simultaneous-start connections don't all retire at once.
+    /// Without this, a 5-connection pool started together hits max_age at the
+    /// same instant every `max_age` interval, concentrating 5 reconnects into
+    /// one burst and amplifying the recovery-latency DoS.
+    #[test]
+    fn max_age_with_jitter_adds_slot_indexed_jitter() {
+        let base = Duration::from_secs(1800);
+        for slot in 0..100usize {
+            let with_jitter = max_age_with_jitter(Some(base), slot).unwrap();
+            let expected = (base.as_secs() as i64 + retirement_jitter_secs(slot)).max(0) as u64;
+            assert_eq!(with_jitter, Duration::from_secs(expected));
+        }
+        // Two different slots must (almost always) get different deadlines —
+        // the whole point is spreading retirement. Same slot is stable.
+        assert_ne!(
+            max_age_with_jitter(Some(base), 0),
+            max_age_with_jitter(Some(base), 1),
+            "slots 0 and 1 should retire at different times"
+        );
+    }
+
+    /// Negative jitter must not produce a zero/negative lifetime: clamp at 1s.
+    #[test]
+    fn max_age_with_jitter_clamps_below_one_second() {
+        // max_age=10s, slot whose jitter is -100s would naively go negative.
+        let small = Duration::from_secs(10);
+        let slot = (0..1000).find(|&i| retirement_jitter_secs(i) < 0).unwrap();
+        let with_jitter = max_age_with_jitter(Some(small), slot).unwrap();
+        assert!(
+            with_jitter >= Duration::from_secs(1),
+            "clamped lifetime must be >= 1s, got {:?}",
+            with_jitter
+        );
+    }
+
+    /// `max_age_with_jitter(None, _)` returns None — disabled max_age stays
+    /// disabled; jitter never forces retirement on a no-max-age connection.
+    #[test]
+    fn max_age_with_jitter_none_stays_none() {
+        assert_eq!(max_age_with_jitter(None, 0), None);
     }
 
     #[test]
@@ -1351,9 +1530,10 @@ mod tests {
     // Regression test for the "pool stuck at dead=N" bug where
     // `reconnect_loop`'s semaphore permit was held across backoff retries,
     // starving other slots' reconnects. With per-attempt permit acquisition
-    // (the fix), 3 concurrent reconnect_loops must all recover even though
-    // `reconnect_limiter` size is 2 and each loop fails twice before
-    // succeeding.
+    // (the fix), 3 concurrent reconnect_loops must all recover even when each
+    // loop fails twice before succeeding. (The limiter is now sized at 8 — see
+    // `reconnect_limiter` — so this test never contends for permits; it
+    // guards the per-attempt-acquisition invariant itself.)
     #[tokio::test]
     async fn reconnect_loop_recovers_when_all_slots_dead() {
         use std::time::Instant;
@@ -1421,6 +1601,12 @@ mod tests {
         for h in handles {
             match h.await.unwrap() {
                 MonitorCommand::Respawn { slot: _ } => respawn_count += 1,
+                MonitorCommand::RespawnAfterPanic { slot, .. } => {
+                    panic!(
+                        "slot {} recovered via RespawnAfterPanic; this test drives reconnect_loop directly so no panic was expected",
+                        slot
+                    );
+                }
                 MonitorCommand::DropSlot(slot) => {
                     panic!("slot {} was dropped instead of respawning", slot);
                 }
@@ -1451,6 +1637,258 @@ mod tests {
                 guard.as_ref().is_some_and(|c| c.is_valid()),
                 "conn_ref should hold a valid MockConnection after reconnect"
             );
+        }
+    }
+
+    /// Regression for the "all slots dead for 30s+" DoS. When every slot is
+    /// Dead and the remote is immediately reachable, recovery must NOT be
+    /// gated behind a forced pre-reconnect sleep. The first reconnect attempt
+    /// should fire promptly so a transient outage clears in ~1 RTT rather than
+    /// `backoff` (1s) per slot. Before the fix, `reconnect_loop` unconditionally
+    /// slept `backoff` before the very first attempt, so even an instantly
+    /// reachable remote added ~1s of dead time per slot.
+    #[tokio::test]
+    async fn reconnect_loop_attempts_first_try_without_backoff_sleep() {
+        use std::time::Instant;
+
+        let pool = make_pool();
+        let mut conn_refs = Vec::new();
+        for _ in 0..3 {
+            let (slot, conn_ref) = pool.push_empty_slot().await;
+            pool.mark_dead(slot, 0).await.unwrap();
+            conn_refs.push(conn_ref);
+        }
+        // No fail-first: every reconnect succeeds on the first try.
+        set_fail_first_n(0);
+
+        let cancel = CancellationToken::new();
+        let params = Arc::new(ConnParams {
+            url: Url::parse("tls://unused.example:443").unwrap(),
+            cert_path: PathBuf::from("/nonexistent"),
+            host: "unused.example".to_string(),
+            stream_window: 0,
+            max_age: None,
+            ping_interval: Duration::from_secs(60),
+            ping_fail_threshold: 3,
+            quic_endpoint: None,
+        });
+
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for slot in 0..3 {
+            let pool_ref = pool.clone();
+            let params_ref = params.clone();
+            let conn_ref = conn_refs[slot].clone();
+            let cancel_child = cancel.child_token();
+            handles.push(tokio::spawn(async move {
+                reconnect_loop::<MockConnection>(
+                    slot,
+                    conn_ref,
+                    pool_ref,
+                    params_ref,
+                    0,
+                    cancel_child,
+                )
+                .await
+            }));
+        }
+        let mut respawn_count = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                MonitorCommand::Respawn { slot: _ } => respawn_count += 1,
+                other => panic!("unexpected command: {:?}", other),
+            }
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(respawn_count, 3, "all 3 slots should recover on first try");
+        // First-try success must be sub-second. If the pre-reconnect sleep
+        // regresses, this jumps past 1s. Generous upper bound for CI scheduling.
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "first-try recovery took {:?}; expected no pre-reconnect sleep",
+            elapsed
+        );
+    }
+
+    /// Regression for the "panic orphans a slot forever" bug. When
+    /// `reconnect_loop` panics inside `T::reconnect_with`, the parent
+    /// `health_loop` must NOT silently exit — doing so leaves the slot Dead
+    /// with no supervisor, and `pool_monitor` never respawns it (DoS until
+    /// process restart). The fix: `health_loop` treats a panicked
+    /// reconnect child as recoverable and sends `Respawn` so the monitor
+    /// spawns a fresh health task that retries reconnect.
+    #[tokio::test]
+    async fn health_loop_recovers_when_reconnect_panics() {
+        let pool = make_pool();
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        // Start with a conn whose ping will fail on the very next tick.
+        // valid=false → is_valid()=false → health_loop marks retiring+dead.
+        {
+            let mut guard = conn_ref.lock().await;
+            let conn = MockConnection::new_valid();
+            conn.valid.store(false, Ordering::Release);
+            *guard = Some(conn);
+        }
+
+        // Force the first reconnect attempt to PANIC. With the bug, health_loop
+        // would `let _ = h.await` (discarding the JoinError) and return without
+        // sending any MonitorCommand — orphaning the slot. With the fix it sends
+        // Respawn so the monitor retries.
+        set_panic_first_n(1);
+
+        let cancel = CancellationToken::new();
+        let params = Arc::new(ConnParams {
+            url: Url::parse("tls://unused.example:443").unwrap(),
+            cert_path: PathBuf::from("/nonexistent"),
+            host: "unused.example".to_string(),
+            stream_window: 0,
+            max_age: None,
+            ping_interval: Duration::from_secs(60),
+            ping_fail_threshold: 1,
+            quic_endpoint: None,
+        });
+
+        let (monitor_tx, mut monitor_rx) = mpsc::channel::<MonitorCommand>(8);
+
+        let pool_ref = pool.clone();
+        let conn_ref_clone = conn_ref.clone();
+        let cancel_child = cancel.child_token();
+        let handle = tokio::spawn(async move {
+            health_loop(
+                slot,
+                conn_ref_clone,
+                pool_ref,
+                params,
+                cancel_child,
+                monitor_tx,
+                0,
+            )
+            .await;
+        });
+
+        // Wait for health_loop to exit (it returns after the conn_dead path).
+        let _ = tokio::time::timeout(Duration::from_secs(15), handle).await;
+
+        // It must have sent a RespawnAfterPanic command — not exited silently
+        // leaving the slot orphaned.
+        let cmd = tokio::time::timeout(Duration::from_secs(2), monitor_rx.recv())
+            .await
+            .expect("timed out waiting for MonitorCommand")
+            .expect("monitor_tx dropped without sending a command");
+
+        match cmd {
+            MonitorCommand::RespawnAfterPanic { slot: s, panic_retries } => {
+                assert_eq!(s, slot, "RespawnAfterPanic should reference the original slot");
+                assert_eq!(
+                    panic_retries, 1,
+                    "panic_retries should advance to 1 after the first panic"
+                );
+            }
+            MonitorCommand::Respawn { slot: s } => {
+                panic!(
+                    "got Respawn({{slot={}}}); panic should be recoverable via RespawnAfterPanic, not a silent Respawn",
+                    s
+                );
+            }
+            MonitorCommand::DropSlot(s) => {
+                panic!("got DropSlot({}); panic should be recoverable, not permanent", s);
+            }
+        }
+    }
+
+    /// After `MAX_RECONNECT_PANIC_RETRIES` consecutive reconnect panics, the
+    /// slot must be dropped (DropSlot) instead of looping forever. This guards
+    /// against a persistently-panicking `reconnect_with` turning the pool into
+    /// an infinite respawn churn.
+    #[tokio::test]
+    async fn health_loop_drops_slot_after_max_panic_retries() {
+        const MAX_RECONNECT_PANIC_RETRIES: u32 = 3;
+
+        let pool = make_pool();
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        {
+            let mut guard = conn_ref.lock().await;
+            let conn = MockConnection::new_valid();
+            conn.valid.store(false, Ordering::Release);
+            *guard = Some(conn);
+        }
+
+        let cancel = CancellationToken::new();
+        let params = Arc::new(ConnParams {
+            url: Url::parse("tls://unused.example:443").unwrap(),
+            cert_path: PathBuf::from("/nonexistent"),
+            host: "unused.example".to_string(),
+            stream_window: 0,
+            max_age: None,
+            ping_interval: Duration::from_secs(60),
+            ping_fail_threshold: 1,
+            quic_endpoint: None,
+        });
+
+        // Drive successive health_loop instances exactly as pool_monitor would.
+        // Each iteration: panic-first is set, health_loop runs, sends a command.
+        let mut panic_retries = 0u32;
+        let mut final_cmd: Option<MonitorCommand> = None;
+        for _ in 0..(MAX_RECONNECT_PANIC_RETRIES + 2) {
+            set_panic_first_n(1);
+            let (monitor_tx, mut monitor_rx) = mpsc::channel::<MonitorCommand>(8);
+            let pool_ref = pool.clone();
+            let params_ref = params.clone();
+            let conn_ref_clone = conn_ref.clone();
+            let cancel_child = cancel.child_token();
+            let panic_retries_for_this_run = panic_retries;
+            let handle = tokio::spawn(async move {
+                health_loop(
+                    slot,
+                    conn_ref_clone,
+                    pool_ref,
+                    params_ref,
+                    cancel_child,
+                    monitor_tx,
+                    panic_retries_for_this_run,
+                )
+                .await;
+            });
+            let _ = tokio::time::timeout(Duration::from_secs(15), handle).await;
+
+            let cmd = tokio::time::timeout(Duration::from_secs(2), monitor_rx.recv())
+                .await
+                .expect("timed out waiting for MonitorCommand")
+                .expect("monitor_tx dropped without sending a command");
+
+            match cmd {
+                MonitorCommand::RespawnAfterPanic {
+                    panic_retries: next, ..
+                } => {
+                    panic_retries = next;
+                    // Slot still Dead; loop drives the next health_loop instance.
+                }
+                MonitorCommand::DropSlot(_) => {
+                    final_cmd = Some(cmd);
+                    break;
+                }
+                other => panic!("unexpected command after panic retries: {:?}", other),
+            }
+        }
+
+        match final_cmd {
+            Some(MonitorCommand::DropSlot(s)) => {
+                assert_eq!(s, slot, "DropSlot should reference the original slot");
+                // Should have taken exactly MAX_RECONNECT_PANIC_RETRIES + 1 panics
+                // (3 RespawnAfterPanic, then DropSlot on the 4th).
+                assert_eq!(
+                    panic_retries,
+                    MAX_RECONNECT_PANIC_RETRIES,
+                    "DropSlot should fire only after exhausting {} panic retries; got panic_retries={}",
+                    MAX_RECONNECT_PANIC_RETRIES,
+                    panic_retries
+                );
+            }
+            other => panic!(
+                "expected DropSlot after max retries, got {:?}",
+                other.map(|c| format!("{:?}", c))
+            ),
         }
     }
 }
