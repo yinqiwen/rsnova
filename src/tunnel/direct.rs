@@ -160,13 +160,17 @@ fn is_plausible_domain(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
-/// Extract the host portion of a `host:port` / `[ipv6]:port` / bare address.
+/// Extract the host portion of a `host:port` / `[ipv6]:port` / `ipv6:port` /
+/// bare address.
+///
+/// Note: SOCKS5 emits unbracketed IPv6+port (e.g. `::1:443`). We deliberately
+/// do NOT eagerly `parse::<IpAddr>()` here, because `::1:443` parses as the
+/// IPv6 address `0:0:0:0:0:0:1:443` rather than host `::1` + port `443`.
+/// Falling through to `rsplit_once(':')` correctly peels the trailing port
+/// (a u16 has no `:`), yielding host `::1`.
 pub fn extract_host(addr: &str) -> Option<String> {
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return Some(sa.ip().to_string());
-    }
-    if let Ok(ip) = addr.parse::<IpAddr>() {
-        return Some(ip.to_string());
     }
     let host = match addr.rsplit_once(':') {
         Some((h, _port)) => h,
@@ -492,12 +496,28 @@ fe80::/10
     fn extract_host_handles_ip_domain_and_ipv6() {
         assert_eq!(extract_host("127.0.0.1:443"), Some("127.0.0.1".to_string()));
         assert_eq!(extract_host("[::1]:443"), Some("::1".to_string()));
+        // SOCKS5 emits unbracketed IPv6+port; the port must be peeled, not
+        // parsed as a trailing hextet of the address.
+        assert_eq!(extract_host("::1:443"), Some("::1".to_string()));
+        assert_eq!(
+            extract_host("2001:db8::1:443"),
+            Some("2001:db8::1".to_string())
+        );
         assert_eq!(
             extract_host("example.com:80"),
             Some("example.com".to_string())
         );
         assert_eq!(extract_host("example.com"), Some("example.com".to_string()));
-        assert_eq!(extract_host("::1"), Some("::1".to_string()));
+    }
+
+    /// Regression: SOCKS5 IPv6 loopback target (`::1:443`) must match the
+    /// built-in `::1/128` default rule and be direct-bypassed, not silently
+    /// fall through to the remote tunnel.
+    #[test]
+    fn socks5_ipv6_loopback_matches_default() {
+        let host = extract_host("::1:443").unwrap();
+        assert_eq!(host, "::1");
+        assert!(DirectRules::defaults().matches(&host));
     }
 
     #[tokio::test]
