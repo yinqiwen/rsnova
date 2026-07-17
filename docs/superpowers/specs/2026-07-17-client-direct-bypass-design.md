@@ -17,13 +17,14 @@ In client proxy mode, forward traffic whose destination matches configured rules
 
 ## Decisions (from brainstorming)
 
-1. **Matching model:** Two rule kinds — CIDR rules (match IP-literal destinations) and domain-suffix rules (match domain destinations by name). No client-side DNS resolution. (Choice C.)
-2. **Configuration source:** Plain-text rules file, one rule per line, auto-classified. Path supplied via `--direct-rules <path>` (also a valid TOML key `direct_rules`). (Supersedes an earlier two-CLI-flag design.)
-3. **Hot reload:** Rules are reloadable at runtime via the existing admin reload path; reload re-reads the file and swaps the compiled rule set. (Choice B.)
+1. **Matching model:** Two rule kinds — CIDR rules (match IP-literal destinations) and domain rules (match domain destinations by name). No client-side DNS resolution. (Choice C.)
+2. **Configuration source:** Plain-text rules file, one rule per line, auto-classified. Path supplied via `--direct-rules <path>` (also a valid TOML key `direct_rules`). Optional; when omitted only built-in defaults apply.
+3. **Hot reload:** A background task polls the rules file mtime every 5s; on change it re-reads and atomically swaps the compiled rule set. The admin reload endpoint may also trigger a reload manually as a fallback. (Choice B, refined to file-watcher.)
 4. **Direct-connect failure behavior:** Close the inbound connection; do **not** fall back to the remote server. (Choice A.)
 5. **Transport scope:** TCP only. (Choice A.)
-6. **Default rules, on by default:** Direct bypass is enabled by default with a built-in default rule set (loopback / private / link-local / `localhost`). `--direct-rules <file>` adds file rules on top of the defaults. `--no-direct-bypass` disables the feature entirely. (Choice A.) Rationale: traffic to `127.0.0.1`/`192.168.x` should not be detoured through the remote server (it would wrongly hit the remote's loopback/private addresses); defaulting these to direct is a correctness improvement.
-7. **Implementation shape:** A single shared `try_bypass_direct` method invoked from each of the 4 local handlers — no new `Message` variant, no extra mpsc channel.
+6. **Default rules, on by default:** Direct bypass is enabled by default with a built-in default rule set (loopback / private / link-local / `localhost`). `--direct-rules <file>` adds file rules on top of the defaults. `--no-direct-bypass` disables the feature entirely; `--no-default-bypass` disables only the built-in defaults while keeping file rules active. (Choice A, refined with independent defaults switch.)
+7. **Domain rule syntax:** `*.suffix` matches proper subdomains of `suffix` (e.g. `*.corp.internal` matches `api.corp.internal`, not `corp.internal` itself). A bare domain (e.g. `db.internal.corp.com`) matches that exact hostname only. This distinguishes "subdomain tree" from "exact host" and follows PAC/domain-list convention.
+8. **Implementation shape:** A single shared `try_bypass_direct` method invoked from each of the 4 local handlers — no new `Message` variant, no extra mpsc channel.
 
 ## Architecture
 
@@ -32,22 +33,25 @@ In client proxy mode, forward traffic whose destination matches configured rules
 Holds all direct-bypass logic behind a small, testable surface.
 
 ```rust
-/// Compiled, immutable rule snapshot. Replaced as a whole on reload.
+/// Compiled, immutable rule snapshot. Replaced as a whole on reload (single
+/// RwLock → no torn reads between cidrs and domain rules mid-swap).
 pub struct DirectRules {
-    cidrs: Vec<IpNet>,            // IPv4/IPv6 CIDRs (incl. /32, /128 from bare IPs)
-    domain_suffixes: Vec<String>, // lowercased, leading dots stripped, e.g. "corp.local"
+    cidrs: Vec<IpNet>,              // IPv4/IPv6 CIDRs (incl. /32, /128 from bare IPs)
+    domain_exact: Vec<String>,      // exact hostnames, lowercased (bare domain rules)
+    domain_suffix: Vec<String>,     // suffixes, lowercased, no leading dot (from *.suffix rules)
 }
 
 impl DirectRules {
-    /// Built-in defaults: loopback, private, link-local, ULA + "localhost".
+    pub fn empty() -> Self;
+    /// Built-in defaults: loopback, private, link-local, ULA + "localhost" + "*.localhost".
     pub fn defaults() -> Self;
-    /// Read + classify each line of the file. Never returns Err for a bad line
-    /// (warn-skips). Returns Err only on file IO failure.
+    /// Read + classify each line of the file. Warn-skips unrecognizable lines;
+    /// returns Err only on file IO failure.
     pub fn parse_file(path: &Path) -> Result<Self>;
     /// Merge two rule sets (defaults ⊕ file). Duplicates allowed; cheap to scan.
     pub fn merge(self, other: Self) -> Self;
-    /// host is either an IP literal (matched against cidrs) or a domain name
-    /// (suffix-matched against domain_suffixes).
+    /// host is an IP literal (matched against cidrs) or a domain name
+    /// (exact- or suffix-matched against domain rules).
     pub fn matches(&self, host: &str) -> bool;
     pub fn is_empty(&self) -> bool;
 }
@@ -55,25 +59,29 @@ impl DirectRules {
 /// Shared handle held by the local handlers.
 #[derive(Clone)]
 pub struct DirectCtx {
-    pub enabled: bool,
-    pub path: Option<PathBuf>,                 // Some when --direct-rules given
-    pub rules: Arc<RwLock<DirectRules>>,       // std::sync::RwLock; no await under lock
+    pub enabled: bool,                        // false when --no-direct-bypass
+    pub include_defaults: bool,               // false when --no-default-bypass
+    pub path: Option<PathBuf>,                // Some when --direct-rules given
+    pub rules: Arc<RwLock<DirectRules>>,      // std::sync::RwLock; no await under lock
     pub idle_timeout_secs: usize,
 }
 
 impl DirectCtx {
-    /// Returns Ok(true) if the stream was handled by direct bypass (success or
-    /// failure — caller must return Ok(()) either way). Ok(false) = not matched,
-    /// caller proceeds to remote.
+    /// Ok(true)  = handled by direct bypass (success or failure — caller returns Ok(())).
+    /// Ok(false) = not matched / disabled — caller proceeds to remote.
     pub async fn try_bypass(
         &self, tunnel_id: u32, inbound: TcpStream, target_addr: &str,
         payload: Option<Vec<u8>>,
     ) -> Result<bool>;
 
-    /// Re-read file (if path set), recompute defaults ⊕ file, swap in. On file
-    /// error: warn and keep previous rules.
+    /// Recompute (defaults if include_defaults) ⊕ (file if path readable) and swap.
+    /// On file IO error: warn and keep previous rules.
     pub fn reload(&self) -> Result<()>;
 }
+
+/// Background task: poll file mtime every 5s; on change call `ctx.reload()`.
+/// Only spawned when `ctx.path` is Some.
+pub fn start_direct_watcher(ctx: DirectCtx);
 ```
 
 ### Rule file format
@@ -84,25 +92,30 @@ Plain text, one rule per line:
 - Each remaining line is classified, in order:
   1. Parse as `IpNet` (CIDR, e.g. `10.0.0.0/8`, `fe80::/10`) → CIDR rule.
   2. Else parse as `IpAddr` (bare IP, e.g. `1.2.3.4`) → CIDR rule as `/32` (IPv4) or `/128` (IPv6).
-  3. Else treat as a **domain-suffix** rule: strip a leading `.`, lowercase.
+  3. Else if it starts with `*.` → strip `*.`, lowercase → **domain-suffix** rule.
+  4. Else → lowercase → **domain-exact** rule.
 - A line that is none of the above is skipped with a `warn!` log. Loading continues; the file is not rejected as a whole.
 
 ### Matching semantics
 
 - `matches(host)`:
   - If `host.parse::<IpAddr>()` succeeds → return `cidrs.iter().any(|c| c.contains(&ip))`.
-  - Else lowercase `host`; return true if `host == suffix` or `host.ends_with(&format!(".{suffix}"))` for any suffix. The leading-dot guard prevents `notcorp.local` from matching `corp.local`.
+  - Else lowercase `host`:
+    - exact match: `domain_exact.iter().any(|d| d == host)`.
+    - suffix match: `domain_suffix.iter().any(|s| host.ends_with(&format!(".{s}")))` — proper subdomain only (the leading-dot guard means `corp.internal` does not match suffix `corp.internal`, and `notcorp.internal` does not match `corp.internal`).
 - Domain matching is case-insensitive; CIDR matching is exact.
 
-### Built-in default rules
+### Built-in default rules (active unless `--no-default-bypass`)
 
 - CIDR: `127.0.0.0/8`, `::1/128`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`, `169.254.0.0/16`, `fe80::/10`.
-- Domain: `localhost`.
+- Domain-exact: `localhost`.
+- Domain-suffix: `localhost` (from `*.localhost`, so `foo.localhost` etc. also match).
 
 ### New CLI / TOML args (`main.rs` `Args`)
 
-- `--direct-rules <path>` (`direct_rules = "..."`): optional path to the plain-text rules file. File rules are merged on top of the built-in defaults.
-- `--no-direct-bypass` (`no_direct_bypass = true`): disables the feature entirely. Default `false` (feature on with defaults).
+- `--direct-rules <path>` (`direct_rules = "..."`): optional path to the plain-text rules file. File rules merge on top of built-in defaults.
+- `--no-direct-bypass` (`no_direct_bypass = true`): disables the feature entirely. Default `false`.
+- `--no-default-bypass` (`no_default_bypass = true`): disables only the built-in default rules; file rules (if any) still apply. Default `false`.
 
 ### Data flow
 
@@ -149,10 +162,9 @@ Note: SOCKS5/HTTPS handlers already send the success/established reply before th
 
 ### Hot reload
 
-- `service_main` constructs the initial `DirectCtx`: `rules = defaults ⊕ parse_file(path)` (or defaults only if no path / file unreadable at startup — see error handling). `enabled = !args.no_direct_bypass`.
-- The same `DirectCtx` is shared with the admin reload path. On admin reload, alongside the existing `trigger_reload()`, call `DirectCtx::reload()`:
-  - Re-read `path` (if `Some`), recompute `defaults ⊕ file`, `write-lock` and swap.
-  - On file IO error → `warn!` and keep the previous rule set (do not clear, do not revert to defaults-only).
+- **File mtime watcher:** `start_direct_watcher(ctx)` spawns a background task that polls `ctx.path`'s mtime every 5s. When mtime changes, it calls `ctx.reload()`. Spawned in `service_main` only when `ctx.path` is `Some`.
+- **Admin manual trigger:** the existing admin reload endpoint additionally calls `ctx.reload()` so an operator can force a re-read without editing the file.
+- `DirectCtx::reload()` recomputes `(defaults if include_defaults else empty) ⊕ (parse_file(path) if Ok else nothing)` and swaps under the write lock. On file IO error it `warn!`s and keeps the previous rule set (no swap, no clearing).
 - The local accept loop and handlers read the current rules per connection; no restart needed.
 - `ReloadableConfig` gains no new fields — the rule source of truth is the file on disk, not in-memory config.
 
@@ -160,9 +172,9 @@ Note: SOCKS5/HTTPS handlers already send the success/established reply before th
 
 | Stage | Failure | Behavior |
 |---|---|---|
-| Startup file load | File missing / IO error | `warn!`, use **defaults only**, continue running (do not exit) |
+| Startup file load | File missing / IO error | `warn!`, use defaults only (or empty if `--no-default-bypass`), continue running (do not exit) |
 | Startup / reload line parse | A line cannot be classified | `warn!` skip the line, continue loading the rest |
-| Reload file load | IO error | `warn!`, **keep previous rules** (no swap, no clearing) |
+| Reload file load (watcher or admin) | IO error | `warn!`, **keep previous rules** (no swap, no clearing) |
 | Host extraction | Cannot extract host | Treat as no match → route to remote |
 | Direct `TcpStream::connect` | Timeout / refused / unreachable | `warn!`, close inbound, `Ok(true)` (no remote fallback) |
 | Payload write / relay | IO error | `debug!` (aligned with existing `transfer finish`), close, `Ok(true)` |
@@ -171,7 +183,7 @@ Note: SOCKS5/HTTPS handlers already send the success/established reply before th
 
 - `[tunnel_id] Direct bypass hit: {target_addr} (rule={matched_rule})` — info or debug.
 - `[tunnel_id] Direct connect failed: {target_addr}: {e}` — warn.
-- `direct rules loaded: {N} cidrs, {M} domains from {path:?}` — info.
+- `direct rules loaded: {N} cidrs, {P} exact, {Q} suffix domains from {path:?}` — info.
 - `direct rules file not found, using defaults only: {path:?}: {e}` — warn (startup).
 - `direct rules reload failed, keeping previous: {e}` — warn.
 
@@ -188,13 +200,14 @@ Note: SOCKS5/HTTPS handlers already send the success/established reply before th
 
 ## Testing (`direct.rs` `#[cfg(test)] mod tests`)
 
-1. **Parse + classify:** a mixed file (CIDR / bare IP / domain / `#` comment / blank / unrecognizable line) yields the right `cidrs` and `domain_suffixes`; bare IP → /32; unrecognizable line skipped without error.
+1. **Parse + classify:** a mixed file (CIDR / bare IP / `*.suffix` / bare domain / `#` comment / blank / unrecognizable line) yields the right `cidrs`, `domain_exact`, `domain_suffix`; bare IP → /32; `*.corp.internal` → suffix `corp.internal`; unrecognizable line skipped without error.
 2. **`matches` semantics:**
-   - `10.5.0.1` ∈ `10.0.0.0/8` true; `11.0.0.1` false.
-   - `::1` ∈ `::1/128`; `fe80::1` ∈ `fe80::/10`.
-   - `a.b.corp.local` matches `corp.local`; `corp.local` matches itself; `notcorp.local` does **not** match `corp.local`; case-insensitive.
+   - IP: `10.5.0.1` ∈ `10.0.0.0/8` true; `11.0.0.1` false; `::1` ∈ `::1/128`; `fe80::1` ∈ `fe80::/10`.
+   - Suffix: `*.corp.internal` matches `api.corp.internal` and `x.y.corp.internal`, does **not** match `corp.internal` itself; `notcorp.internal` does not match `corp.internal`.
+   - Exact: bare `corp.internal` matches only `corp.internal`, not `api.corp.internal`.
+   - Case-insensitive for domains.
    - Empty `DirectRules`: `is_empty` true, `matches` always false.
-3. **Defaults:** `DirectRules::defaults()` matches `127.0.0.1`, `192.168.1.5`, `localhost`; does not match `8.8.8.8` or `example.com`.
+3. **Defaults:** `DirectRules::defaults()` matches `127.0.0.1`, `192.168.1.5`, `localhost`, `foo.localhost`; does not match `8.8.8.8` or `example.com`.
 4. **Host extraction:** `127.0.0.1:443`, `[::1]:443`, `example.com:80`, `example.com` all yield the correct host; an unparseable string routes to no-match.
 5. **End-to-end relay via `try_bypass`:** with `tokio::io::duplex` standing in for the target, a `DirectCtx` with a hitting rule completes payload write + bidirectional copy + EOF close and returns `Ok(true)`; a non-hitting rule returns `Ok(false)`.
 
@@ -202,9 +215,9 @@ Protocol-level end-to-end (SOCKS5/HTTP/HTTPS parsing) is already covered by the 
 
 ## Files touched (summary)
 
-- New: `src/tunnel/direct.rs`.
+- New: `src/tunnel/direct.rs` (`DirectRules`, `DirectCtx`, `try_bypass`, `start_direct_watcher`).
 - `src/tunnel/mod.rs` — declare `direct`.
-- `src/main.rs` — new `Args` fields (`direct_rules`, `no_direct_bypass`); construct `DirectCtx` in the client-proxy branch; pass to `start_local_tunnel_server`; wire admin reload to `DirectCtx::reload`.
+- `src/main.rs` — new `Args` fields (`direct_rules`, `no_direct_bypass`, `no_default_bypass`); construct `DirectCtx` in the client-proxy branch; pass to `start_local_tunnel_server`; spawn `start_direct_watcher` when `path` is Some; wire admin reload to `DirectCtx::reload`.
 - `src/tunnel/local.rs` — `handle_local_tunnel` + `start_local_tunnel_server` accept and forward `direct_ctx`.
 - `src/tunnel/socks5_local.rs`, `src/tunnel/http_local.rs`, `src/tunnel/transparent.rs` — accept `direct_ctx`, call `try_bypass` after target extraction.
 - `src/tunnel/stream.rs` — no change (reuses `Stream::transfer`).
