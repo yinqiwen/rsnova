@@ -1,8 +1,14 @@
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+
+use crate::tunnel::stream::Stream;
+use crate::tunnel::DEFAULT_TIMEOUT_SECS;
 
 /// Compiled, immutable rule snapshot. Replaced as a whole on reload (single
 /// RwLock → no torn reads between cidrs and domain rules mid-swap).
@@ -134,6 +140,26 @@ fn is_plausible_domain(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
+/// Extract the host portion of a `host:port` / `[ipv6]:port` / bare address.
+pub fn extract_host(addr: &str) -> Option<String> {
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Some(sa.ip().to_string());
+    }
+    if let Ok(ip) = addr.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    let host = match addr.rsplit_once(':') {
+        Some((h, _port)) => h,
+        None => addr,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 /// Shared handle held by the local handlers. Cheap to clone (Arc inside).
 #[derive(Clone)]
 pub struct DirectCtx {
@@ -196,6 +222,77 @@ impl DirectCtx {
             "direct rules reloaded: {n_cidrs} cidrs, {n_exact} exact, {n_suffix} suffix"
         );
         Ok(())
+    }
+}
+
+impl DirectCtx {
+    /// Ok(true)  = handled by direct bypass (success or failure — caller returns Ok(())).
+    /// Ok(false) = not matched / disabled — caller proceeds to remote.
+    pub async fn try_bypass(
+        &self,
+        tunnel_id: u32,
+        inbound: TcpStream,
+        target_addr: &str,
+        payload: Option<&[u8]>,
+    ) -> anyhow::Result<bool> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        let host = match extract_host(target_addr) {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+        let rule = {
+            let guard = self.rules.read().unwrap();
+            if guard.is_empty() {
+                return Ok(false);
+            }
+            guard.matched_rule(&host)
+        };
+        let Some(rule) = rule else {
+            return Ok(false);
+        };
+
+        tracing::info!("[{tunnel_id}] Direct bypass hit: {target_addr} (rule={rule})");
+        metrics::counter!("client_proxy_direct_total").increment(1);
+
+        let mut outbound = match tokio::time::timeout(
+            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            TcpStream::connect(target_addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                metrics::counter!("client_proxy_direct_connect_failed_total").increment(1);
+                tracing::warn!("[{tunnel_id}] Direct connect failed: {target_addr}: {e}");
+                return Ok(true);
+            }
+            Err(e) => {
+                metrics::counter!("client_proxy_direct_connect_failed_total").increment(1);
+                tracing::warn!("[{tunnel_id}] Direct connect timed out: {target_addr}: {e}");
+                return Ok(true);
+            }
+        };
+
+        metrics::gauge!("client_proxy_direct_streams").increment(1.0);
+
+        if let Some(p) = payload
+            && let Err(e) = outbound.write_all(p).await
+        {
+            tracing::debug!("[{tunnel_id}] Direct payload write failed: {e}");
+            metrics::gauge!("client_proxy_direct_streams").decrement(1.0);
+            return Ok(true);
+        }
+
+        let (mut in_r, mut in_w) = inbound.into_split();
+        let (mut out_r, mut out_w) = outbound.into_split();
+        let mut stream = Stream::new(&mut in_r, &mut in_w, &mut out_r, &mut out_w);
+        if let Err(e) = stream.transfer(self.idle_timeout_secs).await {
+            tracing::debug!("[{tunnel_id}] Direct transfer finish: {e}");
+        }
+        metrics::gauge!("client_proxy_direct_streams").decrement(1.0);
+        Ok(true)
     }
 }
 
@@ -322,5 +419,39 @@ fe80::/10
         let _ = ctx.reload();
         // Still matches defaults → previous rules were retained.
         assert!(ctx.rules.read().unwrap().matches("127.0.0.1"));
+    }
+
+    #[test]
+    fn extract_host_handles_ip_domain_and_ipv6() {
+        assert_eq!(extract_host("127.0.0.1:443"), Some("127.0.0.1".to_string()));
+        assert_eq!(extract_host("[::1]:443"), Some("::1".to_string()));
+        assert_eq!(extract_host("example.com:80"), Some("example.com".to_string()));
+        assert_eq!(extract_host("example.com"), Some("example.com".to_string()));
+        assert_eq!(extract_host("::1"), Some("::1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn try_bypass_returns_false_for_nonmatching_target() {
+        // 8.8.8.8 is not in defaults; with no file, it must not match.
+        // try_bypass must return Ok(false) WITHOUT attempting a connect.
+        let ctx = DirectCtx::new(true, true, None, 30);
+        let acc = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let acc_addr = acc.local_addr().unwrap();
+        let inbound = tokio::net::TcpStream::connect(acc_addr).await.unwrap();
+        drop(acc);
+        let handled = ctx.try_bypass(0, inbound, "8.8.8.8:9", None).await.unwrap();
+        assert!(!handled, "non-matching target must not be handled");
+    }
+
+    #[tokio::test]
+    async fn try_bypass_returns_false_when_disabled() {
+        let ctx = DirectCtx::new(false, true, None, 30);
+        let acc = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let acc_addr = acc.local_addr().unwrap();
+        let inbound = tokio::net::TcpStream::connect(acc_addr).await.unwrap();
+        drop(acc);
+        // Even though 127.0.0.1 would match, disabled must short-circuit.
+        let handled = ctx.try_bypass(0, inbound, "127.0.0.1:9", None).await.unwrap();
+        assert!(!handled);
     }
 }
