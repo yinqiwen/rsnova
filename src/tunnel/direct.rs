@@ -1,5 +1,6 @@
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
@@ -133,6 +134,71 @@ fn is_plausible_domain(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
+/// Shared handle held by the local handlers. Cheap to clone (Arc inside).
+#[derive(Clone)]
+pub struct DirectCtx {
+    pub enabled: bool,
+    pub include_defaults: bool,
+    pub path: Option<PathBuf>,
+    pub rules: Arc<RwLock<DirectRules>>,
+    pub idle_timeout_secs: usize,
+}
+
+impl DirectCtx {
+    pub fn new(
+        enabled: bool,
+        include_defaults: bool,
+        path: Option<PathBuf>,
+        idle_timeout_secs: usize,
+    ) -> Self {
+        let rules = Self::load_rules(include_defaults, path.as_deref());
+        Self { enabled, include_defaults, path, rules: Arc::new(RwLock::new(rules)), idle_timeout_secs }
+    }
+
+    /// Compose defaults (if enabled) ⊕ file rules. On file IO error at
+    /// startup: warn and fall back to defaults-only (or empty if no defaults).
+    fn load_rules(include_defaults: bool, path: Option<&Path>) -> DirectRules {
+        let base = if include_defaults { DirectRules::defaults() } else { DirectRules::empty() };
+        let Some(p) = path else { return base; };
+        match DirectRules::parse_file(p) {
+            Ok(f) => base.merge(f),
+            Err(e) => {
+                tracing::warn!("direct rules file load failed, using defaults only: {p:?}: {e}");
+                base
+            }
+        }
+    }
+
+    /// Re-read file (if path set) and swap. On file error: warn and keep
+    /// previous rules. No-op (Ok) when path is None.
+    pub fn reload(&self) -> anyhow::Result<()> {
+        let Some(p) = self.path.as_deref() else { return Ok(()); };
+        let new = match DirectRules::parse_file(p) {
+            Ok(f) => {
+                let base = if self.include_defaults {
+                    DirectRules::defaults()
+                } else {
+                    DirectRules::empty()
+                };
+                base.merge(f)
+            }
+            Err(e) => {
+                tracing::warn!("direct rules reload failed, keeping previous: {e}");
+                return Ok(()); // keep previous
+            }
+        };
+        let mut guard = self.rules.write().unwrap();
+        let n_cidrs = new.cidrs.len();
+        let n_exact = new.domain_exact.len();
+        let n_suffix = new.domain_suffix.len();
+        *guard = new;
+        tracing::info!(
+            "direct rules reloaded: {n_cidrs} cidrs, {n_exact} exact, {n_suffix} suffix"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +296,31 @@ fe80::/10
         assert!(!r.matches("x.com")); // no leading label
         assert!(!r.matches("bx.com")); // char before suffix is not '.'
         assert!(r.matches("a.b.x.com")); // multi-label
+    }
+
+    #[test]
+    fn ctx_new_loads_defaults_and_file() {
+        // No path → defaults only.
+        let ctx = DirectCtx::new(true, true, None, 30);
+        assert!(ctx.rules.read().unwrap().matches("127.0.0.1"));
+        assert!(!ctx.rules.read().unwrap().matches("8.8.8.8"));
+    }
+
+    #[test]
+    fn ctx_new_no_defaults_is_empty_when_no_file() {
+        let ctx = DirectCtx::new(true, false, None, 30);
+        assert!(ctx.rules.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ctx_reload_keeps_previous_on_file_error() {
+        // Point at a nonexistent path: startup falls back to defaults,
+        // reload must KEEP the previous (defaults) rather than clearing.
+        let path = PathBuf::from("/nonexistent/rsnova-direct-test-no-such-file.txt");
+        let ctx = DirectCtx::new(true, true, Some(path), 30);
+        assert!(ctx.rules.read().unwrap().matches("127.0.0.1"));
+        let _ = ctx.reload();
+        // Still matches defaults → previous rules were retained.
+        assert!(ctx.rules.read().unwrap().matches("127.0.0.1"));
     }
 }
