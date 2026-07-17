@@ -55,7 +55,9 @@ impl DirectRules {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("*.") {
-                if !rest.is_empty() {
+                if rest.is_empty() {
+                    tracing::warn!("direct rules: skipping empty wildcard line: {line:?}");
+                } else {
                     domain_suffix.push(rest.to_lowercase());
                 }
                 continue;
@@ -107,8 +109,15 @@ impl DirectRules {
         if self.domain_exact.iter().any(|d| d == &h) {
             return Some(h);
         }
+        let h_bytes = h.as_bytes();
         for s in &self.domain_suffix {
-            if h.ends_with(&format!(".{s}")) {
+            let s_bytes = s.as_bytes();
+            // h ends with ".{s}" (a leading dot, so self/sibling false-positives are
+            // rejected) — checked without allocating.
+            if h_bytes.len() >= s_bytes.len() + 2
+                && &h_bytes[h_bytes.len() - s_bytes.len() - 1] == &b'.'
+                && &h_bytes[h_bytes.len() - s_bytes.len()..] == s_bytes
+            {
                 return Some(format!("*.{s}"));
             }
         }
@@ -212,5 +221,14 @@ fe80::/10
         assert!(m.matches("192.168.0.1"));
         assert!(m.matches("x.a.com"));
         assert!(m.matches("b.com"));
+    }
+
+    #[test]
+    fn suffix_requires_leading_dot_boundary() {
+        let r = DirectRules::parse_lines("*.x.com\n");
+        assert!(r.matches("a.x.com")); // shortest valid match
+        assert!(!r.matches("x.com")); // no leading label
+        assert!(!r.matches("bx.com")); // char before suffix is not '.'
+        assert!(r.matches("a.b.x.com")); // multi-label
     }
 }
