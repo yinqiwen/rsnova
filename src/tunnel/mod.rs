@@ -14,6 +14,8 @@ mod tls_remote;
 
 mod transparent;
 
+pub(crate) mod direct;
+
 pub mod tunnel_client;
 pub mod tunnel_config;
 pub mod tunnel_registry;
