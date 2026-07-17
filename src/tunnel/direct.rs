@@ -7,8 +7,8 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::tunnel::stream::Stream;
 use crate::tunnel::DEFAULT_TIMEOUT_SECS;
+use crate::tunnel::stream::Stream;
 
 /// Compiled, immutable rule snapshot. Replaced as a whole on reload (single
 /// RwLock → no torn reads between cidrs and domain rules mid-swap).
@@ -20,14 +20,24 @@ pub struct DirectRules {
 
 impl DirectRules {
     pub fn empty() -> Self {
-        Self { cidrs: Vec::new(), domain_exact: Vec::new(), domain_suffix: Vec::new() }
+        Self {
+            cidrs: Vec::new(),
+            domain_exact: Vec::new(),
+            domain_suffix: Vec::new(),
+        }
     }
 
     /// Built-in defaults: loopback, private, link-local, ULA + localhost + *.localhost.
     pub fn defaults() -> Self {
         let cidrs: Vec<IpNet> = [
-            "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-            "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+            "127.0.0.0/8",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+            "::1/128",
+            "fc00::/7",
+            "fe80::/10",
         ]
         .iter()
         .map(|s| s.parse::<IpNet>().expect("valid default CIDR"))
@@ -75,7 +85,11 @@ impl DirectRules {
             }
             tracing::warn!("direct rules: skipping unrecognizable line: {line:?}");
         }
-        Self { cidrs, domain_exact, domain_suffix }
+        Self {
+            cidrs,
+            domain_exact,
+            domain_suffix,
+        }
     }
 
     /// Read + classify a file. Returns Err only on IO failure.
@@ -91,7 +105,11 @@ impl DirectRules {
         domain_exact.extend(other.domain_exact);
         let mut domain_suffix = self.domain_suffix;
         domain_suffix.extend(other.domain_suffix);
-        Self { cidrs, domain_exact, domain_suffix }
+        Self {
+            cidrs,
+            domain_exact,
+            domain_suffix,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -100,6 +118,7 @@ impl DirectRules {
 
     /// `host` is an IP literal (matched against cidrs) or a domain name
     /// (exact- or suffix-matched). Case-insensitive for domains.
+    #[allow(dead_code)]
     pub fn matches(&self, host: &str) -> bool {
         self.matched_rule(host).is_some()
     }
@@ -122,7 +141,7 @@ impl DirectRules {
             // h ends with ".{s}" (a leading dot, so self/sibling false-positives are
             // rejected) — checked without allocating.
             if h_bytes.len() >= s_bytes.len() + 2
-                && &h_bytes[h_bytes.len() - s_bytes.len() - 1] == &b'.'
+                && h_bytes[h_bytes.len() - s_bytes.len() - 1] == b'.'
                 && &h_bytes[h_bytes.len() - s_bytes.len()..] == s_bytes
             {
                 return Some(format!("*.{s}"));
@@ -137,7 +156,8 @@ impl DirectRules {
 fn is_plausible_domain(s: &str) -> bool {
     !s.is_empty()
         && !s.contains(char::is_whitespace)
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
 /// Extract the host portion of a `host:port` / `[ipv6]:port` / bare address.
@@ -178,14 +198,26 @@ impl DirectCtx {
         idle_timeout_secs: usize,
     ) -> Self {
         let rules = Self::load_rules(include_defaults, path.as_deref());
-        Self { enabled, include_defaults, path, rules: Arc::new(RwLock::new(rules)), idle_timeout_secs }
+        Self {
+            enabled,
+            include_defaults,
+            path,
+            rules: Arc::new(RwLock::new(rules)),
+            idle_timeout_secs,
+        }
     }
 
     /// Compose defaults (if enabled) ⊕ file rules. On file IO error at
     /// startup: warn and fall back to defaults-only (or empty if no defaults).
     fn load_rules(include_defaults: bool, path: Option<&Path>) -> DirectRules {
-        let base = if include_defaults { DirectRules::defaults() } else { DirectRules::empty() };
-        let Some(p) = path else { return base; };
+        let base = if include_defaults {
+            DirectRules::defaults()
+        } else {
+            DirectRules::empty()
+        };
+        let Some(p) = path else {
+            return base;
+        };
         match DirectRules::parse_file(p) {
             Ok(f) => base.merge(f),
             Err(e) => {
@@ -198,7 +230,9 @@ impl DirectCtx {
     /// Re-read file (if path set) and swap. On file error: warn and keep
     /// previous rules. No-op (Ok) when path is None.
     pub fn reload(&self) -> anyhow::Result<()> {
-        let Some(p) = self.path.as_deref() else { return Ok(()); };
+        let Some(p) = self.path.as_deref() else {
+            return Ok(());
+        };
         let new = match DirectRules::parse_file(p) {
             Ok(f) => {
                 let base = if self.include_defaults {
@@ -209,7 +243,7 @@ impl DirectCtx {
                 base.merge(f)
             }
             Err(e) => {
-                tracing::warn!("direct rules reload failed, keeping previous: {e}");
+                tracing::warn!("direct rules reload failed, keeping previous: {p:?}: {e}");
                 return Ok(()); // keep previous
             }
         };
@@ -299,7 +333,9 @@ impl DirectCtx {
 /// Background task: poll `ctx.path`'s mtime every 5s; on change call
 /// `ctx.reload()`. Only spawn when `ctx.path` is Some.
 pub fn start_direct_watcher(ctx: DirectCtx) {
-    let Some(path) = ctx.path.clone() else { return; };
+    let Some(path) = ctx.path.clone() else {
+        return;
+    };
     tokio::spawn(async move {
         let mut last_mtime = std::fs::metadata(&path)
             .ok()
@@ -337,8 +373,16 @@ fe80::/10
         let r = DirectRules::parse_lines(content);
         // 10.0.0.0/8, 1.2.3.4 (/32), fe80::/10
         assert_eq!(r.cidrs.len(), 3);
-        assert!(r.cidrs.iter().any(|c| c.contains(&IpAddr::V4("10.5.0.1".parse().unwrap()))));
-        assert!(r.cidrs.iter().any(|c| c.contains(&IpAddr::V4("1.2.3.4".parse().unwrap()))));
+        assert!(
+            r.cidrs
+                .iter()
+                .any(|c| c.contains(&IpAddr::V4("10.5.0.1".parse().unwrap())))
+        );
+        assert!(
+            r.cidrs
+                .iter()
+                .any(|c| c.contains(&IpAddr::V4("1.2.3.4".parse().unwrap())))
+        );
         assert_eq!(r.domain_suffix, vec!["corp.internal".to_string()]);
         assert_eq!(r.domain_exact, vec!["db.internal.corp.com".to_string()]);
     }
@@ -448,7 +492,10 @@ fe80::/10
     fn extract_host_handles_ip_domain_and_ipv6() {
         assert_eq!(extract_host("127.0.0.1:443"), Some("127.0.0.1".to_string()));
         assert_eq!(extract_host("[::1]:443"), Some("::1".to_string()));
-        assert_eq!(extract_host("example.com:80"), Some("example.com".to_string()));
+        assert_eq!(
+            extract_host("example.com:80"),
+            Some("example.com".to_string())
+        );
         assert_eq!(extract_host("example.com"), Some("example.com".to_string()));
         assert_eq!(extract_host("::1"), Some("::1".to_string()));
     }
@@ -480,7 +527,10 @@ fe80::/10
         let acc_addr = acc.local_addr().unwrap();
         let mut inbound = tokio::net::TcpStream::connect(acc_addr).await.unwrap();
         drop(acc);
-        let handled = ctx.try_bypass(0, &mut inbound, "8.8.8.8:9", None).await.unwrap();
+        let handled = ctx
+            .try_bypass(0, &mut inbound, "8.8.8.8:9", None)
+            .await
+            .unwrap();
         assert!(!handled, "non-matching target must not be handled");
     }
 
@@ -492,7 +542,10 @@ fe80::/10
         let mut inbound = tokio::net::TcpStream::connect(acc_addr).await.unwrap();
         drop(acc);
         // Even though 127.0.0.1 would match, disabled must short-circuit.
-        let handled = ctx.try_bypass(0, &mut inbound, "127.0.0.1:9", None).await.unwrap();
+        let handled = ctx
+            .try_bypass(0, &mut inbound, "127.0.0.1:9", None)
+            .await
+            .unwrap();
         assert!(!handled);
     }
 }
