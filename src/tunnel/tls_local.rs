@@ -240,7 +240,12 @@ pub fn valid_tls_version(buf: &[u8]) -> bool {
     true
 }
 
-pub async fn handle_tls(tunnel_id: u32, inbound: TcpStream, sender: ProxySender) -> Result<()> {
+pub async fn handle_tls(
+    tunnel_id: u32,
+    mut inbound: TcpStream,
+    sender: ProxySender,
+    direct_ctx: crate::tunnel::direct::DirectCtx,
+) -> Result<()> {
     let target_addr = match peek_sni_v2(&inbound).await {
         Ok(mut sni) => {
             sni.push_str(":443");
@@ -250,9 +255,15 @@ pub async fn handle_tls(tunnel_id: u32, inbound: TcpStream, sender: ProxySender)
     };
     if target_addr.is_empty() {
         tracing::error!("[{}]no sni found ", tunnel_id);
-        super::transparent::handle_transparent(tunnel_id, inbound, sender).await
+        super::transparent::handle_transparent(tunnel_id, inbound, sender, direct_ctx).await
     } else {
         tracing::info!("[{}]Handle TLS proxy to {} ", tunnel_id, target_addr);
+        if direct_ctx
+            .try_bypass(tunnel_id, &mut inbound, &target_addr, None)
+            .await?
+        {
+            return Ok(());
+        }
         let msg = Message::open_tcp_stream(inbound, target_addr, None);
         sender.send(msg).await?;
         Ok(())

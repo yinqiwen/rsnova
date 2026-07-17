@@ -49,6 +49,7 @@ pub async fn handle_socks5(
     tunnel_id: u32,
     mut inbound: TcpStream,
     sender: ProxySender,
+    direct_ctx: crate::tunnel::direct::DirectCtx,
 ) -> Result<()> {
     //let mut peek_buf = Vec::new();
     let mut num_methods_buf = [0u8; 2];
@@ -123,6 +124,13 @@ pub async fn handle_socks5(
     inbound.write_all(&resp).await?;
 
     tracing::info!("[{}]Handle SOCKS5 proxy to {}", tunnel_id, target_addr);
+
+    if direct_ctx
+        .try_bypass(tunnel_id, &mut inbound, &target_addr, None)
+        .await?
+    {
+        return Ok(());
+    }
 
     let msg = Message::open_tcp_stream(inbound, target_addr, None);
     sender.send(msg).await?;

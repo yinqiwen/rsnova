@@ -14,6 +14,7 @@ async fn handle_local_tunnel(
     inbound: TcpStream,
     tunnel_id: u32,
     sender: ProxySender,
+    direct_ctx: crate::tunnel::direct::DirectCtx,
 ) -> Result<()> {
     //stream.peek(buf)
     let mut peek_buf = [0u8; 3];
@@ -22,7 +23,7 @@ async fn handle_local_tunnel(
         5 => {
             //socks5
             // tracing::info!("[{}]Accept client as SOCKS5 proxy.", tunnel_id);
-            handle_socks5(tunnel_id, inbound, sender).await?;
+            handle_socks5(tunnel_id, inbound, sender, direct_ctx).await?;
             return Ok(());
         }
         4 => {
@@ -36,7 +37,7 @@ async fn handle_local_tunnel(
     }
     if valid_tls_version(&peek_buf[..]) {
         // tracing::info!("[{}]Accept client as TLS proxy.", tunnel_id);
-        handle_tls(tunnel_id, inbound, sender).await?;
+        handle_tls(tunnel_id, inbound, sender, direct_ctx).await?;
         return Ok(());
     }
     if let Ok(prefix_str) = std::str::from_utf8(&peek_buf) {
@@ -50,9 +51,9 @@ async fn handle_local_tunnel(
                 // );
                 //http proxy
                 if prefix_str.as_str() == "CON" {
-                    handle_https(tunnel_id, inbound, sender).await?;
+                    handle_https(tunnel_id, inbound, sender, direct_ctx).await?;
                 } else {
-                    handle_http(tunnel_id, inbound, sender).await?;
+                    handle_http(tunnel_id, inbound, sender, direct_ctx).await?;
                 }
                 return Ok(());
             }
@@ -65,7 +66,7 @@ async fn handle_local_tunnel(
         "[{}]Accept client with non socks5/tls/http traffic.",
         tunnel_id
     );
-    super::transparent::handle_transparent(tunnel_id, inbound, sender).await
+    super::transparent::handle_transparent(tunnel_id, inbound, sender, direct_ctx).await
 }
 
 pub async fn start_local_tunnel_server(
@@ -73,6 +74,7 @@ pub async fn start_local_tunnel_server(
     sender: ProxySender,
     tproxy: bool,
     max_connections: usize,
+    direct_ctx: crate::tunnel::direct::DirectCtx,
 ) -> Result<(), std::io::Error> {
     let listener = new_tcp_listener(addr, tproxy).await?;
     let semaphore = Arc::new(Semaphore::new(max_connections));
@@ -105,9 +107,11 @@ pub async fn start_local_tunnel_server(
         let tunnel_id = tunnel_id_seed;
         tunnel_id_seed += 1;
         let tunnel_sender = sender.clone();
+        let direct_ctx = direct_ctx.clone();
         tokio::spawn(async move {
             let _permit = permit; // hold permit until task completes
-            if let Err(e) = handle_local_tunnel(inbound, tunnel_id, tunnel_sender).await {
+            if let Err(e) = handle_local_tunnel(inbound, tunnel_id, tunnel_sender, direct_ctx).await
+            {
                 tracing::error!("handle local tunnel error:{}", e);
             }
         });

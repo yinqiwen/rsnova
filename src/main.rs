@@ -166,6 +166,21 @@ struct Args {
     #[default(String::new())]
     #[arg(long = "tunnel-port-range")]
     tunnel_port_range: String,
+
+    /// Path to a plain-text direct-bypass rules file (one CIDR/domain rule per line).
+    #[default(None)]
+    #[arg(long = "direct-rules")]
+    direct_rules: Option<PathBuf>,
+
+    /// Disable direct bypass entirely.
+    #[default(false)]
+    #[arg(long = "no-direct-bypass")]
+    no_direct_bypass: bool,
+
+    /// Disable the built-in default direct-bypass rules (file rules still apply).
+    #[default(false)]
+    #[arg(long = "no-default-bypass")]
+    no_default_bypass: bool,
 }
 
 fn validate_mux_stream_window(window: u32) -> anyhow::Result<()> {
@@ -261,6 +276,12 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
     }
 
     // Build shared AppConfig for admin server and tunnel client
+    let direct_ctx = tunnel::direct::DirectCtx::new(
+        matches!(args.role, Role::Client) && !args.no_direct_bypass,
+        !args.no_default_bypass,
+        args.direct_rules.clone(),
+        args.idle_timeout_secs,
+    );
     let app_config = Arc::new(app_config::AppConfig {
         reloadable: Arc::new(tokio::sync::Mutex::new(app_config::ReloadableConfig {
             tunnel_entries,
@@ -287,6 +308,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
         reload_token: Arc::new(tokio::sync::Mutex::new(
             tokio_util::sync::CancellationToken::new(),
         )),
+        direct_ctx,
     });
 
     // Start admin server (always enabled)
@@ -368,8 +390,18 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
             let listen_addr = args.listen;
             let tproxy = args.tproxy;
             let max_connections = args.max_connections;
-            tunnel::start_local_tunnel_server(&listen_addr, tunnel_sender, tproxy, max_connections)
-                .await?;
+            let direct_ctx = app_config.direct_ctx.clone();
+            if direct_ctx.path.is_some() && direct_ctx.enabled {
+                tunnel::direct::start_direct_watcher(direct_ctx.clone());
+            }
+            tunnel::start_local_tunnel_server(
+                &listen_addr,
+                tunnel_sender,
+                tproxy,
+                max_connections,
+                direct_ctx,
+            )
+            .await?;
 
             // Keep the main task running
             loop {

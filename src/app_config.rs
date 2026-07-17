@@ -35,6 +35,7 @@ pub struct AppConfig {
     /// CancellationToken used to notify tunnel client to reconnect with new config.
     /// Wrapped in Arc<Mutex<>> so it can be replaced after cancel (CancellationToken is one-shot).
     pub reload_token: Arc<Mutex<CancellationToken>>,
+    pub direct_ctx: crate::tunnel::direct::DirectCtx,
 }
 
 impl AppConfig {

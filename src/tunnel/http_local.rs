@@ -88,6 +88,7 @@ pub async fn handle_http(
     tunnel_id: u32,
     mut inbound: TcpStream,
     sender: ProxySender,
+    direct_ctx: crate::tunnel::direct::DirectCtx,
 ) -> Result<()> {
     let headers_buf = read_http_headers(&mut inbound).await?;
     let target_addr = extract_target(&headers_buf, ":80")?;
@@ -98,6 +99,12 @@ pub async fn handle_http(
     // let src = inbound.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "N/A".to_string());
     // tracing::info!("[{tunnel_id}] HTTP src={src} target={target_addr} original_dst={original_dst} headers={headers_str}");
     tracing::info!("[{}]Handle HTTP proxy to {} ", tunnel_id, target_addr);
+    if direct_ctx
+        .try_bypass(tunnel_id, &mut inbound, &target_addr, Some(&headers_buf))
+        .await?
+    {
+        return Ok(());
+    }
     let msg = Message::open_tcp_stream(inbound, target_addr, Some(headers_buf));
     sender.send(msg).await?;
     Ok(())
@@ -107,6 +114,7 @@ pub async fn handle_https(
     tunnel_id: u32,
     mut inbound: TcpStream,
     sender: ProxySender,
+    direct_ctx: crate::tunnel::direct::DirectCtx,
 ) -> Result<()> {
     let headers_buf = read_http_headers(&mut inbound).await?;
     let conn_res = "HTTP/1.0 200 Connection established\r\n\r\n";
@@ -119,6 +127,12 @@ pub async fn handle_https(
         Err(_) => extract_target(&headers_buf, ":443")?,
     };
     tracing::info!("[{}]Handle HTTPS proxy to {} ", tunnel_id, target_addr);
+    if direct_ctx
+        .try_bypass(tunnel_id, &mut inbound, &target_addr, None)
+        .await?
+    {
+        return Ok(());
+    }
     let msg = Message::open_tcp_stream(inbound, target_addr, None);
     sender.send(msg).await?;
     Ok(())

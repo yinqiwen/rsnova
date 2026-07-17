@@ -231,7 +231,7 @@ impl DirectCtx {
     pub async fn try_bypass(
         &self,
         tunnel_id: u32,
-        inbound: TcpStream,
+        inbound: &mut TcpStream,
         target_addr: &str,
         payload: Option<&[u8]>,
     ) -> anyhow::Result<bool> {
@@ -285,7 +285,7 @@ impl DirectCtx {
             return Ok(true);
         }
 
-        let (mut in_r, mut in_w) = inbound.into_split();
+        let (mut in_r, mut in_w) = tokio::io::split(inbound);
         let (mut out_r, mut out_w) = outbound.into_split();
         let mut stream = Stream::new(&mut in_r, &mut in_w, &mut out_r, &mut out_w);
         if let Err(e) = stream.transfer(self.idle_timeout_secs).await {
@@ -478,9 +478,9 @@ fe80::/10
         let ctx = DirectCtx::new(true, true, None, 30);
         let acc = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let acc_addr = acc.local_addr().unwrap();
-        let inbound = tokio::net::TcpStream::connect(acc_addr).await.unwrap();
+        let mut inbound = tokio::net::TcpStream::connect(acc_addr).await.unwrap();
         drop(acc);
-        let handled = ctx.try_bypass(0, inbound, "8.8.8.8:9", None).await.unwrap();
+        let handled = ctx.try_bypass(0, &mut inbound, "8.8.8.8:9", None).await.unwrap();
         assert!(!handled, "non-matching target must not be handled");
     }
 
@@ -489,10 +489,10 @@ fe80::/10
         let ctx = DirectCtx::new(false, true, None, 30);
         let acc = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let acc_addr = acc.local_addr().unwrap();
-        let inbound = tokio::net::TcpStream::connect(acc_addr).await.unwrap();
+        let mut inbound = tokio::net::TcpStream::connect(acc_addr).await.unwrap();
         drop(acc);
         // Even though 127.0.0.1 would match, disabled must short-circuit.
-        let handled = ctx.try_bypass(0, inbound, "127.0.0.1:9", None).await.unwrap();
+        let handled = ctx.try_bypass(0, &mut inbound, "127.0.0.1:9", None).await.unwrap();
         assert!(!handled);
     }
 }
