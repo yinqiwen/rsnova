@@ -296,6 +296,29 @@ impl DirectCtx {
     }
 }
 
+/// Background task: poll `ctx.path`'s mtime every 5s; on change call
+/// `ctx.reload()`. Only spawn when `ctx.path` is Some.
+pub fn start_direct_watcher(ctx: DirectCtx) {
+    let Some(path) = ctx.path.clone() else { return; };
+    tokio::spawn(async move {
+        let mut last_mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let mtime = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            if mtime != last_mtime {
+                last_mtime = mtime;
+                let _ = ctx.reload();
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +451,24 @@ fe80::/10
         assert_eq!(extract_host("example.com:80"), Some("example.com".to_string()));
         assert_eq!(extract_host("example.com"), Some("example.com".to_string()));
         assert_eq!(extract_host("::1"), Some("::1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reload_picks_up_file_changes() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("rsnova-direct-test-{}.txt", std::process::id()));
+        std::fs::write(&path, "10.0.0.0/8\n").unwrap();
+        let ctx = DirectCtx::new(true, false, Some(path.clone()), 30);
+        assert!(ctx.rules.read().unwrap().matches("10.1.2.3"));
+        assert!(!ctx.rules.read().unwrap().matches("192.168.1.1"));
+
+        // Rewrite the file; reload; new rule applies, old rule gone (no defaults).
+        std::fs::write(&path, "192.168.0.0/16\n").unwrap();
+        ctx.reload().unwrap();
+        assert!(ctx.rules.read().unwrap().matches("192.168.1.1"));
+        assert!(!ctx.rules.read().unwrap().matches("10.1.2.3"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
