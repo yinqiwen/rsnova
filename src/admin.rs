@@ -351,6 +351,10 @@ async fn handle_config_save(config: &AppConfig, body: &str) -> anyhow::Result<()
     // Trigger reload
     config.trigger_reload().await;
 
+    // Re-read direct-bypass rules file (if any) so an admin "save" also picks
+    // up rules-file edits, not just tunnel config.
+    let _ = config.direct_ctx.reload();
+
     tracing::info!("Configuration reloaded via admin page");
     Ok(())
 }
