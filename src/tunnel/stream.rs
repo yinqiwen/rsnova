@@ -286,6 +286,13 @@ impl TransferBuffer {
                     Poll::Ready(Ok(i)) => {
                         self.pos += i;
                         self.need_flush = true;
+                        // A successful write is data progress — the peer
+                        // direction is draining the buffer even though the
+                        // reader is idle (buffer is full or EOF). Without
+                        // this, Docker pulls of large images timeout when
+                        // the 32KB buffer fills and write-back is slow
+                        // (e.g. due to mux flow-control backpressure).
+                        state.mark_active();
                     }
                     Poll::Ready(Err(e)) => {
                         state.abort.store(true, Relaxed);
@@ -522,5 +529,40 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("abort"), "expected abort error, got: {}", err);
+    }
+
+    /// Regression: successful writes must reset the idle timer.
+    ///
+    /// In the Docker pull scenario the 32KB buffer fills, then drains
+    /// slowly through a bandwidth-limited mux stream. Before the fix,
+    /// only reads marked the transfer active — so a full buffer with
+    /// slow writes would hit the idle timeout even though data was
+    /// flowing. The fix calls `mark_active()` on every successful write.
+    ///
+    /// This test validates the `TransferState` contract: after the idle
+    /// check clears the active flag, a subsequent `mark_active()` (from a
+    /// successful write) must restore it so the next check sees progress.
+    #[test]
+    fn write_mark_active_resets_idle_check() {
+        let state = TransferState::new();
+        // Initial state: active == true.
+        assert!(state.check_and_reset_active(), "initial active should be true");
+        // After reset: active == false.
+        assert!(!state.check_and_reset_active(), "second check with no mark should be false");
+        // Simulate one write success (the fix adds this in poll_copy).
+        state.mark_active();
+        // Now active should be true again.
+        assert!(state.check_and_reset_active(), "mark_active after write should reset idle");
+    }
+
+    /// Without `mark_active()` on writes, two consecutive idle checks
+    /// with no read activity in between return `false` on the second
+    /// check → idle timeout. This is the bug: only reads reset the flag.
+    #[test]
+    fn write_without_mark_active_triggers_idle() {
+        let state = TransferState::new();
+        assert!(state.check_and_reset_active()); // initial
+        // Simulate idle interval with no reads AND no write-mark calls.
+        assert!(!state.check_and_reset_active()); // timeout!
     }
 }
