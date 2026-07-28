@@ -1,391 +1,189 @@
 use anyhow::{Result, anyhow};
 
-use futures::future::try_join;
-use futures::ready;
-
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::task::{Context, Poll};
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::time::Sleep;
-use tokio::time::sleep;
-use tokio::time::timeout;
+use std::time::{Duration, Instant};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional_with_sizes,
+};
+use tokio::time::{sleep, timeout};
 
 use crate::mux::event::{self, OpenStreamEvent};
 use crate::tunnel::CHECK_TIMEOUT_SECS;
 use crate::tunnel::DEFAULT_TIMEOUT_SECS;
 use crate::utils::UdpClientStream;
 
-/// Cross-direction shared state for a single `Stream::transfer`.
+const TRANSFER_BUF_SIZE: usize = 32 * 1024;
+
+/// Connection-level last-activity tracker shared by both directions.
 ///
-/// `active` is set by whichever direction successfully reads, and cleared by
-/// the idle-check timer when it fires. This replaces the previous
-/// `last_active_millis: AtomicU64` + `Instant::elapsed()` per-read syscall
-/// — at 30k reads/s/stream that syscall (~25ns each) added up under
-/// concurrency. An `AtomicBool` store is ~1ns on x86 and carries no clock
-/// dependency.
-///
-/// Trade-off: idle precision is now `CHECK_TIMEOUT_SECS` (1s) rather than
-/// sub-millisecond. That's fine — the idle budget itself is 30s, so 1s
-/// granularity is well within the slack we'd want anyway.
-struct TransferState {
-    abort: AtomicBool,
-    active: AtomicBool,
+/// Only `touch()` writes; idle checks are read-only. This avoids the previous
+/// `AtomicBool::swap(false)` design where each direction's idle timer could
+/// clear the other direction's activity credit and false-trigger timeouts
+/// during one-way downloads.
+struct IdleTrack {
+    start: Instant,
+    last_active_millis: AtomicU64,
 }
 
-impl TransferState {
+impl IdleTrack {
     fn new() -> Self {
-        Self {
-            abort: AtomicBool::new(false),
-            active: AtomicBool::new(true),
-        }
+        let track = Self {
+            start: Instant::now(),
+            last_active_millis: AtomicU64::new(0),
+        };
+        track.touch();
+        track
     }
-    /// Mark this transfer as having seen progress. Cheaper than recording a
-    /// timestamp — just a relaxed atomic store.
+
     #[inline]
-    fn mark_active(&self) {
-        self.active.store(true, Relaxed);
+    fn touch(&self) {
+        self.last_active_millis
+            .store(self.start.elapsed().as_millis() as u64, Relaxed);
     }
-    /// Called from the idle-check timer. Returns `true` if the transfer has
-    /// seen activity since the last check (and clears the flag for the next
-    /// interval); returns `false` if the transfer was idle for a full
-    /// interval.
-    fn check_and_reset_active(&self) -> bool {
-        // `swap` is used instead of `load`+`store` to avoid a TOCTOU where
-        // a read landing between load and store could be missed.
-        self.active.swap(false, Relaxed)
+
+    fn idle_millis(&self) -> u64 {
+        let now = self.start.elapsed().as_millis() as u64;
+        now.saturating_sub(self.last_active_millis.load(Relaxed))
     }
 }
 
-/// Owned transfer buffer modelled on tokio's `io::util::copy::CopyBuffer`.
-///
-/// Borrowed improvements over the previous `read(&mut [u8; 32768])` +
-/// `write_all` loop:
-///
-/// - Heap-allocated `Box<[u8]>` (borrowed from tokio) instead of a 32 KB stack
-///   array. Under 1024 concurrent streams this keeps task stacks small.
-/// - When the writer returns `Pending`, we top up the read buffer if there is
-///   room (tokio's `poll_write_buf`), so the next write can be a larger,
-///   cheaper vectored write instead of a tight write-all loop that idles the
-///   reader while waiting on flow control.
-/// - When the reader returns `Pending` but the buffer still has unwritten
-///   data, we keep draining the writer (and flush if needed) rather than
-///   parking the whole task — this avoids a deadlock when the reader depends
-///   on the writer making progress (e.g. mux flow control echo).
-/// - `poll_write` returning 0 is treated as `WriteZero` (tokio's contract)
-///   rather than silently looping.
-///
-/// Preserved project-specific behaviour:
-/// - `idle_timeout_secs` soft polling: a `Sleep` armed for `CHECK_TIMEOUT_SECS`
-///   fires periodically; on each fire we check the shared `active` flag. If
-///   the flag is set we clear it and re-arm; if it is clear we increment an
-///   idle-interval counter, and once that counter reaches
-///   `timeout_sec / CHECK_TIMEOUT_SECS` we return an idle-timeout error.
-///   This preserves the "continue on transient silence, exit only on budget
-///   exceeded" semantics that `tokio::io::copy_bidirectional` cannot express.
-/// - `state.abort` flag: a direction observing an error sets abort so the
-///   peer direction aborts on its next poll.
-/// - `state.mark_active()` on every successful read, plus four
-///   `metrics::counter!` close-reason counters.
-struct TransferBuffer {
-    read_done: bool,
-    need_flush: bool,
-    pos: usize,
-    cap: usize,
-    buf: Box<[u8]>,
-    /// Sleep armed for `CHECK_TIMEOUT_SECS`. When it fires we re-check idle
-    /// budget and re-arm. `Option` because we recreate it on each re-arm.
-    idle_check: Option<Pin<Box<Sleep>>>,
-    /// Number of consecutive idle intervals (Sleep fires with no read
-    /// activity since the previous fire). Reset to 0 whenever `active` was
-    /// set. Compared against `timeout_sec / CHECK_TIMEOUT_SECS` to decide
-    /// whether the idle budget is exceeded.
-    idle_intervals: u32,
+/// Thin `AsyncRead`/`AsyncWrite` wrapper that records byte-level progress on
+/// a shared [`IdleTrack`]. Pending I/O does **not** count as activity.
+struct IdleStream<'a, S: ?Sized> {
+    inner: &'a mut S,
+    track: Arc<IdleTrack>,
 }
 
-impl TransferBuffer {
-    fn new(buf_size: usize) -> Self {
-        Self {
-            read_done: false,
-            need_flush: false,
-            pos: 0,
-            cap: 0,
-            buf: vec![0u8; buf_size].into_boxed_slice(),
-            idle_check: None,
-            idle_intervals: 0,
-        }
-    }
-
-    fn arm_idle_check(&mut self) {
-        self.idle_check = Some(Box::pin(sleep(Duration::from_secs(CHECK_TIMEOUT_SECS))));
-    }
-
-    fn poll_fill_buf<R>(
-        &mut self,
+impl<S: AsyncRead + Unpin + ?Sized> AsyncRead for IdleStream<'_, S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        reader: Pin<&mut R>,
-        state: &TransferState,
-    ) -> Poll<io::Result<()>>
-    where
-        R: AsyncRead + ?Sized,
-    {
-        let me = &mut *self;
-        let mut buf = ReadBuf::new(&mut me.buf);
-        buf.set_filled(me.cap);
-        let res = reader.poll_read(cx, &mut buf);
-        if let Poll::Ready(Ok(())) = res {
-            let filled_len = buf.filled().len();
-            // Only mark active if we actually read new bytes. A zero-length
-            // fill (read returning 0 bytes without EOF) shouldn't reset the
-            // idle timer.
-            if filled_len > me.cap {
-                state.mark_active();
-            }
-            me.read_done = me.cap == filled_len;
-            me.cap = filled_len;
-        }
-        res
-    }
-
-    /// Borrowed from tokio: while waiting on the writer, top up the read
-    /// buffer if there is spare capacity. This converts "writer stalled, so
-    /// reader idles" into "writer stalled, so we read more ahead".
-    fn poll_write_buf<R, W>(
-        &mut self,
-        cx: &mut Context<'_>,
-        mut reader: Pin<&mut R>,
-        mut writer: Pin<&mut W>,
-        state: &TransferState,
-    ) -> Poll<io::Result<usize>>
-    where
-        R: AsyncRead + ?Sized,
-        W: AsyncWrite + ?Sized,
-    {
-        let me = &mut *self;
-        match writer.as_mut().poll_write(cx, &me.buf[me.pos..me.cap]) {
-            Poll::Pending => {
-                if !me.read_done && me.cap < me.buf.len() {
-                    ready!(me.poll_fill_buf(cx, reader.as_mut(), state))?;
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut *self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before {
+                    self.track.touch();
                 }
-                Poll::Pending
+                Poll::Ready(Ok(()))
             }
-            res => res,
+            other => other,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin + ?Sized> AsyncWrite for IdleStream<'_, S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut *self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    self.track.touch();
+                }
+                Poll::Ready(Ok(n))
+            }
+            other => other,
         }
     }
 
-    /// Drive one step of the copy loop. Returns:
-    /// - `Poll::Ready(Ok(()))` when EOF reached and flushed.
-    /// - `Poll::Ready(Err(_))` on IO error, idle timeout, or abort.
-    /// - `Poll::Pending` when waiting on reader/writer.
-    fn poll_copy<R, W>(
-        &mut self,
-        cx: &mut Context<'_>,
-        mut reader: Pin<&mut R>,
-        mut writer: Pin<&mut W>,
-        timeout_sec: u64,
-        state: &TransferState,
-    ) -> Poll<Result<()>>
-    where
-        R: AsyncRead + ?Sized,
-        W: AsyncWrite + ?Sized,
-    {
-        loop {
-            // Check abort flag first — the peer direction may have set it.
-            if state.abort.load(Relaxed) {
-                metrics::counter!("mux.stream.close.abort").increment(1);
-                return Poll::Ready(Err(anyhow!("abort")));
-            }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
 
-            // Idle-timeout soft polling. The Sleep fires every
-            // `CHECK_TIMEOUT_SECS`. On each fire we check the `active` flag.
-            // See the struct doc for the full rationale.
-            //
-            // We poll the Sleep via a temporary match rather than a let-chain
-            // so the `&mut self.idle_check` borrow ends before we touch other
-            // `self` fields below.
-            let idle_fired = match self.idle_check.as_mut() {
-                Some(sleep) => matches!(sleep.as_mut().poll(cx), Poll::Ready(())),
-                None => false,
-            };
-            if idle_fired {
-                // timeout_sec == 0 disables the idle timeout entirely.
-                // Still re-arm the Sleep so the task wakes periodically
-                // to poll the abort flag; otherwise a permanently-stalled
-                // reader would never notice the peer direction errored.
-                if timeout_sec == 0 {
-                    self.idle_intervals = 0;
-                    self.arm_idle_check();
-                    continue;
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut *self.inner).poll_write_vectored(cx, bufs) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    self.track.touch();
                 }
-                if state.check_and_reset_active() {
-                    self.idle_intervals = 0;
-                } else {
-                    self.idle_intervals += 1;
-                    let budget_intervals = (timeout_sec / CHECK_TIMEOUT_SECS).max(1) as u32;
-                    if self.idle_intervals >= budget_intervals {
-                        metrics::counter!("mux.stream.close.idle_timeout").increment(1);
-                        return Poll::Ready(Err(anyhow!(
-                            "idle timeout: no activity for {}s",
-                            timeout_sec
-                        )));
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+async fn copy_bidirectional_with_idle<A, B>(
+    a: &mut A,
+    b: &mut B,
+    idle_timeout_secs: u64,
+) -> Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    if idle_timeout_secs == 0 {
+        copy_bidirectional_with_sizes(a, b, TRANSFER_BUF_SIZE, TRANSFER_BUF_SIZE).await?;
+        metrics::counter!("mux.stream.close.eof").increment(1);
+        return Ok(());
+    }
+
+    let track = Arc::new(IdleTrack::new());
+    let mut a = IdleStream {
+        inner: a,
+        track: track.clone(),
+    };
+    let mut b = IdleStream {
+        inner: b,
+        track: track.clone(),
+    };
+
+    let copy = copy_bidirectional_with_sizes(&mut a, &mut b, TRANSFER_BUF_SIZE, TRANSFER_BUF_SIZE);
+    tokio::pin!(copy);
+
+    let idle_limit_millis = idle_timeout_secs.saturating_mul(1000);
+    let checker = sleep(Duration::from_secs(CHECK_TIMEOUT_SECS));
+    tokio::pin!(checker);
+
+    loop {
+        tokio::select! {
+            result = &mut copy => {
+                match result {
+                    Ok(_) => {
+                        metrics::counter!("mux.stream.close.eof").increment(1);
+                        return Ok(());
                     }
-                }
-                self.arm_idle_check();
-                // Re-arm created a fresh Sleep whose waker is not yet
-                // registered with the runtime. `continue` re-enters the loop
-                // so the new Sleep gets polled (registering its waker) before
-                // this task parks. Without this, a permanently-idle reader
-                // would never be woken again.
-                continue;
-            }
-
-            // Fill phase: if buffer has room and we haven't seen EOF, try to
-            // read more. `poll_fill_buf` marks the transfer active on a
-            // successful non-zero read.
-            if self.cap < self.buf.len() && !self.read_done {
-                match self.poll_fill_buf(cx, reader.as_mut(), state) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => {
-                        state.abort.store(true, Relaxed);
+                    Err(e) => {
                         metrics::counter!("mux.stream.close.read_error").increment(1);
-                        return Poll::Ready(Err(e.into()));
-                    }
-                    Poll::Pending => {
-                        // Borrowed from tokio: if the reader has no progress
-                        // but our buffer still has unwritten data, drain the
-                        // writer instead of parking. If the buffer is empty,
-                        // flush a buffered writer to avoid deadlock when the
-                        // reader depends on writer progress (mux echo).
-                        if self.pos == self.cap {
-                            if self.need_flush {
-                                ready!(writer.as_mut().poll_flush(cx))?;
-                                self.need_flush = false;
-                            }
-                            // Buffer is empty and reader has no data — park
-                            // until the reader or the idle-check Sleep wakes
-                            // us. Returning Pending is critical: `continue`
-                            // here would busy-loop and starve the runtime.
-                            return Poll::Pending;
-                        }
-                        // Buffer still has unwritten data — fall through to
-                        // the write phase below to make progress.
+                        return Err(e.into());
                     }
                 }
             }
-
-            // Write phase: drain whatever is in the buffer. `poll_write_buf`
-            // also tops up the reader (marking active) if the writer parks.
-            while self.pos < self.cap {
-                match self.poll_write_buf(cx, reader.as_mut(), writer.as_mut(), state) {
-                    Poll::Ready(Ok(0)) => {
-                        state.abort.store(true, Relaxed);
-                        metrics::counter!("mux.stream.close.write_error").increment(1);
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "write zero byte into writer",
-                        )
-                        .into()));
-                    }
-                    Poll::Ready(Ok(i)) => {
-                        self.pos += i;
-                        self.need_flush = true;
-                        // A successful write is data progress — the peer
-                        // direction is draining the buffer even though the
-                        // reader is idle (buffer is full or EOF). Without
-                        // this, Docker pulls of large images timeout when
-                        // the 32KB buffer fills and write-back is slow
-                        // (e.g. due to mux flow-control backpressure).
-                        state.mark_active();
-                    }
-                    Poll::Ready(Err(e)) => {
-                        state.abort.store(true, Relaxed);
-                        metrics::counter!("mux.stream.close.write_error").increment(1);
-                        return Poll::Ready(Err(e.into()));
-                    }
-                    Poll::Pending => {
-                        // Writer blocked on flow-control backpressure
-                        // (e.g. mux send window exhausted). This is NOT
-                        // idleness — data is in flight, just throttled.
-                        // Without this, Docker pulls of large images hit
-                        // idle timeout when the 256KB mux window is full
-                        // and WINDOW_UPDATE takes >30s on slow links.
-                        state.mark_active();
-                        return Poll::Pending;
-                    }
+            _ = &mut checker => {
+                if track.idle_millis() >= idle_limit_millis {
+                    metrics::counter!("mux.stream.close.idle_timeout").increment(1);
+                    return Err(anyhow!(
+                        "idle timeout: no activity for {}s",
+                        idle_timeout_secs
+                    ));
                 }
-            }
-
-            // Buffer drained — reset for the next fill.
-            self.pos = 0;
-            self.cap = 0;
-
-            // If reader hit EOF, flush and finish.
-            if self.read_done {
-                ready!(writer.as_mut().poll_flush(cx))?;
-                metrics::counter!("mux.stream.close.eof").increment(1);
-                return Poll::Ready(Ok(()));
+                checker
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_secs(CHECK_TIMEOUT_SECS));
             }
         }
     }
-}
-
-/// Future driving `TransferBuffer::poll_copy` to completion.
-struct Transfer<'a, R, W>
-where
-    R: AsyncRead + Unpin + ?Sized,
-    W: AsyncWrite + Unpin + ?Sized,
-{
-    reader: &'a mut R,
-    writer: &'a mut W,
-    buf: TransferBuffer,
-    timeout_sec: u64,
-    state: Arc<TransferState>,
-}
-
-impl<R, W> std::future::Future for Transfer<'_, R, W>
-where
-    R: AsyncRead + Unpin + ?Sized,
-    W: AsyncWrite + Unpin + ?Sized,
-{
-    type Output = Result<()>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let me = &mut *self;
-        me.buf.poll_copy(
-            cx,
-            Pin::new(&mut *me.reader),
-            Pin::new(&mut *me.writer),
-            me.timeout_sec,
-            &me.state,
-        )
-    }
-}
-
-async fn timeout_copy<R: AsyncRead + Unpin + ?Sized, W: AsyncWrite + Unpin + ?Sized>(
-    r: &mut R,
-    w: &mut W,
-    timeout_sec: u64,
-    state: Arc<TransferState>,
-) -> Result<()> {
-    let mut buf = TransferBuffer::new(32 * 1024);
-    buf.arm_idle_check();
-    let result = Transfer {
-        reader: r,
-        writer: w,
-        buf,
-        timeout_sec,
-        state,
-    }
-    .await;
-    // Shutdown the write side regardless of outcome so the peer sees EOF.
-    let _ = w.shutdown().await;
-    result
 }
 
 pub struct Stream<'a, LR, LW, RR, RW> {
@@ -412,21 +210,9 @@ where
     }
 
     pub async fn transfer(&mut self, idle_timeout_secs: usize) -> Result<()> {
-        let state = Arc::new(TransferState::new());
-        let client_to_server = timeout_copy(
-            &mut self.local_reader,
-            &mut self.remote_writer,
-            idle_timeout_secs as u64,
-            state.clone(),
-        );
-        let server_to_client = timeout_copy(
-            &mut self.remote_reader,
-            &mut self.local_writer,
-            idle_timeout_secs as u64,
-            state.clone(),
-        );
-        try_join(client_to_server, server_to_client).await?;
-        Ok(())
+        let mut local = tokio::io::join(&mut *self.local_reader, &mut *self.local_writer);
+        let mut remote = tokio::io::join(&mut *self.remote_reader, &mut *self.remote_writer);
+        copy_bidirectional_with_idle(&mut local, &mut remote, idle_timeout_secs as u64).await
     }
 }
 
@@ -473,25 +259,18 @@ pub async fn handle_server_stream<'a, LR: AsyncReadExt + Unpin, LW: AsyncWriteEx
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-    /// idle timeout: a stalled reader must cause `timeout_copy` to return an
-    /// error after the idle budget is exceeded. We use a 1s idle budget and
-    /// a reader that never produces data.
-    ///
-    /// With `CHECK_TIMEOUT_SECS=1` and `timeout_sec=1`, the budget is
-    /// `1 / 1 = 1` idle interval. The first Sleep fire at t=1s clears the
-    /// initial `active=true` flag (set in `TransferState::new`); the second
-    /// fire at t=2s sees `active=false` and triggers the timeout.
     #[tokio::test]
-    async fn idle_timeout_fires_on_stalled_reader() {
-        // duplex whose writer side we never touch — reader will Pending forever.
-        let (mut a, _b) = duplex(1024);
-        let state = Arc::new(TransferState::new());
-        let mut sink = tokio::io::sink();
+    async fn idle_timeout_fires_when_both_sides_stall() {
+        let (client, _client_peer) = duplex(1024);
+        let (remote, _remote_peer) = duplex(1024);
+        let (mut lr, mut lw) = tokio::io::split(client);
+        let (mut rr, mut rw) = tokio::io::split(remote);
 
         let start = Instant::now();
-        let result = timeout_copy(&mut a, &mut sink, 1, state).await;
+        let mut stream = Stream::new(&mut lr, &mut lw, &mut rr, &mut rw);
+        let result = stream.transfer(1).await;
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "expected idle timeout error");
@@ -501,10 +280,8 @@ mod tests {
             "expected idle timeout message, got: {}",
             err
         );
-        // First Sleep fires at ~1s (clears initial active flag), second at
-        // ~2s (declares timeout). Allow CI slack.
         assert!(
-            elapsed >= Duration::from_millis(1900),
+            elapsed >= Duration::from_millis(900),
             "returned too early: {:?}",
             elapsed
         );
@@ -515,72 +292,69 @@ mod tests {
         );
     }
 
-    /// abort: setting `state.abort` mid-flight causes `timeout_copy` to return
-    /// an abort error on its next poll.
+    /// Regression: one-way download must not idle-timeout while bytes keep flowing.
+    ///
+    /// The previous AtomicBool design let the silent upload direction clear the
+    /// shared activity flag every CHECK_TIMEOUT_SECS, so the download direction
+    /// accumulated false idle intervals and died around the configured budget.
     #[tokio::test]
-    async fn abort_flag_cancels_transfer() {
-        let (mut a, mut b) = duplex(1024);
-        let state = Arc::new(TransferState::new());
+    async fn one_way_download_survives_past_idle_budget() {
+        let (client_end, proxy_local) = duplex(4096);
+        let (proxy_remote, mut server_end) = duplex(4096);
+        let (mut lr, mut lw) = tokio::io::split(proxy_local);
+        let (mut rr, mut rw) = tokio::io::split(proxy_remote);
 
-        // Spawn a slow writer that produces 1 byte every 50ms — keeps the
-        // reader from hitting EOF so the abort flag is the only exit path.
         let producer = tokio::spawn(async move {
-            for _ in 0..100 {
-                b.write_all(&[0u8]).await.unwrap();
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            for _ in 0..50 {
+                server_end.write_all(&[1u8; 512]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            b.shutdown().await.unwrap();
+            server_end.shutdown().await.unwrap();
         });
 
-        let state_for_abort = state.clone();
-        // After 200ms, set abort.
-        let aborter = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            state_for_abort.abort.store(true, Relaxed);
+        let mut client_end = client_end;
+        let consumer = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match client_end.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
         });
 
-        let mut sink = tokio::io::sink();
-        let result = timeout_copy(&mut a, &mut sink, 30, state).await;
-        aborter.await.unwrap();
+        let mut stream = Stream::new(&mut lr, &mut lw, &mut rr, &mut rw);
+        let transfer = stream.transfer(2);
+        tokio::pin!(transfer);
+
+        // Idle budget is 2s; after 3s of continuous one-way traffic the relay
+        // must still be alive (would have false-triggered under the old design).
+        let still_running = timeout(Duration::from_secs(3), &mut transfer).await;
+        assert!(
+            still_running.is_err(),
+            "transfer ended before idle budget under one-way load: {:?}",
+            still_running.map(|r| r.map_err(|e| e.to_string()))
+        );
+
+        producer.abort();
+        consumer.abort();
         let _ = producer.await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("abort"), "expected abort error, got: {}", err);
+        let _ = consumer.await;
     }
 
-    /// Regression: successful writes must reset the idle timer.
-    ///
-    /// In the Docker pull scenario the 32KB buffer fills, then drains
-    /// slowly through a bandwidth-limited mux stream. Before the fix,
-    /// only reads marked the transfer active — so a full buffer with
-    /// slow writes would hit the idle timeout even though data was
-    /// flowing. The fix calls `mark_active()` on every successful write.
-    ///
-    /// This test validates the `TransferState` contract: after the idle
-    /// check clears the active flag, a subsequent `mark_active()` (from a
-    /// successful write) must restore it so the next check sees progress.
     #[test]
-    fn write_mark_active_resets_idle_check() {
-        let state = TransferState::new();
-        // Initial state: active == true.
-        assert!(state.check_and_reset_active(), "initial active should be true");
-        // After reset: active == false.
-        assert!(!state.check_and_reset_active(), "second check with no mark should be false");
-        // Simulate one write success (the fix adds this in poll_copy).
-        state.mark_active();
-        // Now active should be true again.
-        assert!(state.check_and_reset_active(), "mark_active after write should reset idle");
-    }
+    fn idle_track_touch_is_monotonic_and_non_destructive() {
+        let track = IdleTrack::new();
+        assert!(track.idle_millis() < 50);
 
-    /// Without `mark_active()` on writes, two consecutive idle checks
-    /// with no read activity in between return `false` on the second
-    /// check → idle timeout. This is the bug: only reads reset the flag.
-    #[test]
-    fn write_without_mark_active_triggers_idle() {
-        let state = TransferState::new();
-        assert!(state.check_and_reset_active()); // initial
-        // Simulate idle interval with no reads AND no write-mark calls.
-        assert!(!state.check_and_reset_active()); // timeout!
+        // Read-only checks must not clear activity.
+        let _ = track.idle_millis();
+        let _ = track.idle_millis();
+        assert!(track.idle_millis() < 50);
+
+        std::thread::sleep(Duration::from_millis(20));
+        track.touch();
+        assert!(track.idle_millis() < 20);
     }
 }
