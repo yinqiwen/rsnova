@@ -634,7 +634,15 @@ pub(crate) async fn health_loop<T>(
                         let mut guard = conn_ref.lock().await;
                         if let Some(conn) = guard.as_mut() {
                             if conn.is_valid() {
-                                if conn.ping().await.is_err() {
+                                // Data flowing through active streams is
+                                // liveness evidence — no need to PING.
+                                // Without this, PING frames get stuck
+                                // behind DATA in the mpsc channel during
+                                // large transfers (Docker pull) and the
+                                // 2s timeout fires falsely.
+                                if conn.active_stream_count() > 0 {
+                                    consecutive_fails = 0;
+                                } else if conn.ping().await.is_err() {
                                     consecutive_fails += 1;
                                     if consecutive_fails >= params.ping_fail_threshold {
                                         should_mark_retiring = true;

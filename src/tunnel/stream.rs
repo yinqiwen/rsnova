@@ -214,6 +214,15 @@ impl TransferBuffer {
                 None => false,
             };
             if idle_fired {
+                // timeout_sec == 0 disables the idle timeout entirely.
+                // Still re-arm the Sleep so the task wakes periodically
+                // to poll the abort flag; otherwise a permanently-stalled
+                // reader would never notice the peer direction errored.
+                if timeout_sec == 0 {
+                    self.idle_intervals = 0;
+                    self.arm_idle_check();
+                    continue;
+                }
                 if state.check_and_reset_active() {
                     self.idle_intervals = 0;
                 } else {
@@ -299,7 +308,16 @@ impl TransferBuffer {
                         metrics::counter!("mux.stream.close.write_error").increment(1);
                         return Poll::Ready(Err(e.into()));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        // Writer blocked on flow-control backpressure
+                        // (e.g. mux send window exhausted). This is NOT
+                        // idleness — data is in flight, just throttled.
+                        // Without this, Docker pulls of large images hit
+                        // idle timeout when the 256KB mux window is full
+                        // and WINDOW_UPDATE takes >30s on slow links.
+                        state.mark_active();
+                        return Poll::Pending;
+                    }
                 }
             }
 
