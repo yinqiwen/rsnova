@@ -21,7 +21,10 @@ fn main() {
         .build()
         .unwrap();
 
-    println!("=== Raw baselines ({} bytes, chunk={}) ===", TOTAL_BYTES, CHUNK);
+    println!(
+        "=== Raw baselines ({} bytes, chunk={}) ===",
+        TOTAL_BYTES, CHUNK
+    );
     println!();
 
     // 1. Pure memcpy — memory bandwidth floor. Copy 4MB 1000 times so the
@@ -34,11 +37,13 @@ fn main() {
         dst.copy_from_slice(&src);
     }
     let elapsed = start.elapsed();
-    let memcpy_mibps = (TOTAL_BYTES as f64 * copies as f64)
-        / elapsed.as_secs_f64()
-        / (1024.0 * 1024.0);
+    let memcpy_mibps =
+        (TOTAL_BYTES as f64 * copies as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0);
     let per_op_us = elapsed.as_secs_f64() * 1e6 / copies as f64;
-    println!("1. raw_memcpy:         {:>14.2} MiB/s  ({:.2}µs/op, n={})", memcpy_mibps, per_op_us, copies);
+    println!(
+        "1. raw_memcpy:         {:>14.2} MiB/s  ({:.2}µs/op, n={})",
+        memcpy_mibps, per_op_us, copies
+    );
 
     // 2. Duplex echo with plain tokio::io::copy (no mux).
     let mut times = Vec::new();
@@ -48,7 +53,12 @@ fn main() {
     }
     let mean_ms = times.iter().map(|t| t.as_secs_f64() * 1e3).sum::<f64>() / times.len() as f64;
     let mibps = (TOTAL_BYTES as f64) / (mean_ms / 1e3) / (1024.0 * 1024.0);
-    println!("2. duplex_echo:        {:>8.2} MiB/s  ({:.3}ms/op, n={})", mibps, mean_ms, times.len());
+    println!(
+        "2. duplex_echo:        {:>8.2} MiB/s  ({:.3}ms/op, n={})",
+        mibps,
+        mean_ms,
+        times.len()
+    );
 
     // 3. TCP loopback echo with copy_bidirectional.
     let mut times = Vec::new();
@@ -58,11 +68,19 @@ fn main() {
     }
     let mean_ms = times.iter().map(|t| t.as_secs_f64() * 1e3).sum::<f64>() / times.len() as f64;
     let mibps = (TOTAL_BYTES as f64) / (mean_ms / 1e3) / (1024.0 * 1024.0);
-    println!("3. tcp_loopback_echo:  {:>8.2} MiB/s  ({:.3}ms/op, n={})", mibps, mean_ms, times.len());
+    println!(
+        "3. tcp_loopback_echo:  {:>8.2} MiB/s  ({:.3}ms/op, n={})",
+        mibps,
+        mean_ms,
+        times.len()
+    );
 
     println!();
     println!("bench_relay (mux+duplex) reports ~1525 MiB/s on this machine.");
-    println!("Compare: mux overhead vs duplex_echo = {:.1}x", mibps_to_duplex(mibps));
+    println!(
+        "Compare: mux overhead vs duplex_echo = {:.1}x",
+        mibps_to_duplex(mibps)
+    );
 }
 
 fn mibps_to_duplex(_x: f64) -> f64 {

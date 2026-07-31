@@ -21,6 +21,15 @@ use crate::utils::read_tokio_tls_certs;
 /// Limits fd consumption under load and prevents EMFILE cascading failures.
 const MAX_SERVER_PROXY_STREAMS: usize = 256;
 
+/// Maximum concurrent inbound TLS client connections the server will hold.
+/// Each accepted connection spawns a mux dispatcher task plus a 256-entry
+/// control channel (~25KB resident), so an unbounded accept loop grows
+/// memory linearly under port scans or connection churn. 1024 matches the
+/// per-connection mux stream cap and keeps worst-case dispatcher memory
+/// around ~25MB; beyond that new connections are refused at accept time.
+const MAX_SERVER_CONNECTIONS: usize = 1024;
+const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub async fn start_tls_remote_server(
     listen: &SocketAddr,
     cert_path: &Path,
@@ -44,40 +53,102 @@ pub async fn start_tls_remote_server(
 
     let mut id: u32 = 0;
     let free_ids = Arc::new(Mutex::new(VecDeque::new()));
+    let conn_semaphore = Arc::new(Semaphore::new(MAX_SERVER_CONNECTIONS));
+    let mut accept_backoff = crate::utils::AcceptBackoff::default();
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => {
+                accept_backoff.reset();
+                accepted
+            }
+            Err(error) => {
+                let delay = accept_backoff.next_delay();
+                metrics::counter!("tls_server_accept_retries").increment(1);
+                tracing::warn!("TLS accept failed: {}; retrying in {:?}", error, delay);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
+        // Reject excess connections before allocating a dispatcher + control
+        // channel for them. The permit is held by the connection task and
+        // released when it exits, so slots recycle as connections close.
+        let permit = match conn_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                metrics::counter!("tls_server_connections_rejected").increment(1);
+                tracing::warn!(
+                    "max TLS connections ({}) reached, dropping connection",
+                    MAX_SERVER_CONNECTIONS
+                );
+                // `stream` is dropped here, closing the socket immediately.
+                continue;
+            }
+        };
         let conn_id = if free_ids.lock().unwrap().is_empty() {
             id += 1;
             id - 1
         } else {
             free_ids.lock().unwrap().pop_front().unwrap()
         };
+        metrics::gauge!("tls_server_connections").increment(1.0);
         let acceptor = acceptor.clone();
         let fut_free_ids = free_ids.clone();
         let registry = registry.clone();
         let fut = async move {
-            let stream = acceptor.accept(stream).await?;
+            let auth_deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
+            let stream = tokio::time::timeout_at(auth_deadline, acceptor.accept(stream))
+                .await
+                .map_err(|_| anyhow!("TLS handshake timed out"))??;
             tracing::info!("TLS connection incoming");
-            handle_tls_connection(stream, conn_id, idle_timeout_secs, stream_window, registry)
-                .await?;
+            handle_tls_connection_until(
+                stream,
+                conn_id,
+                idle_timeout_secs,
+                stream_window,
+                registry,
+                auth_deadline,
+            )
+            .await?;
             Ok(()) as Result<()>
         };
 
         tokio::spawn(async move {
+            let _permit = permit; // held until this task exits
             if let Err(e) = fut.await {
                 tracing::error!("connection failed: {reason}", reason = e.to_string())
             }
+            metrics::gauge!("tls_server_connections").decrement(1.0);
             fut_free_ids.lock().unwrap().push_back(conn_id);
         });
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     conn: T,
     id: u32,
     idle_timeout_secs: usize,
     stream_window: u32,
     registry: Option<crate::tunnel::tunnel_registry::SharedRegistry>,
+) -> Result<()> {
+    handle_tls_connection_until(
+        conn,
+        id,
+        idle_timeout_secs,
+        stream_window,
+        registry,
+        tokio::time::Instant::now() + AUTH_TIMEOUT,
+    )
+    .await
+}
+
+async fn handle_tls_connection_until<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    conn: T,
+    id: u32,
+    idle_timeout_secs: usize,
+    stream_window: u32,
+    registry: Option<crate::tunnel::tunnel_registry::SharedRegistry>,
+    auth_deadline: tokio::time::Instant,
 ) -> Result<()> {
     let (r, w) = tokio::io::split(conn);
     let mux_conn = Arc::new(mux::Connection::new_with_stream_window(
@@ -88,10 +159,20 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
         stream_window,
     ));
 
-    let auth_stream = mux_conn.accept_stream().await?;
+    let auth_stream = tokio::time::timeout_at(auth_deadline, mux_conn.accept_stream())
+        .await
+        .map_err(|_| {
+            metrics::counter!("tls_server_auth_timeouts").increment(1);
+            anyhow!("authentication timed out waiting for auth stream")
+        })??;
     let (mut auth_r, mut auth_w) = tokio::io::split(auth_stream);
 
-    let ev = event::read_event(&mut auth_r).await?;
+    let ev = tokio::time::timeout_at(auth_deadline, event::read_event(&mut auth_r))
+        .await
+        .map_err(|_| {
+            metrics::counter!("tls_server_auth_timeouts").increment(1);
+            anyhow!("authentication timed out waiting for auth event")
+        })??;
     if ev.header.flags() != event::FLAG_AUTH {
         return Err(anyhow!(
             "expected FLAG_AUTH on first stream, got flag={}",
@@ -109,6 +190,7 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
             let ack = event::AuthAck::Proxy;
             let ack_ev = event::new_auth_ack_event(0, &ack)?;
             event::write_event(&mut auth_w, ack_ev).await?;
+            tokio::io::AsyncWriteExt::flush(&mut auth_w).await?;
             drop(auth_r);
             drop(auth_w);
 
@@ -241,9 +323,6 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
             // of the real registration result. Entering the accept loop below
             // keeps `mux_conn` alive so the dispatcher flushes the ACK; the
             // connection tears down naturally when the client disconnects.
-            drop(auth_r);
-            drop(auth_w);
-
             match &register_req {
                 Some((req, _)) => tracing::info!(
                     "[{}] Tunnel client '{}' registered, waiting for disconnect...",
@@ -256,12 +335,55 @@ pub(crate) async fn handle_tls_connection<T: AsyncRead + AsyncWrite + Unpin + Se
                 ),
             }
 
-            // Keep the connection alive until the client disconnects. This is
-            // what lets the dispatcher flush the ACK written above. Both the
-            // success and reject paths share this loop.
-            while let Ok(_stream) = mux_conn.accept_stream().await {
-                tracing::warn!("[{}] Unexpected stream in tunnel mode, discarding", id);
+            let mut control_task =
+                tokio::spawn(async move { event::read_event(&mut auth_r).await });
+            let mut draining = false;
+            loop {
+                tokio::select! {
+                    control = &mut control_task, if !draining => {
+                        match control {
+                            Ok(Ok(ev)) if ev.header.flags() == event::FLAG_DRAIN => {
+                                draining = true;
+                                if let Some((req, registry)) = &register_req {
+                                    let marked = registry.lock().await.begin_drain(&req.client_id, id);
+                                    tracing::info!(
+                                        "[{}] Tunnel client '{}' draining (registered={})",
+                                        id,
+                                        req.client_id,
+                                        marked,
+                                    );
+                                }
+                            }
+                            Ok(Ok(ev)) => {
+                                tracing::warn!(
+                                    "[{}] unexpected tunnel control flag {}, closing generation",
+                                    id,
+                                    ev.header.flags(),
+                                );
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::debug!("[{}] tunnel control stream closed: {}", id, e);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::debug!("[{}] tunnel control task failed: {}", id, e);
+                                break;
+                            }
+                        }
+                    }
+                    stream = mux_conn.accept_stream() => {
+                        match stream {
+                            Ok(_stream) => {
+                                tracing::warn!("[{}] Unexpected stream in tunnel mode, discarding", id);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
             }
+            control_task.abort();
+            drop(auth_w);
 
             if let Some((req, registry)) = register_req {
                 tracing::info!(
@@ -291,6 +413,33 @@ mod tests {
     use super::*;
     use crate::mux::event::TunnelEntry;
     use crate::mux::{self, event};
+
+    #[tokio::test]
+    async fn silent_client_hits_auth_deadline_and_releases_permit() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let (client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            let _client = client;
+            handle_tls_connection_until(
+                server,
+                0,
+                0,
+                mux::INITIAL_STREAM_WINDOW,
+                None,
+                tokio::time::Instant::now() + Duration::from_millis(20),
+            )
+            .await
+        });
+
+        let error = task
+            .await
+            .unwrap()
+            .expect_err("silent client must time out");
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(semaphore.available_permits(), 1);
+    }
 
     /// Regression test for the "close by remote" race.
     ///

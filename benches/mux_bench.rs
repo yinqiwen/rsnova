@@ -17,8 +17,8 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rsnova::mux::Connection;
-use rsnova::mux::event;
 use rsnova::mux::Mode;
+use rsnova::mux::event;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Spawn a runtime once per criterion process. Criterion's async_tokio
@@ -47,20 +47,10 @@ fn bench_mux_stream_write(c: &mut Criterion) {
                     let (a, b) = tokio::io::duplex(8 * 1024 * 1024);
                     let (a_r, a_w) = tokio::io::split(a);
                     let (b_r, b_w) = tokio::io::split(b);
-                    let client = Connection::new_with_stream_window(
-                        a_r,
-                        a_w,
-                        Mode::Client,
-                        0,
-                        256 * 1024,
-                    );
-                    let server = Connection::new_with_stream_window(
-                        b_r,
-                        b_w,
-                        Mode::Server,
-                        1,
-                        256 * 1024,
-                    );
+                    let client =
+                        Connection::new_with_stream_window(a_r, a_w, Mode::Client, 0, 256 * 1024);
+                    let server =
+                        Connection::new_with_stream_window(b_r, b_w, Mode::Server, 1, 256 * 1024);
 
                     let client_stream = client.open_stream().await.expect("open_stream");
                     let server_stream = server.accept_stream().await.expect("accept_stream");
@@ -162,67 +152,55 @@ fn bench_connection_duplex(c: &mut Criterion) {
     for size in [4 * 1024usize, 64 * 1024, 256 * 1024] {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            b.to_async(&rt()).iter(|| {
-                async move {
-                    let (a, b) = tokio::io::duplex(8 * 1024 * 1024);
-                    let (a_r, a_w) = tokio::io::split(a);
-                    let (b_r, b_w) = tokio::io::split(b);
-                    let client = Connection::new_with_stream_window(
-                        a_r,
-                        a_w,
-                        Mode::Client,
-                        0,
-                        256 * 1024,
-                    );
-                    let server = Connection::new_with_stream_window(
-                        b_r,
-                        b_w,
-                        Mode::Server,
-                        1,
-                        256 * 1024,
-                    );
+            b.to_async(&rt()).iter(|| async move {
+                let (a, b) = tokio::io::duplex(8 * 1024 * 1024);
+                let (a_r, a_w) = tokio::io::split(a);
+                let (b_r, b_w) = tokio::io::split(b);
+                let client =
+                    Connection::new_with_stream_window(a_r, a_w, Mode::Client, 0, 256 * 1024);
+                let server =
+                    Connection::new_with_stream_window(b_r, b_w, Mode::Server, 1, 256 * 1024);
 
-                    let client_stream = client.open_stream().await.expect("open_stream");
-                    let server_stream = server.accept_stream().await.expect("accept_stream");
-                    let (mut cr, mut cw) = tokio::io::split(client_stream);
-                    let (mut sr, mut sw) = tokio::io::split(server_stream);
+                let client_stream = client.open_stream().await.expect("open_stream");
+                let server_stream = server.accept_stream().await.expect("accept_stream");
+                let (mut cr, mut cw) = tokio::io::split(client_stream);
+                let (mut sr, mut sw) = tokio::io::split(server_stream);
 
-                    let payload = vec![0xABu8; size];
-                    let echo_payload = payload.clone();
-                    let echo = tokio::spawn(async move {
-                        let mut buf = vec![0u8; size.min(32 * 1024)];
-                        let mut remaining = size;
-                        while remaining > 0 {
-                            let n = sr.read(&mut buf).await.unwrap();
-                            if n == 0 {
-                                break;
-                            }
-                            sw.write_all(&buf[..n]).await.unwrap();
-                            remaining -= n;
-                        }
-                        sw.shutdown().await.unwrap();
-                        black_box(echo_payload);
-                    });
-
-                    cw.write_all(&payload).await.unwrap();
-                    cw.shutdown().await.unwrap();
-
-                    let mut recv = Vec::with_capacity(size);
+                let payload = vec![0xABu8; size];
+                let echo_payload = payload.clone();
+                let echo = tokio::spawn(async move {
                     let mut buf = vec![0u8; size.min(32 * 1024)];
                     let mut remaining = size;
                     while remaining > 0 {
-                        let n = cr.read(&mut buf).await.unwrap();
+                        let n = sr.read(&mut buf).await.unwrap();
                         if n == 0 {
                             break;
                         }
-                        recv.extend_from_slice(&buf[..n]);
+                        sw.write_all(&buf[..n]).await.unwrap();
                         remaining -= n;
                     }
-                    let _ = echo.await;
-                    client.close();
-                    server.close();
-                    black_box(recv.len());
+                    sw.shutdown().await.unwrap();
+                    black_box(echo_payload);
+                });
+
+                cw.write_all(&payload).await.unwrap();
+                cw.shutdown().await.unwrap();
+
+                let mut recv = Vec::with_capacity(size);
+                let mut buf = vec![0u8; size.min(32 * 1024)];
+                let mut remaining = size;
+                while remaining > 0 {
+                    let n = cr.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    recv.extend_from_slice(&buf[..n]);
+                    remaining -= n;
                 }
+                let _ = echo.await;
+                client.close();
+                server.close();
+                black_box(recv.len());
             });
         });
     }

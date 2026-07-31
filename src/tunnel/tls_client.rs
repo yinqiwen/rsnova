@@ -47,15 +47,25 @@ impl MuxConnection for TlsConnection {
             None => Err(anyhow!("null connection")),
             Some(c) => match c.ping().await {
                 Ok(()) => Ok(()),
-                Err(e) => {
+                Err(e) if e.is_fatal() => {
                     // Tear down the old mux task before dropping it. Otherwise
                     // it keeps running on the half-open TLS link until TCP
                     // keepalive eventually trips — exactly the failure mode
                     // ping was added to detect.
                     c.close();
                     self.inner = None;
-                    tracing::error!("ping failed: {}", e);
-                    Err(e)
+                    tracing::error!("ping failed, connection unusable: {}", e);
+                    Err(anyhow::Error::new(e))
+                }
+                Err(e) => {
+                    // A timeout alone is not proof the link is gone: one lost
+                    // packet plus TCP retransmission backoff can blow the ping
+                    // budget on a perfectly usable path. Leave the connection
+                    // in place and let the health loop's consecutive-failure
+                    // threshold decide — it closes the conn once the threshold
+                    // is reached.
+                    tracing::warn!("ping failed: {}", e);
+                    Err(anyhow::Error::new(e))
                 }
             },
         }
@@ -274,6 +284,7 @@ async fn new_tls_connection(
 
     let connector = TlsConnector::from(Arc::new(client_crypto));
     let stream = TcpStream::connect(&remote).await?;
+    crate::utils::set_tcp_keepalive(&stream);
 
     let domain = pki_types::ServerName::try_from(domain)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?

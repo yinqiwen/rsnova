@@ -36,10 +36,7 @@ fn main() -> std::io::Result<()> {
 
     println!(
         "bench_relay: {} bytes total per iter, chunk={}, warmup={}, measured={}",
-        total_bytes,
-        CHUNK,
-        warmup,
-        measured
+        total_bytes, CHUNK, warmup, measured
     );
 
     // Single runtime for the whole process. We don't try to cleanly shut
@@ -78,11 +75,12 @@ fn main() -> std::io::Result<()> {
         println!("  run[{}]: {:.3}ms  {:.2} MiB/s", i, secs * 1e3, mibps);
     }
 
-    let mean_ms = measured_times.iter().map(|t| t.as_secs_f64() * 1e3).sum::<f64>()
+    let mean_ms = measured_times
+        .iter()
+        .map(|t| t.as_secs_f64() * 1e3)
+        .sum::<f64>()
         / measured_times.len() as f64;
-    let mean_mibps = (total_bytes as f64)
-        / (mean_ms / 1e3)
-        / (1024.0 * 1024.0);
+    let mean_mibps = (total_bytes as f64) / (mean_ms / 1e3) / (1024.0 * 1024.0);
     let min_ms = measured_times
         .iter()
         .map(|t| t.as_secs_f64() * 1e3)
@@ -93,7 +91,11 @@ fn main() -> std::io::Result<()> {
         .fold(0.0, f64::max);
     println!(
         "\nmean: {:.3}ms  {:.2} MiB/s   (min {:.3}ms, max {:.3}ms, n={})",
-        mean_ms, mean_mibps, min_ms, max_ms, measured_times.len()
+        mean_ms,
+        mean_mibps,
+        min_ms,
+        max_ms,
+        measured_times.len()
     );
 
     Ok(())

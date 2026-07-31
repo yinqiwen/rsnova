@@ -95,9 +95,19 @@ pub struct NewStreamParams {
     pub window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
 }
 
+/// Control-plane messages for the mux dispatcher.
+///
+/// The two largest variants are boxed so the enum stays pointer-sized for
+/// the common small variants (Ping/Pong/StreamClose/WindowUpdateFromPeer).
+/// `AcceptStream` wraps a oneshot carrying a full `MuxStream` (~200B) and
+/// `NewStreamParams` bundles two channel endpoints plus an Arc (~50B);
+/// inlined, they would make every `Control` — including the per-DATA-frame
+/// `StreamData` — as large as the biggest variant. With
+/// `CONTROL_CHANNEL_CAPACITY = 256` slots per connection, boxing keeps the
+/// resident channel buffer at a few KB instead of tens of KB.
 pub enum Control {
-    AcceptStream(oneshot::Sender<Result<MuxStream>>),
-    NewStream(NewStreamParams),
+    AcceptStream(Box<oneshot::Sender<Result<MuxStream>>>),
+    NewStream(Box<NewStreamParams>),
     StreamData(u32, Bytes, bool),
     StreamShutdown(u32, bool),
     StreamClose(u32, bool),
@@ -113,13 +123,19 @@ pub struct MuxStream {
     ev_writer: PollSender<Control>,
     inbound_reader: mpsc::UnboundedReceiver<Option<Bytes>>,
     recv_buf: Bytes,
-    initial_close: bool,
+    shutdown_state: ShutdownState,
     close_by_remote: bool,
     read_eof: bool,
     flow: Arc<StreamFlow>,
     consumed_since_update: u32,
     window_update_threshold: u32,
     window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownState {
+    Open,
+    Sent,
 }
 
 impl MuxStream {
@@ -138,7 +154,7 @@ impl MuxStream {
             ev_writer: PollSender::new(ev_writer),
             inbound_reader,
             recv_buf: Bytes::new(),
-            initial_close: false,
+            shutdown_state: ShutdownState::Open,
             close_by_remote: false,
             read_eof: false,
             flow,
@@ -175,53 +191,37 @@ impl MuxStream {
     }
 
     /// Zero-copy write path for callers that already hold a `Bytes`.
-///
-/// The standard `AsyncWrite::poll_write` takes `&[u8]`, forcing an internal
-/// `extend_from_slice` copy into an owned `BytesMut` before the bytes can
-/// travel across the dispatcher's mpsc channel. When a caller (e.g. the
-/// relay loop in `tunnel::stream`) has read data into a `BytesMut` and
-/// `split_to`/`freeze`d it into a `Bytes`, this method skips that copy
-/// entirely — the `Bytes` is moved straight into the `Control::StreamData`
-/// message with only a refcount bump.
-///
-/// Returns `Poll::Ready(Ok(()))` when the full `data` has been accepted
-/// (subject to flow-control window). If the window can't cover all of
-/// `data.len()`, returns `Pending` after registering the waker; the caller
-/// should retry the same `data` when woken. If `data.len()` exceeds the
-/// initial stream window the caller must split it first.
-pub fn poll_write_bytes(
-    &mut self,
-    cx: &mut Context<'_>,
-    data: Bytes,
-) -> Poll<Result<(), std::io::Error>> {
-    if self.close_by_remote || self.flow.is_closed() {
-        return Poll::Ready(Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "stream closed",
-        )));
-    }
-    let len = data.len();
-    if len == 0 {
-        return Poll::Ready(Ok(()));
-    }
-
-    if self.flow.available() < len as u32 {
-        self.flow.register_waker(cx.waker());
-        if self.flow.is_closed() {
+    ///
+    /// The standard `AsyncWrite::poll_write` takes `&[u8]`, forcing an internal
+    /// `extend_from_slice` copy into an owned `BytesMut` before the bytes can
+    /// travel across the dispatcher's mpsc channel. When a caller (e.g. the
+    /// relay loop in `tunnel::stream`) has read data into a `BytesMut` and
+    /// `split_to`/`freeze`d it into a `Bytes`, this method skips that copy
+    /// entirely — the `Bytes` is moved straight into the `Control::StreamData`
+    /// message with only a refcount bump.
+    ///
+    /// Returns `Poll::Ready(Ok(()))` when the full `data` has been accepted
+    /// (subject to flow-control window). If the window can't cover all of
+    /// `data.len()`, returns `Pending` after registering the waker; the caller
+    /// should retry the same `data` when woken. If `data.len()` exceeds the
+    /// initial stream window the caller must split it first.
+    pub fn poll_write_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+        data: Bytes,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if self.close_by_remote || self.flow.is_closed() {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "stream closed",
             )));
         }
-        if self.flow.available() < len as u32 {
-            mux_metrics::inc_write_window_wait(self.conn_id);
-            return Poll::Pending;
+        let len = data.len();
+        if len == 0 {
+            return Poll::Ready(Ok(()));
         }
-    }
 
-    match self.ev_writer.poll_reserve(cx) {
-        Poll::Pending => {
-            mux_metrics::inc_poll_reserve_wait(self.conn_id);
+        if self.flow.available() < len as u32 {
             self.flow.register_waker(cx.waker());
             if self.flow.is_closed() {
                 return Poll::Ready(Err(std::io::Error::new(
@@ -229,36 +229,52 @@ pub fn poll_write_bytes(
                     "stream closed",
                 )));
             }
+            if self.flow.available() < len as u32 {
+                mux_metrics::inc_write_window_wait(self.conn_id);
+                return Poll::Pending;
+            }
+        }
+
+        match self.ev_writer.poll_reserve(cx) {
+            Poll::Pending => {
+                mux_metrics::inc_poll_reserve_wait(self.conn_id);
+                self.flow.register_waker(cx.waker());
+                if self.flow.is_closed() {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "stream closed",
+                    )));
+                }
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(e)) => {
+                return Poll::Ready(Err(utils::make_io_error(&e.to_string())));
+            }
+            Poll::Ready(Ok(_)) => {}
+        }
+
+        let consumed = self.flow.try_consume(len);
+        if consumed < len {
+            // Window shrank between the check above and try_consume. Abort the
+            // reservation and let the caller retry — partial writes via this
+            // path would require the caller to split the Bytes, which loses the
+            // zero-copy benefit.
+            if self.ev_writer.abort_send() {
+                mux_metrics::inc_poll_reserve_aborted(self.conn_id);
+            }
+            self.flow.register_waker(cx.waker());
             return Poll::Pending;
         }
-        Poll::Ready(Err(e)) => {
-            return Poll::Ready(Err(utils::make_io_error(&e.to_string())));
-        }
-        Poll::Ready(Ok(_)) => {}
-    }
 
-    let consumed = self.flow.try_consume(len);
-    if consumed < len {
-        // Window shrank between the check above and try_consume. Abort the
-        // reservation and let the caller retry — partial writes via this
-        // path would require the caller to split the Bytes, which loses the
-        // zero-copy benefit.
-        if self.ev_writer.abort_send() {
-            mux_metrics::inc_poll_reserve_aborted(self.conn_id);
+        let stream_id = self.id;
+        match self
+            .ev_writer
+            .send_item(Control::StreamData(stream_id, data, false))
+        {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
         }
-        self.flow.register_waker(cx.waker());
-        return Poll::Pending;
     }
-
-    let stream_id = self.id;
-    match self
-        .ev_writer
-        .send_item(Control::StreamData(stream_id, data, false))
-    {
-        Ok(()) => Poll::Ready(Ok(())),
-        Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
-    }
-}
 }
 
 impl AsyncRead for MuxStream {
@@ -428,19 +444,24 @@ impl AsyncWrite for MuxStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        if !self.initial_close {
-            self.initial_close = true;
-            self.flush_window_update();
-            let ctrl = Control::StreamShutdown(self.id, false);
-            match ready!(self.ev_writer.poll_reserve(cx)) {
-                Err(e) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
-                Ok(_) => match self.ev_writer.send_item(ctrl) {
-                    Ok(()) => Poll::Ready(Ok(())),
+        if self.shutdown_state == ShutdownState::Sent {
+            return Poll::Ready(Ok(()));
+        }
+
+        self.flush_window_update();
+        match self.ev_writer.poll_reserve(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(utils::make_io_error(&e.to_string()))),
+            Poll::Ready(Ok(())) => {
+                let ctrl = Control::StreamShutdown(self.id, false);
+                match self.ev_writer.send_item(ctrl) {
+                    Ok(()) => {
+                        self.shutdown_state = ShutdownState::Sent;
+                        Poll::Ready(Ok(()))
+                    }
                     Err(ex) => Poll::Ready(Err(utils::make_io_error(&ex.to_string()))),
-                },
+                }
             }
-        } else {
-            Poll::Ready(Ok(()))
         }
     }
 }
@@ -563,5 +584,54 @@ mod tests {
         flow.close();
         flow.credit(100);
         assert_eq!(flow.available(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_retries_after_control_channel_capacity_returns() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        control_tx.send(Control::Ping(1)).await.unwrap();
+        let (_data_tx, data_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::unbounded_channel();
+        let mut stream = MuxStream::new(
+            1,
+            9,
+            control_tx,
+            data_rx,
+            Arc::new(StreamFlow::new(4096)),
+            4096,
+            window_tx,
+        );
+
+        let mut shutdown = Box::pin(stream.shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(matches!(control_rx.recv().await, Some(Control::Ping(1))));
+        shutdown.await.unwrap();
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(Control::StreamShutdown(9, false))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod control_size_tests {
+    #[test]
+    fn control_enum_stays_small() {
+        // Boxing AcceptStream/NewStream keeps the hot StreamData/Ping/Pong
+        // variants pointer-sized. Regression guard: if someone adds a large
+        // inline variant, this fails and the channel buffer bloats.
+        let size = std::mem::size_of::<super::Control>();
+        assert!(
+            size <= 40,
+            "Control enum is {} bytes; keep large variants boxed",
+            size
+        );
     }
 }

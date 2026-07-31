@@ -22,6 +22,19 @@ pub const WINDOW_UPDATE_THRESHOLD: u32 = INITIAL_STREAM_WINDOW / 2;
 pub const CONTROL_CHANNEL_CAPACITY: usize = 256;
 pub const MAX_PENDING_INCOMING_STREAMS: usize = 1024;
 pub const MAX_MUX_STREAMS_PER_CONNECTION: usize = 1024;
+/// How many multiples of `initial_stream_window` a stream's dispatcher-side
+/// backlog (`pending_bytes`: bytes pushed into the per-stream channel but not
+/// yet consumed by the application) may reach before the stream is declared
+/// unresponsive and forcibly closed.
+///
+/// The inbound data channel is *unbounded*, so without this cap a consumer
+/// that stops reading (buggy upstream, dead task, slowloris-style peer) lets
+/// `pending_bytes` grow without limit — one stuck stream per connection can
+/// OOM the process. Normal backpressure keeps `pending_bytes` near
+/// `initial_stream_window` (the peer pauses when its send window empties);
+/// 4× headroom absorbs transient bursts without false positives. When the
+/// cap trips we send FIN to the peer, drop the entry, and return the memory.
+const PENDING_BYTES_CAP_WINDOW_MULTIPLE: u64 = 4;
 
 fn incoming_stream_rejection_reason(
     pending_incoming_streams: usize,
@@ -38,11 +51,44 @@ fn incoming_stream_rejection_reason(
 
 /// How long a single ping waits for its matching pong before declaring the
 /// connection unhealthy. The health-check loop in `tunnel/client.rs` fires
-/// every 1 second; a 2-second timeout gives one missed RTT of headroom while
-/// still surfacing a half-open link within ~3 seconds of a stall. Tune higher
-/// for very high-latency links (mobile/satellite); lower values risk
-/// false-positive reconnects under transient load.
-const PING_TIMEOUT: Duration = Duration::from_secs(2);
+/// every 1 second; 5 seconds absorbs a TCP retransmission (or two) on a lossy
+/// path without a false-positive reconnect, while still surfacing a half-open
+/// link within roughly one ping interval of a stall. Tune higher for very
+/// high-latency links (mobile/satellite); lower values risk false-positive
+/// reconnects under transient load.
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a ping round-trip failed.
+///
+/// The distinction drives connection lifecycle. A `Timeout` may be a transient
+/// stall on a still-live link — a single lost packet plus TCP retransmission
+/// backoff exceeds `PING_TIMEOUT` on a lossy path — so the caller applies its
+/// consecutive-failure threshold before giving up on the connection. `Dead`
+/// means the mux dispatcher is gone and no amount of retrying revives it.
+#[derive(Debug)]
+pub enum PingError {
+    Timeout(Duration),
+    Dead(&'static str),
+}
+
+impl PingError {
+    /// `true` when the connection can never recover and must be replaced
+    /// immediately, bypassing any consecutive-failure threshold.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, PingError::Dead(_))
+    }
+}
+
+impl std::fmt::Display for PingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PingError::Timeout(d) => write!(f, "ping timeout after {:?}", d),
+            PingError::Dead(reason) => write!(f, "{}", reason),
+        }
+    }
+}
+
+impl std::error::Error for PingError {}
 
 /// Per-stream state owned exclusively by the dispatcher.
 struct StreamEntry {
@@ -63,7 +109,9 @@ pub struct Connection {
     pong_rx: mpsc::Receiver<u32>,
     ping_nonce_seed: AtomicU32,
     window_update_sender: mpsc::UnboundedSender<(u32, u32)>,
-    #[allow(dead_code)]
+    /// Live mux streams on this connection. Read by `ping()` to implement
+    /// active-traffic liveness (data flow proves the link is up), and by
+    /// `tunnel_remote` to refuse selecting a dead handler for a new visitor.
     active_stream_count: Arc<AtomicUsize>,
     /// Handle to the spawned dispatcher task. Aborted on Drop as
     /// defense-in-depth: `Connection::close()` is best-effort
@@ -140,22 +188,46 @@ impl Connection {
         }
     }
 
-    pub async fn ping(&mut self) -> Result<()> {
+    /// `true` when at least one mux stream is currently active on this
+    /// connection. Data flowing through active streams is proof the link is
+    /// up; `ping()` uses this to skip the wire round-trip, and tunnel code
+    /// uses it to detect a dead-but-not-yet-torn-down connection before
+    /// handing it a new visitor stream.
+    pub fn has_active_streams(&self) -> bool {
+        self.active_stream_count.load(Ordering::Relaxed) > 0
+    }
+
+    pub async fn ping(&mut self) -> std::result::Result<(), PingError> {
+        // Active streams are already exchanging DATA frames with the peer in
+        // both directions — that is stronger liveness evidence than a PING
+        // round-trip. Skipping the wire ping avoids false timeouts when DATA
+        // saturates the link (a PING queued behind a full window easily blows
+        // the 5s budget on a healthy connection), and keeps reverse-tunnel
+        // control connections alive while they carry visitor traffic.
+        // Trade-off: an idle tunnel control connection whose peer
+        // half-vanishes (NAT silently drops the session) is only detected
+        // when a reverse stream actually fails; the reconnect loop then
+        // recovers within one backoff interval.
+        if self.has_active_streams() {
+            return Ok(());
+        }
         // Allocate a fresh monotonic nonce for this round-trip. Stale pongs
         // from previously timed-out pings carry old nonces and will be ignored
         // below — we drain them first as an optimization.
         while self.pong_rx.try_recv().is_ok() {}
         let nonce = self.ping_nonce_seed.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = self.ev_writer.send(Control::Ping(nonce)).await {
-            return Err(anyhow::Error::new(e));
+        if self.ev_writer.send(Control::Ping(nonce)).await.is_err() {
+            return Err(PingError::Dead("mux task terminated; ping not sent"));
         }
         let deadline = tokio::time::Instant::now() + PING_TIMEOUT;
         loop {
             match tokio::time::timeout_at(deadline, self.pong_rx.recv()).await {
                 Ok(Some(n)) if n == nonce => return Ok(()),
                 Ok(Some(_)) => continue, // stale pong from a previous round; keep waiting
-                Ok(None) => return Err(anyhow!("mux task terminated; connection unhealthy")),
-                Err(_) => return Err(anyhow!("ping timeout after {:?}", PING_TIMEOUT)),
+                Ok(None) => {
+                    return Err(PingError::Dead("mux task terminated; connection unhealthy"));
+                }
+                Err(_) => return Err(PingError::Timeout(PING_TIMEOUT)),
             }
         }
     }
@@ -175,13 +247,13 @@ impl Connection {
         );
         if let Err(e) = self
             .ev_writer
-            .send(Control::NewStream(NewStreamParams {
+            .send(Control::NewStream(Box::new(NewStreamParams {
                 stream_id: id,
                 sender,
                 receiver: None,
                 flow,
                 window_update_sender: self.window_update_sender.clone(),
-            }))
+            })))
             .await
         {
             return Err(anyhow::Error::new(e));
@@ -191,7 +263,11 @@ impl Connection {
 
     pub async fn accept_stream(&self) -> Result<MuxStream> {
         let (sender, receiver) = oneshot::channel::<Result<MuxStream>>();
-        if let Err(e) = self.ev_writer.send(Control::AcceptStream(sender)).await {
+        if let Err(e) = self
+            .ev_writer
+            .send(Control::AcceptStream(Box::new(sender)))
+            .await
+        {
             return Err(anyhow::Error::new(e));
         }
         match receiver.await {
@@ -211,7 +287,6 @@ impl Connection {
         let _ = self.ev_writer.try_send(Control::Close);
     }
 
-    #[allow(dead_code)]
     pub fn active_stream_count(&self) -> usize {
         self.active_stream_count.load(Ordering::Relaxed)
     }
@@ -290,6 +365,42 @@ async fn apply_window_update<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Remove stream entries whose dispatcher-side backlog exceeded
+/// `PENDING_BYTES_CAP_WINDOW_MULTIPLE × initial_stream_window`, returning
+/// their stream ids. The caller is responsible for the follow-up teardown
+/// (flow close, peer FIN, metrics). Split out of the dispatcher loop so the
+/// threshold logic is directly unit-testable.
+fn drain_backlog_capped_streams(
+    stream_entries: &mut HashMap<u32, StreamEntry>,
+    active_stream_count: &AtomicUsize,
+    initial_stream_window: u32,
+) -> Vec<u32> {
+    let pending_cap = initial_stream_window as u64 * PENDING_BYTES_CAP_WINDOW_MULTIPLE;
+    let stalled: Vec<u32> = stream_entries
+        .iter()
+        .filter(|(_, entry)| entry.pending_bytes > pending_cap)
+        .map(|(sid, _)| *sid)
+        .collect();
+    for sid in &stalled {
+        if let Some(entry) = stream_entries.remove(sid) {
+            tracing::warn!(
+                "stream backlog {} bytes exceeds cap {}; closing unresponsive stream (sid={})",
+                entry.pending_bytes,
+                pending_cap,
+                sid
+            );
+            entry.flow.close();
+            let _ = entry.sender.send(None);
+            metrics::gauge!("mux.streams").decrement(1.0);
+            metrics::counter!("mux.stream.backlog_cap_hit").increment(1);
+        }
+    }
+    if !stalled.is_empty() {
+        active_stream_count.fetch_sub(stalled.len(), Ordering::Relaxed);
+    }
+    stalled
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     conn_id: u32,
@@ -311,13 +422,13 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 event::FLAG_SYN => {
                     let (sender, receiver) = mpsc::unbounded_channel::<Option<Bytes>>();
                     let flow = Arc::new(StreamFlow::new(initial_stream_window));
-                    Control::NewStream(NewStreamParams {
+                    Control::NewStream(Box::new(NewStreamParams {
                         stream_id: ev.header.stream_id,
                         sender,
                         receiver: Some(receiver),
                         flow,
                         window_update_sender: window_update_sender.clone(),
-                    })
+                    }))
                 }
                 event::FLAG_FIN => Control::StreamClose(ev.header.stream_id, true),
                 event::FLAG_SHUTDOWN => Control::StreamShutdown(ev.header.stream_id, true),
@@ -426,6 +537,31 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     // channel was saturated (StreamClose try_send failed).
                     // See `reap_closed_stream_entries` for the leak this fixes.
                     reap_closed_stream_entries(&mut stream_entries, &active_stream_count);
+
+                    // Close streams whose dispatcher-side backlog has blown
+                    // past PENDING_BYTES_CAP_WINDOW_MULTIPLE × window. The
+                    // inbound channel is unbounded, so a stuck consumer would
+                    // otherwise grow its queue without limit. 1s cadence is
+                    // fast enough to catch a stalled stream before it
+                    // accumulates many multiples of the cap.
+                    let stalled = drain_backlog_capped_streams(
+                        &mut stream_entries,
+                        &active_stream_count,
+                        initial_stream_window,
+                    );
+                    for sid in stalled {
+                        tracing::warn!(
+                            "[{}/{}] stream closed by backlog cap",
+                            conn_id,
+                            sid
+                        );
+                        let ev = event::new_fin_event(sid);
+                        if let Err(e) = event::write_event(&mut w, ev).await {
+                            tracing::error!("write fin for backlog-capped stream failed:{}", e);
+                            break;
+                        }
+                    }
+
                     let mut total_recv_window: u64 = 0;
                     let mut total_send_window: u64 = 0;
                     let mut total_pending_bytes: u64 = 0;
@@ -450,7 +586,7 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let _ = callback.send(Err(anyhow!("duplicate accept")));
                             continue;
                         }
-                        accept_callback = Some(callback);
+                        accept_callback = Some(*callback);
                     }
                     Control::NewStream(params) => {
                         let is_incoming = params.receiver.is_some();
@@ -646,6 +782,75 @@ async fn handle_mux_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
 
+    /// Build a StreamEntry with the given backlog, plus its receiver so the
+    /// sender isn't immediately closed.
+    fn entry_with_backlog(
+        pending_bytes: u64,
+    ) -> (StreamEntry, mpsc::UnboundedReceiver<Option<Bytes>>) {
+        let (tx, rx) = mpsc::unbounded_channel::<Option<Bytes>>();
+        (
+            StreamEntry {
+                sender: tx,
+                recv_window: INITIAL_STREAM_WINDOW,
+                flow: Arc::new(StreamFlow::new(INITIAL_STREAM_WINDOW)),
+                pending_bytes,
+            },
+            rx,
+        )
+    }
+
+    /// A stream whose consumer stops reading must not accumulate an
+    /// unbounded dispatcher-side backlog. Once `pending_bytes` exceeds
+    /// `PENDING_BYTES_CAP_WINDOW_MULTIPLE × initial_stream_window`,
+    /// `drain_backlog_capped_streams` removes it and returns its sid for FIN
+    /// teardown; below the cap the stream is left alone.
+    #[test]
+    fn backlog_cap_removes_only_stalled_streams() {
+        let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let window = INITIAL_STREAM_WINDOW;
+        let cap = window as u64 * PENDING_BYTES_CAP_WINDOW_MULTIPLE;
+
+        // sid 0: healthy stream with a normal in-flight backlog (< cap).
+        let (healthy, _rx0) = entry_with_backlog(window as u64);
+        entries.insert(0, healthy);
+        active.fetch_add(1, Ordering::Relaxed);
+
+        // sid 1: stuck consumer — backlog just past the cap.
+        let (stalled, _rx1) = entry_with_backlog(cap + 1);
+        entries.insert(1, stalled);
+        active.fetch_add(1, Ordering::Relaxed);
+
+        let removed = drain_backlog_capped_streams(&mut entries, &active, window);
+
+        assert_eq!(removed, vec![1], "only the over-cap stream is drained");
+        assert!(entries.contains_key(&0), "healthy stream must remain");
+        assert!(!entries.contains_key(&1), "stalled stream must be removed");
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            1,
+            "active count decremented by removed entries"
+        );
+    }
+
+    /// Backlog at exactly the cap is not enough — the check is strictly
+    /// greater-than, so a stream hovering at the boundary isn't killed.
+    #[test]
+    fn backlog_at_cap_is_not_drained() {
+        let mut entries: HashMap<u32, StreamEntry> = HashMap::new();
+        let active = Arc::new(AtomicUsize::new(1));
+        let window = INITIAL_STREAM_WINDOW;
+        let cap = window as u64 * PENDING_BYTES_CAP_WINDOW_MULTIPLE;
+
+        let (entry, _rx) = entry_with_backlog(cap);
+        entries.insert(7, entry);
+
+        let removed = drain_backlog_capped_streams(&mut entries, &active, window);
+        assert!(removed.is_empty());
+        assert!(entries.contains_key(&7));
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn incoming_stream_limits_reject_pending_and_active_overflow() {
         assert_eq!(incoming_stream_rejection_reason(0, 0), None);
@@ -735,19 +940,28 @@ mod tests {
         active_stream_count.fetch_add(1, Ordering::Relaxed);
 
         // First reap: still live, nothing removed.
-        assert_eq!(reap_closed_stream_entries(&mut entries, &active_stream_count), 0);
+        assert_eq!(
+            reap_closed_stream_entries(&mut entries, &active_stream_count),
+            0
+        );
         assert!(entries.contains_key(&7));
 
         // Now drop the receiver — entry becomes reapable.
         drop(rx);
 
         // Second reap: removed.
-        assert_eq!(reap_closed_stream_entries(&mut entries, &active_stream_count), 1);
+        assert_eq!(
+            reap_closed_stream_entries(&mut entries, &active_stream_count),
+            1
+        );
         assert!(entries.is_empty());
         assert_eq!(active_stream_count.load(Ordering::Relaxed), 0);
 
         // Third reap on empty map: no-op, no panic.
-        assert_eq!(reap_closed_stream_entries(&mut entries, &active_stream_count), 0);
+        assert_eq!(
+            reap_closed_stream_entries(&mut entries, &active_stream_count),
+            0
+        );
     }
 
     /// Two Connections wired back-to-back over `tokio::io::duplex` should
@@ -769,6 +983,49 @@ mod tests {
         // Second ping uses a fresh nonce — verifies the counter advances and
         // the previous round didn't poison state.
         client.ping().await.expect("second ping should succeed");
+    }
+
+    /// With at least one open (never-serviced) stream, `ping()` short-circuits
+    /// on active-traffic liveness and returns Ok even though the peer never
+    /// echoes pongs. This is what keeps both health pings and tunnel-control
+    /// pings from false-timing-out behind saturated DATA frames.
+    ///
+    /// `open_stream` only *queues* `Control::NewStream`; the dispatcher
+    /// increments `active_stream_count` when it processes that message. Poll
+    /// `has_active_streams` (rather than sleeping a fixed interval) so the
+    /// test doesn't depend on dispatcher scheduling latency.
+    #[tokio::test]
+    async fn ping_short_circuits_when_streams_active() {
+        // Peer end is kept alive but never serviced — no PONG will ever come.
+        let (a, _b) = tokio::io::duplex(8192);
+        let (a_r, a_w) = tokio::io::split(a);
+
+        let mut client =
+            Connection::new_with_stream_window(a_r, a_w, Mode::Client, 0, INITIAL_STREAM_WINDOW);
+
+        // Open a stream and leak it so active_stream_count stays > 0.
+        let stream = client.open_stream().await.expect("open_stream");
+        std::mem::forget(stream);
+
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !client.has_active_streams() {
+            assert!(
+                tokio::time::Instant::now() < wait_deadline,
+                "dispatcher never activated the stream"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Returns immediately instead of waiting out PING_TIMEOUT.
+        let start = tokio::time::Instant::now();
+        client
+            .ping()
+            .await
+            .expect("ping with active streams must succeed without a pong");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "ping should short-circuit, not wait for a pong"
+        );
     }
 
     /// If the peer never echoes pongs (simulated by routing reads to a sink
@@ -839,10 +1096,7 @@ mod tests {
             "peer read did not complete within 2s; dispatcher likely still holds the socket (FD leak)"
         );
         let n = read_result.unwrap().expect("read should not error");
-        assert_eq!(
-            n, 0,
-            "expected EOF (n=0) after dispatcher exit, got n={n}"
-        );
+        assert_eq!(n, 0, "expected EOF (n=0) after dispatcher exit, got n={n}");
         let _ = b;
     }
 

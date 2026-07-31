@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow};
 use tokio::net::TcpStream;
 
 use crate::tunnel::Message;
-use crate::tunnel::client::ProxySender;
+use crate::tunnel::client::{ConnectReply, ProxySender};
 
 /// TLS record and handshake constants (RFC 5246, RFC 6066)
 mod tls {
@@ -259,12 +259,18 @@ pub async fn handle_tls(
     } else {
         tracing::info!("[{}]Handle TLS proxy to {} ", tunnel_id, target_addr);
         if direct_ctx
-            .try_bypass(tunnel_id, &mut inbound, &target_addr, None)
+            .try_bypass(
+                tunnel_id,
+                &mut inbound,
+                &target_addr,
+                None,
+                ConnectReply::None,
+            )
             .await?
         {
             return Ok(());
         }
-        let msg = Message::open_tcp_stream(inbound, target_addr, None);
+        let msg = Message::open_tcp_stream(inbound, target_addr, None, ConnectReply::None);
         sender.send(msg).await?;
         Ok(())
     }

@@ -1,4 +1,5 @@
 use crate::tunnel::Message;
+use crate::tunnel::client::ConnectReply;
 use crate::tunnel::client::ProxySender;
 use crate::utils::get_original_dst;
 use anyhow::Result;
@@ -23,12 +24,18 @@ pub async fn handle_transparent(
         target_addr
     );
     if direct_ctx
-        .try_bypass(tunnel_id, &mut inbound, &target_addr, None)
+        .try_bypass(
+            tunnel_id,
+            &mut inbound,
+            &target_addr,
+            None,
+            ConnectReply::None,
+        )
         .await?
     {
         return Ok(());
     }
-    let msg = Message::open_tcp_stream(inbound, target_addr, None);
+    let msg = Message::open_tcp_stream(inbound, target_addr, None, ConnectReply::None);
     sender.send(msg).await?;
 
     Ok(())

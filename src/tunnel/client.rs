@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::mux::event;
-use crate::mux::event::{OpenStreamEvent, StreamProto};
+use crate::mux::event::{OpenStreamError, OpenStreamEvent, StreamProto};
 
 /// Bounded channel capacity for the proxy message queue.
 /// Limits memory growth under load via backpressure.
@@ -27,6 +27,49 @@ pub struct OpenStreamRequest {
     udp_stream: Option<UdpServerStream>,
     event: OpenStreamEvent,
     payload: Option<Vec<u8>>,
+    connect_reply: ConnectReply,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConnectReply {
+    #[default]
+    None,
+    Socks5,
+    HttpConnect,
+}
+
+impl ConnectReply {
+    pub fn success_response(self) -> &'static [u8] {
+        match self {
+            Self::None => &[],
+            Self::Socks5 => &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+            Self::HttpConnect => b"HTTP/1.1 200 Connection Established\r\n\r\n",
+        }
+    }
+
+    pub fn failure_response(self, error: &OpenStreamError) -> Vec<u8> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Socks5 => {
+                let code = match error {
+                    OpenStreamError::NetworkUnreachable => 3,
+                    OpenStreamError::HostUnreachable | OpenStreamError::AddressInvalid => 4,
+                    OpenStreamError::ConnectionRefused => 5,
+                    OpenStreamError::TimedOut => 6,
+                    _ => 1,
+                };
+                vec![5, code, 0, 1, 0, 0, 0, 0, 0, 0]
+            }
+            Self::HttpConnect => {
+                let status = if matches!(error, OpenStreamError::TimedOut) {
+                    "504 Gateway Timeout"
+                } else {
+                    "502 Bad Gateway"
+                };
+                format!("HTTP/1.1 {status}\r\nConnection: close\r\n\r\n").into_bytes()
+            }
+        }
+    }
 }
 
 impl OpenStreamRequest {
@@ -34,6 +77,7 @@ impl OpenStreamRequest {
         stream: tokio::net::TcpStream,
         target: String,
         payload: Option<Vec<u8>>,
+        connect_reply: ConnectReply,
     ) -> Self {
         Self {
             tcp_stream: Some(stream),
@@ -43,6 +87,7 @@ impl OpenStreamRequest {
                 addr: target,
             },
             payload,
+            connect_reply,
         }
     }
     #[allow(dead_code)]
@@ -55,6 +100,7 @@ impl OpenStreamRequest {
                 addr: target,
             },
             payload,
+            connect_reply: ConnectReply::None,
         }
     }
 }
@@ -68,8 +114,9 @@ impl Message {
         stream: tokio::net::TcpStream,
         target: String,
         payload: Option<Vec<u8>>,
+        connect_reply: ConnectReply,
     ) -> Message {
-        let req = OpenStreamRequest::from_tcp(stream, target, payload);
+        let req = OpenStreamRequest::from_tcp(stream, target, payload, connect_reply);
         Message::OpenStream(req)
     }
 
@@ -470,11 +517,20 @@ pub(crate) async fn mux_client_loop<T>(
 {
     while let Some(msg) = receiver.recv().await {
         match msg {
-            Message::OpenStream(event) => {
+            Message::OpenStream(mut event) => {
                 // Wrap pick_and_open in a timeout to prevent the serial
                 // mux_client_loop from blocking indefinitely when the
                 // pool is saturated.
-                match tokio::time::timeout(Duration::from_secs(1), client.pick_and_open()).await {
+                //
+                // 5s: a transient busy pool (health ping holding a conn_ref
+                // lock, or a full control channel during a large transfer)
+                // can exceed 1s without anything being wrong. With 1s the
+                // request was dropped and the client (which already received
+                // SOCKS5-success / HTTP-200) saw a silent reset even though
+                // another pool connection would have served it a moment
+                // later. 5s absorbs those stalls while still failing fast
+                // enough to surface a genuinely dead pool.
+                match tokio::time::timeout(Duration::from_secs(5), client.pick_and_open()).await {
                     Ok(Ok((mut send, mut recv))) => {
                         metrics::gauge!("client_proxy_streams").increment(1.0);
                         tokio::spawn(async move {
@@ -490,6 +546,51 @@ pub(crate) async fn mux_client_loop<T>(
                                 };
                                 if let Err(e) = event::write_event(&mut send, ev).await {
                                     tracing::error!("write open stream event failed:{}", e);
+                                    metrics::gauge!("client_proxy_streams").decrement(1.0);
+                                    return;
+                                }
+                                let ack = match tokio::time::timeout(
+                                    Duration::from_secs(crate::tunnel::DEFAULT_TIMEOUT_SECS),
+                                    event::read_event(&mut recv),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(ev)) => match event::decode_open_ack(&ev) {
+                                        Ok(ack) => ack,
+                                        Err(e) => {
+                                            tracing::error!("decode open stream ack failed:{}", e);
+                                            metrics::gauge!("client_proxy_streams").decrement(1.0);
+                                            return;
+                                        }
+                                    },
+                                    Ok(Err(e)) => {
+                                        tracing::error!("read open stream ack failed:{}", e);
+                                        metrics::gauge!("client_proxy_streams").decrement(1.0);
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        let response = event
+                                            .connect_reply
+                                            .failure_response(&OpenStreamError::TimedOut);
+                                        let _ = local_writer.write_all(&response).await;
+                                        metrics::gauge!("client_proxy_streams").decrement(1.0);
+                                        return;
+                                    }
+                                };
+                                if !ack.success {
+                                    let error = ack.error.unwrap_or_else(|| {
+                                        OpenStreamError::Other("target connection failed".into())
+                                    });
+                                    let response = event.connect_reply.failure_response(&error);
+                                    let _ = local_writer.write_all(&response).await;
+                                    metrics::gauge!("client_proxy_streams").decrement(1.0);
+                                    return;
+                                }
+                                if let Err(e) = local_writer
+                                    .write_all(event.connect_reply.success_response())
+                                    .await
+                                {
+                                    tracing::debug!("write local connect success failed:{}", e);
                                     metrics::gauge!("client_proxy_streams").decrement(1.0);
                                     return;
                                 }
@@ -525,6 +626,17 @@ pub(crate) async fn mux_client_loop<T>(
                                     metrics::gauge!("client_proxy_streams").decrement(1.0);
                                     return;
                                 }
+                                let ack = tokio::time::timeout(
+                                    Duration::from_secs(crate::tunnel::DEFAULT_TIMEOUT_SECS),
+                                    event::read_event(&mut recv),
+                                )
+                                .await;
+                                if !matches!(ack, Ok(Ok(ref ev)) if event::decode_open_ack(ev).is_ok_and(|ack| ack.success))
+                                {
+                                    tracing::error!("UDP open stream was not acknowledged");
+                                    metrics::gauge!("client_proxy_streams").decrement(1.0);
+                                    return;
+                                }
                                 if let Some(payload) = event.payload
                                     && let Err(e) = send.write_all(&payload).await
                                 {
@@ -546,8 +658,22 @@ pub(crate) async fn mux_client_loop<T>(
                         });
                     }
                     Err(_) | Ok(Err(_)) => {
+                        if let Some(stream) = event.tcp_stream.as_mut() {
+                            let response = event
+                                .connect_reply
+                                .failure_response(&OpenStreamError::ResourceExhausted);
+                            let _ = stream.write_all(&response).await;
+                        }
                         crate::mux::metrics::inc_client_open_stream_failed();
-                        tracing::error!("create remote proxy stream failed or timed out");
+                        let active = client.metrics.active.load(Ordering::Relaxed);
+                        let retiring = client.metrics.retiring.load(Ordering::Relaxed);
+                        let dead = client.metrics.dead.load(Ordering::Relaxed);
+                        tracing::error!(
+                            "create remote proxy stream failed or timed out (pool: active={}, retiring={}, dead={})",
+                            active,
+                            retiring,
+                            dead
+                        );
                     }
                 }
             }
@@ -605,8 +731,8 @@ pub(crate) async fn health_loop<T>(
     let gen_token = pool.generation(slot).await;
     let mut is_retiring = false;
     let mut consecutive_fails: u32 = 0;
-    let max_age_deadline = max_age_with_jitter(params.max_age, slot)
-        .map(|d| tokio::time::Instant::now() + d);
+    let max_age_deadline =
+        max_age_with_jitter(params.max_age, slot).map(|d| tokio::time::Instant::now() + d);
 
     // Per-slot state for the in-flight reconnect child.
     let mut reconnect_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -628,7 +754,7 @@ pub(crate) async fn health_loop<T>(
                 // mark_dead to avoid lock ordering issues (pick_and_open takes
                 // conns lock first, then conn_ref lock; we must not hold
                 // conn_ref while acquiring conns lock).
-                {
+                if !is_retiring {
                     let mut should_mark_retiring = false;
                     {
                         let mut guard = conn_ref.lock().await;
@@ -645,6 +771,19 @@ pub(crate) async fn health_loop<T>(
                                 } else if conn.ping().await.is_err() {
                                     consecutive_fails += 1;
                                     if consecutive_fails >= params.ping_fail_threshold {
+                                        // Retryable ping failures leave the conn
+                                        // intact so the threshold can absorb a
+                                        // transient stall. Once it is reached the
+                                        // conn must be closed here: `is_valid()`
+                                        // would otherwise stay true, the slot would
+                                        // never reach Dead, and `replace_slot` would
+                                        // reject the reconnect that follows.
+                                        tracing::error!(
+                                            "[slot-{}] {} consecutive ping failures; retiring connection",
+                                            slot,
+                                            consecutive_fails
+                                        );
+                                        conn.close();
                                         should_mark_retiring = true;
                                     }
                                 } else {
@@ -667,23 +806,38 @@ pub(crate) async fn health_loop<T>(
                     }
                 }
 
-                // max_age check. The current slot model cannot keep both a draining
-                // old connection and a fresh replacement in the same conn_ref. Close
-                // the old connection and move to Dead before reconnecting.
+                // Max-age retirement is graceful: stop assigning new streams to
+                // this slot, but leave the transport alive until existing streams
+                // have drained. Transport and ping failures still close promptly.
                 if !is_retiring
                     && let Some(deadline) = max_age_deadline
                     && tokio::time::Instant::now() >= deadline
                 {
-                    tracing::info!("[slot-{}] reached max age, reconnecting", slot);
+                    tracing::info!("[slot-{}] reached max age, draining", slot);
                     is_retiring = true;
-                    if pool.mark_dead(slot, gen_token).await.is_err() {
+                    if pool.mark_retiring(slot, gen_token).await.is_err() {
                         return;
                     }
                 }
 
-                // Spawn reconnect child if needed. The child sends to
-                // monitor_tx directly on success or DropSlot.
-                if is_retiring && reconnect_handle.is_none() {
+                if is_retiring {
+                    let ready_to_replace = {
+                        let guard = conn_ref.lock().await;
+                        guard.as_ref().is_none_or(|conn| {
+                            !conn.is_valid() || conn.active_stream_count() == 0
+                        })
+                    };
+                    if !ready_to_replace {
+                        continue;
+                    }
+
+                    if pool.mark_dead(slot, gen_token).await.is_err() {
+                        return;
+                    }
+
+                    // Reconnect only after the old connection is fully drained
+                    // and moved to Dead. Starting earlier races replace_slot
+                    // against Retiring and can permanently drop the slot.
                     let pool_ref = pool.clone();
                     let params_ref = params.clone();
                     let cancel_child = cancel.child_token();
@@ -701,58 +855,39 @@ pub(crate) async fn health_loop<T>(
                         // Forward result to the monitor.
                         let _ = monitor_tx_clone.send(cmd).await;
                     }));
-                }
 
-                // If is_retiring and conn is dead: explicitly mark_dead + close,
-                // wait for the reconnect child, then exit.
-                if is_retiring {
-                    let conn_dead = {
-                        let guard = conn_ref.lock().await;
-                        guard.as_ref().is_none_or(|c| !c.is_valid())
-                    };
-                    if conn_dead {
-                        if pool.mark_dead(slot, gen_token).await.is_err() {
-                            return;
-                        }
-                        // Await the reconnect child. A successful child has
-                        // already sent its own MonitorCommand (Respawn or
-                        // DropSlot). But if the child *panicked*, it never got
-                        // to send anything — and without a remedy here the slot
-                        // would be orphaned Dead forever (DoS until process
-                        // restart). On panic we send Respawn ourselves so the
-                        // monitor spawns a fresh health task that retries
-                        // reconnect, up to a bounded number of attempts to avoid
-                        // an infinite panic loop.
-                        if let Some(h) = reconnect_handle.take()
-                            && let Err(_join_err) = h.await
-                        {
-                            const MAX_RECONNECT_PANIC_RETRIES: u32 = 3;
-                            if panic_retries < MAX_RECONNECT_PANIC_RETRIES {
-                                tracing::warn!(
-                                    "[slot-{}] reconnect_loop panicked; retry {}/{}",
+                    // A successful child has already sent Respawn/DropSlot. If
+                    // it panics, explicitly ask the monitor to retry so the Dead
+                    // slot is never orphaned.
+                    if let Some(h) = reconnect_handle.take()
+                        && let Err(_join_err) = h.await
+                    {
+                        const MAX_RECONNECT_PANIC_RETRIES: u32 = 3;
+                        if panic_retries < MAX_RECONNECT_PANIC_RETRIES {
+                            tracing::warn!(
+                                "[slot-{}] reconnect_loop panicked; retry {}/{}",
+                                slot,
+                                panic_retries + 1,
+                                MAX_RECONNECT_PANIC_RETRIES
+                            );
+                            let _ = monitor_tx
+                                .send(MonitorCommand::RespawnAfterPanic {
                                     slot,
-                                    panic_retries + 1,
-                                    MAX_RECONNECT_PANIC_RETRIES
-                                );
-                                let _ = monitor_tx
-                                    .send(MonitorCommand::RespawnAfterPanic {
-                                        slot,
-                                        panic_retries: panic_retries + 1,
-                                    })
-                                    .await;
-                            } else {
-                                tracing::error!(
-                                    "[slot-{}] reconnect_loop panicked {} times; dropping slot",
-                                    slot,
-                                    MAX_RECONNECT_PANIC_RETRIES
-                                );
-                                let _ = monitor_tx
-                                    .send(MonitorCommand::DropSlot(slot))
-                                    .await;
-                            }
+                                    panic_retries: panic_retries + 1,
+                                })
+                                .await;
+                        } else {
+                            tracing::error!(
+                                "[slot-{}] reconnect_loop panicked {} times; dropping slot",
+                                slot,
+                                MAX_RECONNECT_PANIC_RETRIES
+                            );
+                            let _ = monitor_tx
+                                .send(MonitorCommand::DropSlot(slot))
+                                .await;
                         }
-                        return;
                     }
+                    return;
                 }
             }
         }
@@ -776,6 +911,8 @@ where
     T: MuxConnection + Send + 'static,
 {
     use std::sync::atomic::Ordering;
+    let started = tokio::time::Instant::now();
+    let mut attempts: u32 = 0;
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
     // Skip the pre-reconnect sleep on the very first attempt. A freshly-dead
@@ -799,6 +936,7 @@ where
             }
         }
         first_attempt = false;
+        attempts += 1;
         // Acquire permit per-attempt, so a failing reconnect doesn't starve
         // other slots while waiting for its backoff timer. Dropped at end of
         // iteration.
@@ -821,6 +959,12 @@ where
                     pool.metrics
                         .reconnect_success
                         .fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        "[slot-{}] reconnected after {} attempt(s) in {:?}",
+                        slot,
+                        attempts,
+                        started.elapsed()
+                    );
                     return MonitorCommand::Respawn { slot };
                 }
                 Err(GenMismatch) => {
@@ -990,7 +1134,10 @@ pub(crate) async fn pool_monitor<T>(
                 };
                 pool.metrics.health_task_exits.fetch_add(1, Ordering::Relaxed);
                 match task_result {
-                    Ok(()) => tracing::info!("[slot-{}] health task exited normally", slot),
+                    Ok(()) => tracing::info!(
+                        "[slot-{}] health task stopped (connection retired or shutting down)",
+                        slot
+                    ),
                     Err(e) => tracing::error!("[slot-{}] health task panicked: {}", slot, e),
                 }
             }
@@ -1008,8 +1155,12 @@ mod tests {
     /// failure counts) so tests can drive the pool API.
     struct MockConnection {
         valid: AtomicBool,
-        close_called: AtomicBool,
-        ping_count: AtomicU32,
+        close_called: Arc<AtomicBool>,
+        active_streams: Arc<AtomicUsize>,
+        ping_count: Arc<AtomicU32>,
+        /// When true, `ping` fails while `is_valid()` still reports true —
+        /// the shape of a `PingError::Timeout` on a link that may be alive.
+        ping_fails: bool,
         open_count: Arc<AtomicU32>,
         open_started: Option<Arc<tokio::sync::Notify>>,
         open_gate: Option<Arc<tokio::sync::Notify>>,
@@ -1023,8 +1174,10 @@ mod tests {
         fn new_with_open_count(open_count: Arc<AtomicU32>) -> Self {
             Self {
                 valid: AtomicBool::new(true),
-                close_called: AtomicBool::new(false),
-                ping_count: AtomicU32::new(0),
+                close_called: Arc::new(AtomicBool::new(false)),
+                active_streams: Arc::new(AtomicUsize::new(0)),
+                ping_count: Arc::new(AtomicU32::new(0)),
+                ping_fails: false,
                 open_count,
                 open_started: None,
                 open_gate: None,
@@ -1037,12 +1190,27 @@ mod tests {
         ) -> Self {
             Self {
                 valid: AtomicBool::new(true),
-                close_called: AtomicBool::new(false),
-                ping_count: AtomicU32::new(0),
+                close_called: Arc::new(AtomicBool::new(false)),
+                active_streams: Arc::new(AtomicUsize::new(0)),
+                ping_count: Arc::new(AtomicU32::new(0)),
+                ping_fails: false,
                 open_count: Arc::new(AtomicU32::new(0)),
                 open_started: Some(open_started),
                 open_gate: Some(open_gate),
             }
+        }
+
+        /// Ping always fails but the conn stays valid. The counters are shared
+        /// so a test can still read them after the pool has dropped the conn.
+        fn new_with_failing_ping(
+            ping_count: Arc<AtomicU32>,
+            close_called: Arc<AtomicBool>,
+        ) -> Self {
+            let mut conn = Self::new_valid();
+            conn.ping_count = ping_count;
+            conn.close_called = close_called;
+            conn.ping_fails = true;
+            conn
         }
     }
 
@@ -1052,7 +1220,7 @@ mod tests {
 
         fn ping(&mut self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
             self.ping_count.fetch_add(1, Ordering::Relaxed);
-            let v = self.valid.load(Ordering::Acquire);
+            let v = self.valid.load(Ordering::Acquire) && !self.ping_fails;
             async move {
                 if v {
                     Ok(())
@@ -1113,7 +1281,7 @@ mod tests {
             self.valid.store(false, Ordering::Release);
         }
         fn active_stream_count(&self) -> usize {
-            0
+            self.active_streams.load(Ordering::Acquire)
         }
 
         #[allow(clippy::manual_async_fn)]
@@ -1587,10 +1755,10 @@ mod tests {
         // verifies all 3 recover, not just 2.
         let start = Instant::now();
         let mut handles = Vec::new();
-        for slot in 0..3 {
+        for (slot, conn_ref) in conn_refs.iter().enumerate() {
             let pool_ref = pool.clone();
             let params_ref = params.clone();
-            let conn_ref = conn_refs[slot].clone();
+            let conn_ref = conn_ref.clone();
             let cancel_child = cancel.child_token();
             handles.push(tokio::spawn(async move {
                 reconnect_loop::<MockConnection>(
@@ -1683,10 +1851,10 @@ mod tests {
 
         let start = Instant::now();
         let mut handles = Vec::new();
-        for slot in 0..3 {
+        for (slot, conn_ref) in conn_refs.iter().enumerate() {
             let pool_ref = pool.clone();
             let params_ref = params.clone();
-            let conn_ref = conn_refs[slot].clone();
+            let conn_ref = conn_ref.clone();
             let cancel_child = cancel.child_token();
             handles.push(tokio::spawn(async move {
                 reconnect_loop::<MockConnection>(
@@ -1717,6 +1885,92 @@ mod tests {
             "first-try recovery took {:?}; expected no pre-reconnect sleep",
             elapsed
         );
+    }
+
+    /// Regression for "`ping_fail_threshold` is ignored". A ping timeout is not
+    /// proof the link is dead — one lost packet plus TCP retransmission backoff
+    /// exceeds the ping budget on a lossy path — so the connection must survive
+    /// until `ping_fail_threshold` *consecutive* failures. The old TLS `ping`
+    /// dropped the mux connection on the very first failure, which made the next
+    /// health tick see `is_valid() == false` and retire the slot regardless of
+    /// the configured threshold.
+    ///
+    /// The second half of the contract matters just as much: once the threshold
+    /// is reached the conn must be *closed*, otherwise the slot never reaches
+    /// Dead and `replace_slot` rejects the reconnect that follows.
+    #[tokio::test]
+    async fn health_loop_retires_only_after_ping_fail_threshold() {
+        const THRESHOLD: u32 = 3;
+
+        let pool = make_pool();
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        let ping_count = Arc::new(AtomicU32::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = conn_ref.lock().await;
+            *guard = Some(MockConnection::new_with_failing_ping(
+                ping_count.clone(),
+                closed.clone(),
+            ));
+        }
+
+        let cancel = CancellationToken::new();
+        let params = Arc::new(ConnParams {
+            url: Url::parse("tls://unused.example:443").unwrap(),
+            cert_path: PathBuf::from("/nonexistent"),
+            host: "unused.example".to_string(),
+            stream_window: 0,
+            max_age: None,
+            ping_interval: Duration::from_secs(1),
+            ping_fail_threshold: THRESHOLD,
+            quic_endpoint: None,
+        });
+
+        let (monitor_tx, mut monitor_rx) = mpsc::channel::<MonitorCommand>(8);
+        let pool_ref = pool.clone();
+        let conn_ref_clone = conn_ref.clone();
+        let cancel_child = cancel.child_token();
+        let handle = tokio::spawn(async move {
+            health_loop(
+                slot,
+                conn_ref_clone,
+                pool_ref,
+                params,
+                cancel_child,
+                monitor_tx,
+                0,
+            )
+            .await;
+        });
+
+        let cmd = tokio::time::timeout(Duration::from_secs(30), monitor_rx.recv())
+            .await
+            .expect("timed out waiting for MonitorCommand")
+            .expect("monitor_tx dropped without sending a command");
+        assert!(
+            matches!(cmd, MonitorCommand::Respawn { slot: s } if s == slot),
+            "expected Respawn after the threshold was reached, got {:?}",
+            cmd
+        );
+
+        assert_eq!(
+            ping_count.load(Ordering::Relaxed),
+            THRESHOLD,
+            "connection should have been pinged exactly {} times before retiring; \
+             fewer means the threshold was bypassed",
+            THRESHOLD
+        );
+        assert!(
+            closed.load(Ordering::Relaxed),
+            "reaching the threshold must close the conn so the slot can reach Dead"
+        );
+        assert_eq!(
+            pool.slot_state(slot).await,
+            SlotState::Active,
+            "slot should be Active again after the reconnect replaced it"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     /// Regression for the "panic orphans a slot forever" bug. When
@@ -1786,8 +2040,14 @@ mod tests {
             .expect("monitor_tx dropped without sending a command");
 
         match cmd {
-            MonitorCommand::RespawnAfterPanic { slot: s, panic_retries } => {
-                assert_eq!(s, slot, "RespawnAfterPanic should reference the original slot");
+            MonitorCommand::RespawnAfterPanic {
+                slot: s,
+                panic_retries,
+            } => {
+                assert_eq!(
+                    s, slot,
+                    "RespawnAfterPanic should reference the original slot"
+                );
                 assert_eq!(
                     panic_retries, 1,
                     "panic_retries should advance to 1 after the first panic"
@@ -1800,7 +2060,10 @@ mod tests {
                 );
             }
             MonitorCommand::DropSlot(s) => {
-                panic!("got DropSlot({}); panic should be recoverable, not permanent", s);
+                panic!(
+                    "got DropSlot({}); panic should be recoverable, not permanent",
+                    s
+                );
             }
         }
     }
@@ -1867,7 +2130,8 @@ mod tests {
 
             match cmd {
                 MonitorCommand::RespawnAfterPanic {
-                    panic_retries: next, ..
+                    panic_retries: next,
+                    ..
                 } => {
                     panic_retries = next;
                     // Slot still Dead; loop drives the next health_loop instance.
@@ -1886,11 +2150,9 @@ mod tests {
                 // Should have taken exactly MAX_RECONNECT_PANIC_RETRIES + 1 panics
                 // (3 RespawnAfterPanic, then DropSlot on the 4th).
                 assert_eq!(
-                    panic_retries,
-                    MAX_RECONNECT_PANIC_RETRIES,
+                    panic_retries, MAX_RECONNECT_PANIC_RETRIES,
                     "DropSlot should fire only after exhausting {} panic retries; got panic_retries={}",
-                    MAX_RECONNECT_PANIC_RETRIES,
-                    panic_retries
+                    MAX_RECONNECT_PANIC_RETRIES, panic_retries
                 );
             }
             other => panic!(
@@ -1898,5 +2160,76 @@ mod tests {
                 other.map(|c| format!("{:?}", c))
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn max_age_waits_for_active_streams_before_reconnecting() {
+        let pool = make_pool();
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        let close_called = Arc::new(AtomicBool::new(false));
+        let active_streams = Arc::new(AtomicUsize::new(1));
+        {
+            let mut conn = MockConnection::new_valid();
+            conn.close_called = close_called.clone();
+            conn.active_streams = active_streams.clone();
+            *conn_ref.lock().await = Some(conn);
+        }
+
+        let cancel = CancellationToken::new();
+        let params = Arc::new(ConnParams {
+            url: Url::parse("tls://unused.example:443").unwrap(),
+            cert_path: PathBuf::from("/nonexistent"),
+            host: "unused.example".to_string(),
+            stream_window: 0,
+            max_age: Some(Duration::from_secs(1)),
+            ping_interval: Duration::from_millis(20),
+            ping_fail_threshold: 1,
+            quic_endpoint: None,
+        });
+        let (monitor_tx, mut monitor_rx) = mpsc::channel::<MonitorCommand>(8);
+        let handle = tokio::spawn(health_loop(
+            slot,
+            conn_ref,
+            pool.clone(),
+            params,
+            cancel.child_token(),
+            monitor_tx,
+            0,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(pool.slot_state(slot).await, SlotState::Retiring);
+        assert!(!close_called.load(Ordering::Acquire));
+        assert!(monitor_rx.try_recv().is_err());
+
+        active_streams.store(0, Ordering::Release);
+        let cmd = tokio::time::timeout(Duration::from_secs(1), monitor_rx.recv())
+            .await
+            .expect("retired connection should reconnect after its streams drain")
+            .expect("health loop exited without requesting a respawn");
+        assert!(matches!(cmd, MonitorCommand::Respawn { slot: 0 }));
+        assert!(close_called.load(Ordering::Acquire));
+        assert_eq!(pool.slot_state(slot).await, SlotState::Active);
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn connect_reply_maps_protocol_failures() {
+        assert_eq!(
+            ConnectReply::Socks5.failure_response(&OpenStreamError::ConnectionRefused)[1],
+            5
+        );
+        assert!(
+            ConnectReply::HttpConnect
+                .failure_response(&OpenStreamError::TimedOut)
+                .starts_with(b"HTTP/1.1 504")
+        );
+        assert!(
+            ConnectReply::HttpConnect
+                .failure_response(&OpenStreamError::ConnectionRefused)
+                .starts_with(b"HTTP/1.1 502")
+        );
     }
 }

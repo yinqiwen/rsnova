@@ -16,9 +16,12 @@ pub const FLAG_AUTH: u8 = 6;
 pub const FLAG_AUTH_ACK: u8 = 9;
 pub const FLAG_REVERSE_OPEN: u8 = 10;
 pub const FLAG_WIN_UPDATE: u8 = 8;
+pub const FLAG_OPEN_ACK: u8 = 13;
+pub const FLAG_DRAIN: u8 = 14;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 pub const MAX_EVENT_BODY_LEN: u32 = 256 * 1024; // 256KB (was 16MB, reduced for embedded)
+pub const MAX_OPEN_ERROR_LEN: usize = 256;
 
 // pub fn get_event_type_str(flags: u8) -> &'static str {
 //     match flags {
@@ -95,6 +98,57 @@ pub struct OpenStreamEvent {
     pub addr: String,
 }
 
+#[derive(Encode, Decode, PartialEq, Eq, Debug, Clone)]
+pub struct OpenStreamAck {
+    pub success: bool,
+    pub error: Option<OpenStreamError>,
+}
+
+impl OpenStreamAck {
+    pub fn success() -> Self {
+        Self {
+            success: true,
+            error: None,
+        }
+    }
+
+    pub fn failure(error: OpenStreamError) -> Self {
+        Self {
+            success: false,
+            error: Some(error.bounded()),
+        }
+    }
+}
+
+#[derive(Encode, Decode, PartialEq, Eq, Debug, Clone)]
+pub enum OpenStreamError {
+    ConnectionRefused,
+    HostUnreachable,
+    NetworkUnreachable,
+    TimedOut,
+    AddressInvalid,
+    ResourceExhausted,
+    Other(String),
+}
+
+impl OpenStreamError {
+    fn bounded(self) -> Self {
+        match self {
+            Self::Other(mut message) => {
+                if message.len() > MAX_OPEN_ERROR_LEN {
+                    let mut end = MAX_OPEN_ERROR_LEN;
+                    while !message.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    message.truncate(end);
+                }
+                Self::Other(message)
+            }
+            error => error,
+        }
+    }
+}
+
 #[derive(Encode, Decode, PartialEq, Debug, Clone)]
 pub enum AuthRequest {
     Proxy,
@@ -107,7 +161,7 @@ pub struct RegisterRequest {
     pub tunnels: Vec<TunnelEntry>,
 }
 
-#[derive(Encode, Decode, PartialEq, Debug, Clone)]
+#[derive(Encode, Decode, PartialEq, Eq, Debug, Clone)]
 pub struct TunnelEntry {
     pub local_addr: String,
     pub remote_port: u16,
@@ -249,6 +303,37 @@ pub fn new_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> anyhow::Result<
     let mut ev = new_event(sid, Bytes::from(data));
     ev.header.set_flag(FLAG_OPEN);
     Ok(ev)
+}
+
+pub fn new_open_ack_event(sid: u32, ack: &OpenStreamAck) -> anyhow::Result<Event> {
+    let data = bincode::encode_to_vec(ack, config::standard())
+        .map_err(|e| anyhow::anyhow!("encode open stream ack failed: {}", e))?;
+    let mut ev = new_event(sid, Bytes::from(data));
+    ev.header.set_flag(FLAG_OPEN_ACK);
+    Ok(ev)
+}
+
+pub fn decode_open_ack(ev: &Event) -> anyhow::Result<OpenStreamAck> {
+    if ev.header.flags() != FLAG_OPEN_ACK {
+        return Err(anyhow::anyhow!(
+            "expected open stream ack, got flag {}",
+            ev.header.flags()
+        ));
+    }
+    let (ack, _): (OpenStreamAck, usize) =
+        bincode::decode_from_slice(ev.body.as_ref(), config::standard())
+            .map_err(|e| anyhow::anyhow!("decode open stream ack failed: {}", e))?;
+    Ok(ack)
+}
+
+pub fn new_drain_event(sid: u32) -> Event {
+    Event {
+        header: Header {
+            flag_len: get_flag_len(0, FLAG_DRAIN),
+            stream_id: sid,
+        },
+        body: Bytes::new(),
+    }
 }
 
 pub fn new_auth_event(sid: u32, req: &AuthRequest) -> anyhow::Result<Event> {
@@ -477,5 +562,24 @@ mod tests {
         assert_eq!(decoded.header.stream_id, 42);
         let decoded_increment = u32::from_le_bytes(decoded.body[..4].try_into().unwrap());
         assert_eq!(decoded_increment, 131072);
+    }
+
+    #[test]
+    fn write_read_open_ack_event() {
+        let ack = OpenStreamAck::success();
+        let ev = new_open_ack_event(7, &ack).unwrap();
+        assert_eq!(ev.header.flags(), FLAG_OPEN_ACK);
+        assert_eq!(decode_open_ack(&ev).unwrap(), ack);
+    }
+
+    #[test]
+    fn open_error_message_is_bounded() {
+        let ack = OpenStreamAck::failure(OpenStreamError::Other("x".repeat(4096)));
+        let ev = new_open_ack_event(7, &ack).unwrap();
+        let decoded = decode_open_ack(&ev).unwrap();
+        let OpenStreamError::Other(message) = decoded.error.unwrap() else {
+            panic!("expected Other error");
+        };
+        assert!(message.len() <= MAX_OPEN_ERROR_LEN);
     }
 }

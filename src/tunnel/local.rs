@@ -10,63 +10,92 @@ use anyhow::{Result, anyhow};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
+const PROTOCOL_DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalProtocol {
+    Socks5,
+    Socks4,
+    Tls,
+    Http,
+    HttpConnect,
+    Transparent,
+}
+
+fn classify_prefix(prefix: &[u8]) -> Option<LocalProtocol> {
+    if prefix.len() < 3 {
+        return None;
+    }
+    match prefix[0] {
+        5 => return Some(LocalProtocol::Socks5),
+        4 => return Some(LocalProtocol::Socks4),
+        _ => {}
+    }
+    if valid_tls_version(prefix) {
+        return Some(LocalProtocol::Tls);
+    }
+    let method = [
+        prefix[0].to_ascii_uppercase(),
+        prefix[1].to_ascii_uppercase(),
+        prefix[2].to_ascii_uppercase(),
+    ];
+    Some(match &method {
+        b"CON" => LocalProtocol::HttpConnect,
+        b"GET" | b"PUT" | b"POS" | b"DEL" | b"OPT" | b"TRA" | b"PAT" | b"HEA" | b"UPG" => {
+            LocalProtocol::Http
+        }
+        _ => LocalProtocol::Transparent,
+    })
+}
+
+async fn detect_protocol(inbound: &TcpStream) -> Result<LocalProtocol> {
+    let deadline = tokio::time::Instant::now() + PROTOCOL_DETECT_TIMEOUT;
+    let mut peek_buf = [0u8; 3];
+    loop {
+        let count = tokio::time::timeout_at(deadline, inbound.peek(&mut peek_buf))
+            .await
+            .map_err(|_| anyhow!("protocol detection timed out"))??;
+        if count == 0 {
+            return Err(anyhow!("connection closed during protocol detection"));
+        }
+        if let Some(protocol) = classify_prefix(&peek_buf[..count]) {
+            return Ok(protocol);
+        }
+        tokio::time::timeout_at(
+            deadline,
+            tokio::time::sleep(std::time::Duration::from_millis(5)),
+        )
+        .await
+        .map_err(|_| anyhow!("protocol detection timed out"))?;
+    }
+}
+
 async fn handle_local_tunnel(
     inbound: TcpStream,
     tunnel_id: u32,
     sender: ProxySender,
     direct_ctx: crate::tunnel::direct::DirectCtx,
 ) -> Result<()> {
-    //stream.peek(buf)
-    let mut peek_buf = [0u8; 3];
-    inbound.peek(&mut peek_buf).await?;
-    match peek_buf[0] {
-        5 => {
-            //socks5
-            // tracing::info!("[{}]Accept client as SOCKS5 proxy.", tunnel_id);
+    match detect_protocol(&inbound).await? {
+        LocalProtocol::Socks5 => {
             handle_socks5(tunnel_id, inbound, sender, direct_ctx).await?;
-            return Ok(());
+            Ok(())
         }
-        4 => {
-            //socks4
+        LocalProtocol::Socks4 => {
             tracing::error!("socks4 not supported!");
-            return Err(anyhow!("socks4 unimplemented"));
+            Err(anyhow!("socks4 unimplemented"))
         }
-        _ => {
-            //info!("Not socks protocol:{}", _data[0]);
+        LocalProtocol::Tls => handle_tls(tunnel_id, inbound, sender, direct_ctx).await,
+        LocalProtocol::HttpConnect => handle_https(tunnel_id, inbound, sender, direct_ctx).await,
+        LocalProtocol::Http => handle_http(tunnel_id, inbound, sender, direct_ctx).await,
+        LocalProtocol::Transparent => {
+            tracing::info!(
+                "[{}]Accept client with non socks5/tls/http traffic.",
+                tunnel_id
+            );
+            super::transparent::handle_transparent(tunnel_id, inbound, sender, direct_ctx).await
         }
     }
-    if valid_tls_version(&peek_buf[..]) {
-        // tracing::info!("[{}]Accept client as TLS proxy.", tunnel_id);
-        handle_tls(tunnel_id, inbound, sender, direct_ctx).await?;
-        return Ok(());
-    }
-    if let Ok(prefix_str) = std::str::from_utf8(&peek_buf) {
-        let prefix_str = prefix_str.to_uppercase();
-        match prefix_str.as_str() {
-            "GET" | "PUT" | "POS" | "DEL" | "OPT" | "TRA" | "PAT" | "HEA" | "CON" | "UPG" => {
-                // tracing::info!(
-                //     "[{}]Accept client as HTTP proxy with method:{}",
-                //     tunnel_id,
-                //     prefix_str
-                // );
-                //http proxy
-                if prefix_str.as_str() == "CON" {
-                    handle_https(tunnel_id, inbound, sender, direct_ctx).await?;
-                } else {
-                    handle_http(tunnel_id, inbound, sender, direct_ctx).await?;
-                }
-                return Ok(());
-            }
-            _ => {
-                //nothing
-            }
-        };
-    }
-    tracing::info!(
-        "[{}]Accept client with non socks5/tls/http traffic.",
-        tunnel_id
-    );
-    super::transparent::handle_transparent(tunnel_id, inbound, sender, direct_ctx).await
 }
 
 pub async fn start_local_tunnel_server(
@@ -93,7 +122,21 @@ pub async fn start_local_tunnel_server(
         max_connections
     );
     let mut tunnel_id_seed: u32 = 0;
-    while let Ok((inbound, _)) = listener.accept().await {
+    let mut accept_backoff = crate::utils::AcceptBackoff::default();
+    loop {
+        let (inbound, _) = match listener.accept().await {
+            Ok(accepted) => {
+                accept_backoff.reset();
+                accepted
+            }
+            Err(error) => {
+                let delay = accept_backoff.next_delay();
+                metrics::counter!("local_accept_retries").increment(1);
+                tracing::warn!("local accept failed: {}; retrying in {:?}", error, delay);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -116,5 +159,50 @@ pub async fn start_local_tunnel_server(
             }
         });
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    async fn fragmented_protocol(parts: &[&[u8]]) -> LocalProtocol {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(address).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        let mut client = client.await.unwrap();
+        let parts: Vec<Vec<u8>> = parts.iter().map(|part| part.to_vec()).collect();
+        let writer = tokio::spawn(async move {
+            for part in parts {
+                client.write_all(&part).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            }
+        });
+        let protocol = detect_protocol(&server).await.unwrap();
+        writer.await.unwrap();
+        protocol
+    }
+
+    #[test]
+    fn partial_prefix_is_not_classified() {
+        assert_eq!(classify_prefix(b"G"), None);
+        assert_eq!(classify_prefix(&[0x16, 0x03]), None);
+    }
+
+    #[tokio::test]
+    async fn fragmented_http_prefix_is_detected_as_http() {
+        assert_eq!(
+            fragmented_protocol(&[b"G", b"ET"]).await,
+            LocalProtocol::Http
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_tls_prefix_is_detected_as_tls() {
+        assert_eq!(
+            fragmented_protocol(&[&[0x16], &[0x03, 0x01]]).await,
+            LocalProtocol::Tls
+        );
+    }
 }

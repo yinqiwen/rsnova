@@ -7,7 +7,9 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+use crate::mux::event::OpenStreamError;
 use crate::tunnel::DEFAULT_TIMEOUT_SECS;
+use crate::tunnel::client::ConnectReply;
 use crate::tunnel::stream::Stream;
 
 /// Compiled, immutable rule snapshot. Replaced as a whole on reload (single
@@ -272,6 +274,7 @@ impl DirectCtx {
         inbound: &mut TcpStream,
         target_addr: &str,
         payload: Option<&[u8]>,
+        connect_reply: ConnectReply,
     ) -> anyhow::Result<bool> {
         if !self.enabled {
             return Ok(false);
@@ -304,16 +307,27 @@ impl DirectCtx {
             Ok(Err(e)) => {
                 metrics::counter!("client_proxy_direct_connect_failed_total").increment(1);
                 tracing::warn!("[{tunnel_id}] Direct connect failed: {target_addr}: {e}");
+                let response =
+                    connect_reply.failure_response(&OpenStreamError::Other(e.to_string()));
+                let _ = inbound.write_all(&response).await;
                 return Ok(true);
             }
             Err(e) => {
                 metrics::counter!("client_proxy_direct_connect_failed_total").increment(1);
                 tracing::warn!("[{tunnel_id}] Direct connect timed out: {target_addr}: {e}");
+                let response = connect_reply.failure_response(&OpenStreamError::TimedOut);
+                let _ = inbound.write_all(&response).await;
                 return Ok(true);
             }
         };
 
         metrics::gauge!("client_proxy_direct_streams").increment(1.0);
+
+        if let Err(e) = inbound.write_all(connect_reply.success_response()).await {
+            tracing::debug!("[{tunnel_id}] Direct success response failed: {e}");
+            metrics::gauge!("client_proxy_direct_streams").decrement(1.0);
+            return Ok(true);
+        }
 
         if let Some(p) = payload
             && let Err(e) = outbound.write_all(p).await
@@ -548,7 +562,7 @@ fe80::/10
         let mut inbound = tokio::net::TcpStream::connect(acc_addr).await.unwrap();
         drop(acc);
         let handled = ctx
-            .try_bypass(0, &mut inbound, "8.8.8.8:9", None)
+            .try_bypass(0, &mut inbound, "8.8.8.8:9", None, ConnectReply::None)
             .await
             .unwrap();
         assert!(!handled, "non-matching target must not be handled");
@@ -563,7 +577,7 @@ fe80::/10
         drop(acc);
         // Even though 127.0.0.1 would match, disabled must short-circuit.
         let handled = ctx
-            .try_bypass(0, &mut inbound, "127.0.0.1:9", None)
+            .try_bypass(0, &mut inbound, "127.0.0.1:9", None, ConnectReply::None)
             .await
             .unwrap();
         assert!(!handled);

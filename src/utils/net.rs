@@ -1,5 +1,58 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::TcpStream;
+
+/// Bounded exponential delay for retrying transient listener accept errors.
+pub struct AcceptBackoff {
+    current: Duration,
+}
+
+impl Default for AcceptBackoff {
+    fn default() -> Self {
+        Self {
+            current: Duration::from_millis(10),
+        }
+    }
+}
+
+impl AcceptBackoff {
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = (self.current * 2).min(Duration::from_secs(1));
+        delay
+    }
+
+    pub fn reset(&mut self) {
+        self.current = Duration::from_millis(10);
+    }
+}
+
+/// Tune a client-side (outbound) TCP socket for tunnel traffic.
+///
+/// * `TCP_NODELAY`: this mux carries many small control frames (PING/PONG,
+///   WINDOW_UPDATE, SOCKS5 handshakes) interleaved with bulk DATA. Nagle
+///   would hold small frames up to 40-200ms on lossy paths, directly
+///   inflating ping RTTs and window-update latency.
+/// * TCP keepalive (60s idle / 15s interval / 4 probes ≈ 120s detection):
+///   detects half-open links where the peer (or a NAT state entry) vanished
+///   without FIN — the exact case the mux-level ping cannot always cover,
+///   e.g. a tunnel control connection idle while its peers are busy.
+///
+/// Failure to set keepalive is logged but not fatal: the connection still
+/// works, only dead-link detection is weaker.
+pub fn set_tcp_keepalive(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!("set_nodelay failed: {}", e);
+    }
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(15))
+        .with_retries(4);
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        tracing::warn!("set_tcp_keepalive failed: {}", e);
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn sockaddr_storage_to_socketaddr(
@@ -216,5 +269,24 @@ pub fn get_destination_addr(msg: &libc::msghdr) -> std::io::Result<SocketAddr> {
         })?;
 
         Ok(addr.as_socket().expect("SocketAddr"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AcceptBackoff;
+    use std::time::Duration;
+
+    #[test]
+    fn accept_backoff_is_bounded_and_resets_after_success() {
+        let mut backoff = AcceptBackoff::default();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(10));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(20));
+        for _ in 0..16 {
+            let _ = backoff.next_delay();
+        }
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(10));
     }
 }

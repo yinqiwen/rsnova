@@ -1,11 +1,11 @@
 use anyhow::{Result, anyhow};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::tunnel::Message;
-use crate::tunnel::client::ProxySender;
+use crate::tunnel::client::{ConnectReply, ProxySender};
 
 mod v5 {
     pub const VERSION: u8 = 5;
@@ -21,8 +21,6 @@ mod v5 {
     pub const ATYP_IPV4: u8 = 1;
     pub const ATYP_IPV6: u8 = 4;
     pub const ATYP_DOMAIN: u8 = 3;
-
-    pub const SOCKS_RESP_SUUCESS: u8 = 0;
 }
 
 // Extracts the name and port from addr_buf and returns them, converting
@@ -74,7 +72,7 @@ pub async fn handle_socks5(
             inbound.read_exact(&mut addr_buf).await?;
             let addr = Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
             let port = ((addr_buf[4] as u16) << 8) | (addr_buf[5] as u16);
-            format!("{}:{}", addr, port)
+            SocketAddr::new(IpAddr::V4(addr), port).to_string()
         }
         v5::ATYP_IPV6 => {
             let mut addr_buf = [0u8; 18];
@@ -89,7 +87,7 @@ pub async fn handle_socks5(
             let h = ((addr_buf[14] as u16) << 8) | (addr_buf[15] as u16);
             let addr = Ipv6Addr::new(a, b, c, d, e, f, g, h);
             let port = ((addr_buf[16] as u16) << 8) | (addr_buf[17] as u16);
-            format!("{}:{}", addr, port)
+            SocketAddr::new(IpAddr::V6(addr), port).to_string()
         }
         v5::ATYP_DOMAIN => {
             //
@@ -108,31 +106,22 @@ pub async fn handle_socks5(
             return Err(anyhow!("unknown ATYP received: {}", n));
         }
     };
-    let mut resp = [0u8; 10];
-    // VER - protocol version
-    resp[0] = 5;
-    // REP - "reply field" -- what happened with the actual connect.
-    //
-    // In theory this should reply back with a bunch more kinds of
-    // errors if possible, but for now we just recognize a few concrete
-    // errors.
-    resp[1] = v5::SOCKS_RESP_SUUCESS;
-
-    // RSV - reserved
-    resp[2] = 0;
-    resp[3] = 1; // socksAtypeV4         = 0x01
-    inbound.write_all(&resp).await?;
-
     tracing::info!("[{}]Handle SOCKS5 proxy to {}", tunnel_id, target_addr);
 
     if direct_ctx
-        .try_bypass(tunnel_id, &mut inbound, &target_addr, None)
+        .try_bypass(
+            tunnel_id,
+            &mut inbound,
+            &target_addr,
+            None,
+            ConnectReply::Socks5,
+        )
         .await?
     {
         return Ok(());
     }
 
-    let msg = Message::open_tcp_stream(inbound, target_addr, None);
+    let msg = Message::open_tcp_stream(inbound, target_addr, None, ConnectReply::Socks5);
     sender.send(msg).await?;
     Ok(())
 }
