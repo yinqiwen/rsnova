@@ -117,9 +117,7 @@ impl MuxConnection for S2NQuicConnection {
             None => Err(anyhow!("null connection")),
             Some(c) => {
                 if let Err(e) = c.ping() {
-                    c.close(s2n_quic::application::Error::UNKNOWN);
-                    self.inner = None;
-                    tracing::info!("ping fail:{}", e);
+                    tracing::warn!("ping failed: {}", e);
                     Err(e.into())
                 } else {
                     Ok(())

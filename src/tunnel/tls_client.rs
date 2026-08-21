@@ -48,22 +48,15 @@ impl MuxConnection for TlsConnection {
             Some(c) => match c.ping().await {
                 Ok(()) => Ok(()),
                 Err(e) if e.is_fatal() => {
-                    // Tear down the old mux task before dropping it. Otherwise
-                    // it keeps running on the half-open TLS link until TCP
-                    // keepalive eventually trips — exactly the failure mode
-                    // ping was added to detect.
+                    // Mux task is gone; keepalive cannot revive it.
                     c.close();
                     self.inner = None;
                     tracing::error!("ping failed, connection unusable: {}", e);
                     Err(anyhow::Error::new(e))
                 }
                 Err(e) => {
-                    // A timeout alone is not proof the link is gone: one lost
-                    // packet plus TCP retransmission backoff can blow the ping
-                    // budget on a perfectly usable path. Leave the connection
-                    // in place and let the health loop's consecutive-failure
-                    // threshold decide — it closes the conn once the threshold
-                    // is reached.
+                    // Timeouts are observational. TCP keepalive reclaims
+                    // half-open sockets; the health loop must not close.
                     tracing::warn!("ping failed: {}", e);
                     Err(anyhow::Error::new(e))
                 }

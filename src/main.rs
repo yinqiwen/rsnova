@@ -112,7 +112,7 @@ struct Args {
     #[arg(long = "ping-interval")]
     ping_interval_secs: u64,
 
-    /// Consecutive ping failures before a connection is retired
+    /// Consecutive ping failures before a repeated warning (does not close the connection)
     #[default(3)]
     #[arg(long = "ping-fail-threshold")]
     ping_fail_threshold: u32,

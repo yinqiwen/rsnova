@@ -69,6 +69,7 @@ pub async fn start_tls_remote_server(
                 continue;
             }
         };
+        crate::utils::set_tcp_keepalive(&stream);
         // Reject excess connections before allocating a dispatcher + control
         // channel for them. The permit is held by the connection task and
         // released when it exits, so slots recycle as connections close.

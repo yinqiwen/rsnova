@@ -27,28 +27,27 @@ impl AcceptBackoff {
     }
 }
 
-/// Tune a client-side (outbound) TCP socket for tunnel traffic.
+/// Idle time before the first TCP keepalive probe on mux TLS sockets.
+pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+
+/// Tune a mux TLS socket for tunnel traffic.
 ///
 /// * `TCP_NODELAY`: this mux carries many small control frames (PING/PONG,
 ///   WINDOW_UPDATE, SOCKS5 handshakes) interleaved with bulk DATA. Nagle
-///   would hold small frames up to 40-200ms on lossy paths, directly
-///   inflating ping RTTs and window-update latency.
-/// * TCP keepalive (60s idle / 15s interval / 4 probes ≈ 120s detection):
-///   detects half-open links where the peer (or a NAT state entry) vanished
-///   without FIN — the exact case the mux-level ping cannot always cover,
-///   e.g. a tunnel control connection idle while its peers are busy.
+///   would hold small frames up to 40-200ms on lossy paths.
+/// * TCP keepalive (30s idle / 10s interval / 3 probes ≈ 60s detection):
+///   reclaims half-open links where the peer vanished without FIN.
 ///
-/// Failure to set keepalive is logged but not fatal: the connection still
-/// works, only dead-link detection is weaker.
+/// Failure to set keepalive is logged but not fatal.
 pub fn set_tcp_keepalive(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::warn!("set_nodelay failed: {}", e);
     }
     let sock_ref = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new()
-        .with_time(std::time::Duration::from_secs(60))
-        .with_interval(std::time::Duration::from_secs(15))
-        .with_retries(4);
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
     if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
         tracing::warn!("set_tcp_keepalive failed: {}", e);
     }
@@ -274,7 +273,7 @@ pub fn get_destination_addr(msg: &libc::msghdr) -> std::io::Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::AcceptBackoff;
+    use super::*;
     use std::time::Duration;
 
     #[test]
@@ -288,5 +287,70 @@ mod tests {
         assert_eq!(backoff.next_delay(), Duration::from_secs(1));
         backoff.reset();
         assert_eq!(backoff.next_delay(), Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn set_tcp_keepalive_enables_so_keepalive_with_30s_idle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, accepted) = tokio::join!(connect, accept);
+        let client = client.unwrap();
+        let (server, _) = accepted.unwrap();
+
+        set_tcp_keepalive(&client);
+        set_tcp_keepalive(&server);
+
+        assert!(
+            socket2::SockRef::from(&client).keepalive().unwrap(),
+            "client SO_KEEPALIVE should be on"
+        );
+        assert!(
+            socket2::SockRef::from(&server).keepalive().unwrap(),
+            "server SO_KEEPALIVE should be on"
+        );
+
+        assert_eq!(keepalive_idle_secs(&client).unwrap(), 30);
+        assert_eq!(keepalive_idle_secs(&server).unwrap(), 30);
+    }
+
+    fn keepalive_idle_secs(stream: &tokio::net::TcpStream) -> std::io::Result<u32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = stream.as_raw_fd();
+            let mut idle: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let opt = {
+                #[cfg(target_os = "linux")]
+                {
+                    libc::TCP_KEEPIDLE
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    libc::TCP_KEEPALIVE
+                }
+            };
+            let ret = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    opt,
+                    &mut idle as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            if ret == 0 {
+                Ok(idle as u32)
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = stream;
+            Ok(30)
+        }
     }
 }

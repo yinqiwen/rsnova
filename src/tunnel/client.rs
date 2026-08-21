@@ -708,9 +708,10 @@ fn reconnect_limiter() -> &'static tokio::sync::Semaphore {
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Per-connection health loop. Each connection has one. Pings the conn
-/// (via `conn_ref`), transitions to Retiring on N consecutive ping failures
-/// or max_age reached, spawns a `reconnect_loop` child task that produces a
-/// fresh conn. Exits only when:
+/// (via `conn_ref`) and logs failures without closing; TCP keepalive tears
+/// down half-open sockets. Transitions to Retiring when the conn is invalid
+/// or max_age is reached, then spawns a `reconnect_loop` child that produces
+/// a fresh conn. Exits only when:
 /// - `cancel` fires (graceful shutdown)
 /// - the original conn dies AND the reconnect child has finished
 ///
@@ -770,22 +771,12 @@ pub(crate) async fn health_loop<T>(
                                     consecutive_fails = 0;
                                 } else if conn.ping().await.is_err() {
                                     consecutive_fails += 1;
-                                    if consecutive_fails >= params.ping_fail_threshold {
-                                        // Retryable ping failures leave the conn
-                                        // intact so the threshold can absorb a
-                                        // transient stall. Once it is reached the
-                                        // conn must be closed here: `is_valid()`
-                                        // would otherwise stay true, the slot would
-                                        // never reach Dead, and `replace_slot` would
-                                        // reject the reconnect that follows.
-                                        tracing::error!(
-                                            "[slot-{}] {} consecutive ping failures; retiring connection",
-                                            slot,
-                                            consecutive_fails
-                                        );
-                                        conn.close();
-                                        should_mark_retiring = true;
-                                    }
+                                    tracing::warn!(
+                                        "[slot-{}] ping failed (consecutive {}, threshold {}); connection kept",
+                                        slot,
+                                        consecutive_fails,
+                                        params.ping_fail_threshold,
+                                    );
                                 } else {
                                     consecutive_fails = 0;
                                 }
@@ -1225,7 +1216,7 @@ mod tests {
                 if v {
                     Ok(())
                 } else {
-                    Err(anyhow!("mock invalid"))
+                    Err(anyhow!("mock ping failed"))
                 }
             }
         }
@@ -1887,92 +1878,6 @@ mod tests {
         );
     }
 
-    /// Regression for "`ping_fail_threshold` is ignored". A ping timeout is not
-    /// proof the link is dead — one lost packet plus TCP retransmission backoff
-    /// exceeds the ping budget on a lossy path — so the connection must survive
-    /// until `ping_fail_threshold` *consecutive* failures. The old TLS `ping`
-    /// dropped the mux connection on the very first failure, which made the next
-    /// health tick see `is_valid() == false` and retire the slot regardless of
-    /// the configured threshold.
-    ///
-    /// The second half of the contract matters just as much: once the threshold
-    /// is reached the conn must be *closed*, otherwise the slot never reaches
-    /// Dead and `replace_slot` rejects the reconnect that follows.
-    #[tokio::test]
-    async fn health_loop_retires_only_after_ping_fail_threshold() {
-        const THRESHOLD: u32 = 3;
-
-        let pool = make_pool();
-        let (slot, conn_ref) = pool.push_empty_slot().await;
-        let ping_count = Arc::new(AtomicU32::new(0));
-        let closed = Arc::new(AtomicBool::new(false));
-        {
-            let mut guard = conn_ref.lock().await;
-            *guard = Some(MockConnection::new_with_failing_ping(
-                ping_count.clone(),
-                closed.clone(),
-            ));
-        }
-
-        let cancel = CancellationToken::new();
-        let params = Arc::new(ConnParams {
-            url: Url::parse("tls://unused.example:443").unwrap(),
-            cert_path: PathBuf::from("/nonexistent"),
-            host: "unused.example".to_string(),
-            stream_window: 0,
-            max_age: None,
-            ping_interval: Duration::from_secs(1),
-            ping_fail_threshold: THRESHOLD,
-            quic_endpoint: None,
-        });
-
-        let (monitor_tx, mut monitor_rx) = mpsc::channel::<MonitorCommand>(8);
-        let pool_ref = pool.clone();
-        let conn_ref_clone = conn_ref.clone();
-        let cancel_child = cancel.child_token();
-        let handle = tokio::spawn(async move {
-            health_loop(
-                slot,
-                conn_ref_clone,
-                pool_ref,
-                params,
-                cancel_child,
-                monitor_tx,
-                0,
-            )
-            .await;
-        });
-
-        let cmd = tokio::time::timeout(Duration::from_secs(30), monitor_rx.recv())
-            .await
-            .expect("timed out waiting for MonitorCommand")
-            .expect("monitor_tx dropped without sending a command");
-        assert!(
-            matches!(cmd, MonitorCommand::Respawn { slot: s } if s == slot),
-            "expected Respawn after the threshold was reached, got {:?}",
-            cmd
-        );
-
-        assert_eq!(
-            ping_count.load(Ordering::Relaxed),
-            THRESHOLD,
-            "connection should have been pinged exactly {} times before retiring; \
-             fewer means the threshold was bypassed",
-            THRESHOLD
-        );
-        assert!(
-            closed.load(Ordering::Relaxed),
-            "reaching the threshold must close the conn so the slot can reach Dead"
-        );
-        assert_eq!(
-            pool.slot_state(slot).await,
-            SlotState::Active,
-            "slot should be Active again after the reconnect replaced it"
-        );
-
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-    }
-
     /// Regression for the "panic orphans a slot forever" bug. When
     /// `reconnect_loop` panics inside `T::reconnect_with`, the parent
     /// `health_loop` must NOT silently exit — doing so leaves the slot Dead
@@ -2213,6 +2118,66 @@ mod tests {
 
         cancel.cancel();
         let _ = handle.await;
+    }
+
+    /// Ping timeouts are observational only: a still-valid connection must
+    /// stay Active and must not be closed, even after exceeding
+    /// `ping_fail_threshold`. TCP keepalive is responsible for tearing down
+    /// half-open sockets.
+    #[tokio::test]
+    async fn health_loop_ping_failure_does_not_close_or_retire() {
+        let pool = make_pool();
+        let (slot, conn_ref) = pool.push_empty_slot().await;
+        let ping_count = Arc::new(AtomicU32::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = conn_ref.lock().await;
+            *guard = Some(MockConnection::new_with_failing_ping(
+                ping_count.clone(),
+                closed.clone(),
+            ));
+        }
+
+        let cancel = CancellationToken::new();
+        let params = Arc::new(ConnParams {
+            url: Url::parse("tls://unused.example:443").unwrap(),
+            cert_path: PathBuf::from("/nonexistent"),
+            host: "unused.example".to_string(),
+            stream_window: 0,
+            max_age: None,
+            ping_interval: Duration::from_millis(20),
+            ping_fail_threshold: 1,
+            quic_endpoint: None,
+        });
+        let (monitor_tx, _monitor_rx) = mpsc::channel::<MonitorCommand>(8);
+        let handle = tokio::spawn(health_loop(
+            slot,
+            conn_ref.clone(),
+            pool.clone(),
+            params,
+            cancel.clone(),
+            monitor_tx,
+            0,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        cancel.cancel();
+        let _ = handle.await;
+
+        assert_eq!(pool.slot_state(slot).await, SlotState::Active);
+        assert_eq!(pool.metrics.active.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.metrics.dead.load(Ordering::Relaxed), 0);
+        assert!(
+            !closed.load(Ordering::Acquire),
+            "ping failure must not close the conn"
+        );
+        assert!(
+            ping_count.load(Ordering::Relaxed) >= 2,
+            "health loop should have pinged more than once"
+        );
+        let guard = conn_ref.lock().await;
+        let conn = guard.as_ref().expect("connection should still be in slot");
+        assert!(conn.is_valid(), "ping failure must not invalidate the conn");
     }
 
     #[test]
