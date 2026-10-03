@@ -16,6 +16,13 @@ A Rust secure proxy and tunnel that multiplexes traffic over encrypted TLS and Q
 - **Log rotation** — Daily rotation via `--log`
 - **Admin HTTP** — Built-in `/metrics` and `/config` endpoints
 
+## Compatibility and Connection Lifecycle
+
+- Current clients and servers must be upgraded together. The wire protocol now uses target-open acknowledgements and tunnel drain control and is not compatible with older releases.
+- SOCKS5 and HTTP `CONNECT` success is returned only after the server has connected to the requested target; target failures are reported to the local client instead of becoming a silent reset.
+- `--connection-max-age` retires connections gracefully: no new streams are assigned, active one-way or bidirectional transfers finish, and only then is the connection replaced.
+- Reverse-tunnel max-age rotation and config reload register a replacement generation before draining the old generation, so existing reverse streams continue without a routing gap.
+
 ## Use Cases
 
 | Scenario | Description |

@@ -1,3 +1,9 @@
+// These re-exports serve the binary target (src/main.rs declares `mod utils`
+// and consumes them via `crate::utils::*`). The library facade (`src/lib.rs`)
+// only exposes `mux`, so under the lib target these imports appear unused.
+// Suppress the noise rather than weakening the module's public surface.
+#![allow(unused_imports, dead_code)]
+
 #[cfg(unix)]
 mod daemon;
 #[cfg(windows)]
@@ -15,13 +21,15 @@ pub use daemon::daemonize;
 pub use daemon_windows::daemonize;
 pub use error::make_io_error;
 pub use io::fill_read_buf;
-pub use metrics::format_metrics;
-pub use metrics::MetricsRegistry;
 pub use metrics::MetricsLogRecorder;
+pub use metrics::MetricsRegistry;
+pub use metrics::format_metrics;
+pub use net::AcceptBackoff;
 pub use net::get_original_dst;
 pub use net::new_tcp_listener;
 #[cfg(target_os = "linux")]
 pub use net::new_udp_listener;
+pub use net::set_tcp_keepalive;
 #[cfg(target_os = "linux")]
 pub use udp::LinuxTproxyUdpSocket;
 

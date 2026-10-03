@@ -1,5 +1,5 @@
 use anyhow::Result;
-use bincode::{config, Decode, Encode};
+use bincode::{Decode, Encode, config};
 use bytes::{Bytes, BytesMut};
 use std::io::IoSlice;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -16,9 +16,12 @@ pub const FLAG_AUTH: u8 = 6;
 pub const FLAG_AUTH_ACK: u8 = 9;
 pub const FLAG_REVERSE_OPEN: u8 = 10;
 pub const FLAG_WIN_UPDATE: u8 = 8;
+pub const FLAG_OPEN_ACK: u8 = 13;
+pub const FLAG_DRAIN: u8 = 14;
 
 pub const EVENT_HEADER_LEN: usize = 8;
 pub const MAX_EVENT_BODY_LEN: u32 = 256 * 1024; // 256KB (was 16MB, reduced for embedded)
+pub const MAX_OPEN_ERROR_LEN: usize = 256;
 
 // pub fn get_event_type_str(flags: u8) -> &'static str {
 //     match flags {
@@ -54,6 +57,9 @@ impl Header {
     pub fn len(&self) -> u32 {
         self.flag_len >> 8
     }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     #[allow(dead_code)]
     pub fn set_len(&mut self, v: u32) {
         let f = self.flags();
@@ -65,10 +71,82 @@ impl Header {
     }
 }
 
+#[derive(Encode, Decode, PartialEq, Debug, Clone, Copy)]
+pub enum StreamProto {
+    Tcp,
+    Udp,
+}
+
+impl StreamProto {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+impl std::fmt::Display for StreamProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub struct OpenStreamEvent {
-    pub proto: String,
+    pub proto: StreamProto,
     pub addr: String,
+}
+
+#[derive(Encode, Decode, PartialEq, Eq, Debug, Clone)]
+pub struct OpenStreamAck {
+    pub success: bool,
+    pub error: Option<OpenStreamError>,
+}
+
+impl OpenStreamAck {
+    pub fn success() -> Self {
+        Self {
+            success: true,
+            error: None,
+        }
+    }
+
+    pub fn failure(error: OpenStreamError) -> Self {
+        Self {
+            success: false,
+            error: Some(error.bounded()),
+        }
+    }
+}
+
+#[derive(Encode, Decode, PartialEq, Eq, Debug, Clone)]
+pub enum OpenStreamError {
+    ConnectionRefused,
+    HostUnreachable,
+    NetworkUnreachable,
+    TimedOut,
+    AddressInvalid,
+    ResourceExhausted,
+    Other(String),
+}
+
+impl OpenStreamError {
+    fn bounded(self) -> Self {
+        match self {
+            Self::Other(mut message) => {
+                if message.len() > MAX_OPEN_ERROR_LEN {
+                    let mut end = MAX_OPEN_ERROR_LEN;
+                    while !message.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    message.truncate(end);
+                }
+                Self::Other(message)
+            }
+            error => error,
+        }
+    }
 }
 
 #[derive(Encode, Decode, PartialEq, Debug, Clone)]
@@ -83,7 +161,7 @@ pub struct RegisterRequest {
     pub tunnels: Vec<TunnelEntry>,
 }
 
-#[derive(Encode, Decode, PartialEq, Debug, Clone)]
+#[derive(Encode, Decode, PartialEq, Eq, Debug, Clone)]
 pub struct TunnelEntry {
     pub local_addr: String,
     pub remote_port: u16,
@@ -184,7 +262,7 @@ pub fn new_ping_event(nonce: u32) -> Event {
             flag_len: get_flag_len(4, FLAG_PING),
             stream_id: 0,
         },
-        body: Bytes::copy_from_slice(&nonce.to_le_bytes()),
+        body: nonce_bytes(nonce),
     }
 }
 
@@ -194,7 +272,7 @@ pub fn new_pong_event(nonce: u32) -> Event {
             flag_len: get_flag_len(4, FLAG_PONG),
             stream_id: 0,
         },
-        body: Bytes::copy_from_slice(&nonce.to_le_bytes()),
+        body: nonce_bytes(nonce),
     }
 }
 
@@ -204,8 +282,18 @@ pub fn new_window_update_event(sid: u32, increment: u32) -> Event {
             flag_len: get_flag_len(4, FLAG_WIN_UPDATE),
             stream_id: sid,
         },
-        body: Bytes::copy_from_slice(&increment.to_le_bytes()),
+        body: nonce_bytes(increment),
     }
+}
+
+/// Pack a `u32` into a `Bytes` without going through `Bytes::copy_from_slice`,
+/// which would call `to_le_bytes()` (stack array) then allocate + memcpy.
+/// `BytesMut::with_capacity(4)` + `extend_from_slice` + `freeze` is one alloc
+/// and one memcpy, with no intermediate `[u8; 4]` promotion through `&[u8]`.
+fn nonce_bytes(value: u32) -> Bytes {
+    let mut b = BytesMut::with_capacity(4);
+    b.extend_from_slice(&value.to_le_bytes());
+    b.freeze()
 }
 
 pub fn new_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> anyhow::Result<Event> {
@@ -215,6 +303,37 @@ pub fn new_open_stream_event(sid: u32, msg: &OpenStreamEvent) -> anyhow::Result<
     let mut ev = new_event(sid, Bytes::from(data));
     ev.header.set_flag(FLAG_OPEN);
     Ok(ev)
+}
+
+pub fn new_open_ack_event(sid: u32, ack: &OpenStreamAck) -> anyhow::Result<Event> {
+    let data = bincode::encode_to_vec(ack, config::standard())
+        .map_err(|e| anyhow::anyhow!("encode open stream ack failed: {}", e))?;
+    let mut ev = new_event(sid, Bytes::from(data));
+    ev.header.set_flag(FLAG_OPEN_ACK);
+    Ok(ev)
+}
+
+pub fn decode_open_ack(ev: &Event) -> anyhow::Result<OpenStreamAck> {
+    if ev.header.flags() != FLAG_OPEN_ACK {
+        return Err(anyhow::anyhow!(
+            "expected open stream ack, got flag {}",
+            ev.header.flags()
+        ));
+    }
+    let (ack, _): (OpenStreamAck, usize) =
+        bincode::decode_from_slice(ev.body.as_ref(), config::standard())
+            .map_err(|e| anyhow::anyhow!("decode open stream ack failed: {}", e))?;
+    Ok(ack)
+}
+
+pub fn new_drain_event(sid: u32) -> Event {
+    Event {
+        header: Header {
+            flag_len: get_flag_len(0, FLAG_DRAIN),
+            stream_id: sid,
+        },
+        body: Bytes::new(),
+    }
 }
 
 pub fn new_auth_event(sid: u32, req: &AuthRequest) -> anyhow::Result<Event> {
@@ -305,9 +424,24 @@ where
             format!("event body too large: {}", body_data_len),
         ));
     }
-    let mut dbuf = BytesMut::zeroed(body_data_len as usize);
+    // Use `with_capacity` + `read_buf` (via `BufMut`) instead of `BytesMut::zeroed`,
+    // so the body buffer is never memset to zero before being filled. For a
+    // 256KB data frame this saves a memset on the read hot path. `read_buf`
+    // returns the number of bytes written into the `BufMut`; we loop until
+    // `body_data_len` bytes are filled (mirrors `read_exact` semantics).
+    let mut dbuf = BytesMut::with_capacity(body_data_len as usize);
     if body_data_len > 0 {
-        let _ = reader.read_exact(&mut dbuf).await?;
+        let mut remaining = body_data_len as usize;
+        while remaining > 0 {
+            let n = reader.read_buf(&mut dbuf).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before event body complete",
+                ));
+            }
+            remaining = remaining.saturating_sub(n);
+        }
     }
     let ev = Event {
         header,
@@ -428,5 +562,24 @@ mod tests {
         assert_eq!(decoded.header.stream_id, 42);
         let decoded_increment = u32::from_le_bytes(decoded.body[..4].try_into().unwrap());
         assert_eq!(decoded_increment, 131072);
+    }
+
+    #[test]
+    fn write_read_open_ack_event() {
+        let ack = OpenStreamAck::success();
+        let ev = new_open_ack_event(7, &ack).unwrap();
+        assert_eq!(ev.header.flags(), FLAG_OPEN_ACK);
+        assert_eq!(decode_open_ack(&ev).unwrap(), ack);
+    }
+
+    #[test]
+    fn open_error_message_is_bounded() {
+        let ack = OpenStreamAck::failure(OpenStreamError::Other("x".repeat(4096)));
+        let ev = new_open_ack_event(7, &ack).unwrap();
+        let decoded = decode_open_ack(&ev).unwrap();
+        let OpenStreamError::Other(message) = decoded.error.unwrap() else {
+            panic!("expected Other error");
+        };
+        assert!(message.len() <= MAX_OPEN_ERROR_LEN);
     }
 }

@@ -14,6 +14,8 @@ mod tls_remote;
 
 mod transparent;
 
+pub(crate) mod direct;
+
 pub mod tunnel_client;
 pub mod tunnel_config;
 pub mod tunnel_registry;
@@ -34,6 +36,7 @@ pub use self::local::start_local_tunnel_server;
 pub use self::tls_client::new_tls_client;
 pub use self::tls_remote::start_tls_remote_server;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_tunnel_client(
     url: &url::Url,
     cert_path: &std::path::Path,
@@ -41,6 +44,8 @@ pub async fn start_tunnel_client(
     idle_timeout_secs: usize,
     stream_window: u32,
     app_config: std::sync::Arc<crate::app_config::AppConfig>,
+    max_age_secs: u64,
+    concurrent: usize,
 ) -> anyhow::Result<()> {
     match url.scheme() {
         "tls" => {
@@ -51,11 +56,22 @@ pub async fn start_tunnel_client(
                 idle_timeout_secs,
                 stream_window,
                 app_config,
+                max_age_secs,
+                concurrent,
             )
             .await
         }
         "quic" => {
-            start_tunnel_client_quic(url, cert_path, host, app_config, idle_timeout_secs).await
+            start_tunnel_client_quic(
+                url,
+                cert_path,
+                host,
+                app_config,
+                idle_timeout_secs,
+                max_age_secs,
+                concurrent,
+            )
+            .await
         }
         _ => Err(anyhow::anyhow!("unsupported scheme: {}", url.scheme())),
     }

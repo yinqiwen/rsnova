@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use clap_serde_derive::{
-    clap::{self, Parser, ValueEnum},
     ClapSerde,
+    clap::{self, Parser, ValueEnum},
 };
 use serde::Deserialize;
 
@@ -11,13 +11,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use tokio::time;
-
 use url::Url;
 
 mod admin;
 mod app_config;
-mod mux;
+pub mod mux;
 mod tunnel;
 mod utils;
 
@@ -104,6 +102,21 @@ struct Args {
     #[arg(long)]
     mux_stream_window: u32,
 
+    /// Max connection lifetime in seconds (0 = no retirement)
+    #[default(1800)]
+    #[arg(long = "connection-max-age")]
+    connection_max_age: u64,
+
+    /// Interval between connection health pings in seconds
+    #[default(1)]
+    #[arg(long = "ping-interval")]
+    ping_interval_secs: u64,
+
+    /// Consecutive ping failures before a repeated warning (does not close the connection)
+    #[default(3)]
+    #[arg(long = "ping-fail-threshold")]
+    ping_fail_threshold: u32,
+
     #[default("mydomain.io".to_string())]
     #[arg(long)]
     tls_host: String,
@@ -153,6 +166,32 @@ struct Args {
     #[default(String::new())]
     #[arg(long = "tunnel-port-range")]
     tunnel_port_range: String,
+
+    /// Path to a plain-text direct-bypass rules file (one CIDR/domain rule per line).
+    #[default(None)]
+    #[arg(long = "direct-rules")]
+    direct_rules: Option<PathBuf>,
+
+    /// Disable direct bypass entirely.
+    #[default(false)]
+    #[arg(long = "no-direct-bypass")]
+    no_direct_bypass: bool,
+
+    /// Disable the built-in default direct-bypass rules (file rules still apply).
+    #[default(false)]
+    #[arg(long = "no-default-bypass")]
+    no_default_bypass: bool,
+}
+
+fn validate_mux_stream_window(window: u32) -> anyhow::Result<()> {
+    if !(mux::MIN_STREAM_WINDOW..=mux::MAX_STREAM_WINDOW).contains(&window) {
+        return Err(anyhow!(
+            "--mux-stream-window must be between {} and {} bytes",
+            mux::MIN_STREAM_WINDOW,
+            mux::MAX_STREAM_WINDOW
+        ));
+    }
+    Ok(())
 }
 
 fn rcgen(tls_host: &String) -> anyhow::Result<()> {
@@ -202,6 +241,8 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 
     tracing::info!("{args:?}");
 
+    validate_mux_stream_window(args.mux_stream_window)?;
+
     let tunnel_entries = if !args.tunnel.is_empty() {
         if args.tunnel_client_id.is_empty() {
             return Err(anyhow!(
@@ -217,13 +258,16 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
         Vec::new()
     };
 
-    let tunnel_port_ranges = if !args.tunnel_port_range.is_empty() {
-        Some(tunnel::tunnel_config::parse_port_range(
-            &args.tunnel_port_range,
-        )?)
+    // Server-side tunnel port allow-list. Defaults to all non-privileged ports
+    // (1024-65535) so a plain `--role server` enables tunnel registration
+    // without requiring --tunnel-port-range. Explicit --tunnel-port-range still
+    // restricts further (e.g. "8000-9000,10000-10100"). Privileged ports (<1024)
+    // are always rejected by parse_port_range regardless of the default.
+    let tunnel_port_ranges = Some(if args.tunnel_port_range.is_empty() {
+        tunnel::tunnel_config::parse_port_range("1024-65535")?
     } else {
-        None
-    };
+        tunnel::tunnel_config::parse_port_range(&args.tunnel_port_range)?
+    });
 
     let recorder = utils::MetricsLogRecorder::new();
     let metrics_registry = recorder.get_registry();
@@ -232,6 +276,12 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
     }
 
     // Build shared AppConfig for admin server and tunnel client
+    let direct_ctx = tunnel::direct::DirectCtx::new(
+        matches!(args.role, Role::Client) && !args.no_direct_bypass,
+        !args.no_default_bypass,
+        args.direct_rules.clone(),
+        args.idle_timeout_secs,
+    );
     let app_config = Arc::new(app_config::AppConfig {
         reloadable: Arc::new(tokio::sync::Mutex::new(app_config::ReloadableConfig {
             tunnel_entries,
@@ -258,6 +308,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
         reload_token: Arc::new(tokio::sync::Mutex::new(
             tokio_util::sync::CancellationToken::new(),
         )),
+        direct_ctx,
     });
 
     // Start admin server (always enabled)
@@ -289,6 +340,8 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     args.idle_timeout_secs,
                     args.mux_stream_window,
                     app_config,
+                    args.connection_max_age,
+                    args.concurrent,
                 )
                 .await?;
                 return Ok(());
@@ -303,6 +356,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             &args.tls_host,
                             args.concurrent,
                             args.idle_timeout_secs,
+                            args.connection_max_age,
+                            args.ping_interval_secs,
+                            args.ping_fail_threshold,
                         )
                         .await?
                     }
@@ -314,6 +370,9 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                             args.concurrent,
                             args.idle_timeout_secs,
                             args.mux_stream_window,
+                            args.connection_max_age,
+                            args.ping_interval_secs,
+                            args.ping_fail_threshold,
                         )
                         .await?
                     }
@@ -323,26 +382,24 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
                     }
                 };
 
-            let health_checker = tunnel_sender.clone();
-            tokio::spawn(async move {
-                let mut interval = time::interval(Duration::from_secs(1));
-                loop {
-                    interval.tick().await;
-                    if let Err(e) = health_checker.send(tunnel::Message::HealthCheck).await {
-                        tracing::error!("health check error:{}", e);
-                    }
-                }
-            });
+            // Health checks are now self-managed by each connection's
+            // health_loop (see src/tunnel/client.rs). No external ticker
+            // needed.
 
             // Start local tunnel server
             let listen_addr = args.listen;
             let tproxy = args.tproxy;
             let max_connections = args.max_connections;
+            let direct_ctx = app_config.direct_ctx.clone();
+            if direct_ctx.path.is_some() && direct_ctx.enabled {
+                tunnel::direct::start_direct_watcher(direct_ctx.clone());
+            }
             tunnel::start_local_tunnel_server(
                 &listen_addr,
                 tunnel_sender,
                 tproxy,
                 max_connections,
+                direct_ctx,
             )
             .await?;
 
@@ -412,6 +469,7 @@ async fn service_main(args: &Args) -> anyhow::Result<()> {
 }
 
 extern crate cfg_if;
+
 fn main() {
     // Install rustls crypto provider (required for rustls 0.23+)
     rustls::crypto::ring::default_provider()
@@ -446,11 +504,11 @@ fn main() {
         return;
     }
 
-    if args.daemon {
-        if let Err(e) = utils::daemonize(!args.log.is_empty()) {
-            eprintln!("daemonize failed: {}", e);
-            std::process::exit(1);
-        }
+    if args.daemon
+        && let Err(e) = utils::daemonize(!args.log.is_empty())
+    {
+        eprintln!("daemonize failed: {}", e);
+        std::process::exit(1);
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -465,4 +523,39 @@ fn main() {
             std::process::exit(1);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_mux_stream_window_rejects_out_of_range_values() {
+        assert!(validate_mux_stream_window(mux::MIN_STREAM_WINDOW - 1).is_err());
+        assert!(validate_mux_stream_window(mux::MIN_STREAM_WINDOW).is_ok());
+        assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW).is_ok());
+        assert!(validate_mux_stream_window(mux::MAX_STREAM_WINDOW + 1).is_err());
+    }
+
+    /// Server-side tunnel registration must be enabled by default so that
+    /// `--role server` (without --tunnel-port-range) accepts tunnel
+    /// registrations. The default allow-list is all non-privileged ports
+    /// (1024-65535); this verifies a typical client-requested port (15721) is
+    /// permitted while a privileged port (<1024) is rejected. Regression guard
+    /// for the "tunnel not enabled on server" reconnect loop.
+    #[test]
+    fn default_tunnel_port_range_allows_nonprivileged_ports() {
+        let default_range = tunnel::tunnel_config::parse_port_range("1024-65535").unwrap();
+        use tunnel::tunnel_config::is_port_allowed;
+        // A client `--tunnel 15721` requests remote_port=15721 — must be allowed.
+        assert!(
+            is_port_allowed(15721, &default_range),
+            "default range must allow a typical non-privileged tunnel port"
+        );
+        assert!(is_port_allowed(1024, &default_range));
+        assert!(is_port_allowed(65535, &default_range));
+        // Privileged ports are never permitted even with the wide default.
+        assert!(!is_port_allowed(80, &default_range));
+        assert!(!is_port_allowed(1023, &default_range));
+    }
 }

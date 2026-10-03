@@ -1,5 +1,57 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::TcpStream;
+
+/// Bounded exponential delay for retrying transient listener accept errors.
+pub struct AcceptBackoff {
+    current: Duration,
+}
+
+impl Default for AcceptBackoff {
+    fn default() -> Self {
+        Self {
+            current: Duration::from_millis(10),
+        }
+    }
+}
+
+impl AcceptBackoff {
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = (self.current * 2).min(Duration::from_secs(1));
+        delay
+    }
+
+    pub fn reset(&mut self) {
+        self.current = Duration::from_millis(10);
+    }
+}
+
+/// Idle time before the first TCP keepalive probe on mux TLS sockets.
+pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+
+/// Tune a mux TLS socket for tunnel traffic.
+///
+/// * `TCP_NODELAY`: this mux carries many small control frames (PING/PONG,
+///   WINDOW_UPDATE, SOCKS5 handshakes) interleaved with bulk DATA. Nagle
+///   would hold small frames up to 40-200ms on lossy paths.
+/// * TCP keepalive (30s idle / 10s interval / 3 probes ≈ 60s detection):
+///   reclaims half-open links where the peer vanished without FIN.
+///
+/// Failure to set keepalive is logged but not fatal.
+pub fn set_tcp_keepalive(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!("set_nodelay failed: {}", e);
+    }
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        tracing::warn!("set_tcp_keepalive failed: {}", e);
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn sockaddr_storage_to_socketaddr(
@@ -37,7 +89,7 @@ pub async fn new_tcp_listener(
     addr: &SocketAddr,
     transparent: bool,
 ) -> std::io::Result<tokio::net::TcpListener> {
-    let socket2_addr = socket2::SockAddr::from(addr.clone());
+    let socket2_addr = socket2::SockAddr::from(*addr);
     let domain = if socket2_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -47,7 +99,7 @@ pub async fn new_tcp_listener(
     if transparent {
         set_ip_transparent(&listen_tcp_socket, domain)?;
     }
-    listen_tcp_socket.bind(&socket2_addr.into())?;
+    listen_tcp_socket.bind(&socket2_addr)?;
     listen_tcp_socket.listen(128)?;
     tokio::net::TcpListener::from_std(listen_tcp_socket.into())
 }
@@ -63,7 +115,7 @@ pub fn new_udp_listener(
     addr: &SocketAddr,
     transparent: bool,
 ) -> std::io::Result<tokio::net::UdpSocket> {
-    let socket2_addr = socket2::SockAddr::from(addr.clone());
+    let socket2_addr = socket2::SockAddr::from(*addr);
     let domain = if socket2_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -74,7 +126,7 @@ pub fn new_udp_listener(
         set_ip_transparent(&listen_udp_socket, domain)?;
     }
     // Ok(listen_udp_socket)
-    listen_udp_socket.bind(&socket2_addr.into())?;
+    listen_udp_socket.bind(&socket2_addr)?;
     tokio::net::UdpSocket::from_std(listen_udp_socket.into())
 }
 
@@ -216,5 +268,89 @@ pub fn get_destination_addr(msg: &libc::msghdr) -> std::io::Result<SocketAddr> {
         })?;
 
         Ok(addr.as_socket().expect("SocketAddr"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn accept_backoff_is_bounded_and_resets_after_success() {
+        let mut backoff = AcceptBackoff::default();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(10));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(20));
+        for _ in 0..16 {
+            let _ = backoff.next_delay();
+        }
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn set_tcp_keepalive_enables_so_keepalive_with_30s_idle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, accepted) = tokio::join!(connect, accept);
+        let client = client.unwrap();
+        let (server, _) = accepted.unwrap();
+
+        set_tcp_keepalive(&client);
+        set_tcp_keepalive(&server);
+
+        assert!(
+            socket2::SockRef::from(&client).keepalive().unwrap(),
+            "client SO_KEEPALIVE should be on"
+        );
+        assert!(
+            socket2::SockRef::from(&server).keepalive().unwrap(),
+            "server SO_KEEPALIVE should be on"
+        );
+
+        assert_eq!(keepalive_idle_secs(&client).unwrap(), 30);
+        assert_eq!(keepalive_idle_secs(&server).unwrap(), 30);
+    }
+
+    fn keepalive_idle_secs(stream: &tokio::net::TcpStream) -> std::io::Result<u32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = stream.as_raw_fd();
+            let mut idle: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let opt = {
+                #[cfg(target_os = "linux")]
+                {
+                    libc::TCP_KEEPIDLE
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    libc::TCP_KEEPALIVE
+                }
+            };
+            let ret = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    opt,
+                    &mut idle as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            if ret == 0 {
+                Ok(idle as u32)
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = stream;
+            Ok(30)
+        }
     }
 }

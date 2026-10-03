@@ -1,22 +1,20 @@
 use anyhow::anyhow;
 use std::net::ToSocketAddrs;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use url::Url;
 
-// use rustls::crypto::{aws_lc_rs as provider, CryptoProvider};
-
-use super::client::mux_client_loop;
+use super::Message;
 use super::client::MuxClient;
 use super::client::MuxConnection;
-use super::client::{ProxySender, PROXY_CHANNEL_CAPACITY};
-use super::Message;
-use crate::mux::event;
+use super::client::mux_client_loop;
+use super::client::{ConnParams, PROXY_CHANNEL_CAPACITY, ProxySender, validate_pool_config};
 use crate::mux::MuxStream;
+use crate::mux::event;
 use crate::mux::{self};
 use crate::tunnel::ALPN_QUIC_HTTP;
 use crate::utils::read_tokio_tls_certs;
@@ -49,15 +47,18 @@ impl MuxConnection for TlsConnection {
             None => Err(anyhow!("null connection")),
             Some(c) => match c.ping().await {
                 Ok(()) => Ok(()),
-                Err(e) => {
-                    // Tear down the old mux task before dropping it. Otherwise
-                    // it keeps running on the half-open TLS link until TCP
-                    // keepalive eventually trips — exactly the failure mode
-                    // ping was added to detect.
+                Err(e) if e.is_fatal() => {
+                    // Mux task is gone; keepalive cannot revive it.
                     c.close();
                     self.inner = None;
-                    tracing::error!("ping failed: {}", e);
-                    Err(e)
+                    tracing::error!("ping failed, connection unusable: {}", e);
+                    Err(anyhow::Error::new(e))
+                }
+                Err(e) => {
+                    // Timeouts are observational. TCP keepalive reclaims
+                    // half-open sockets; the health loop must not close.
+                    tracing::warn!("ping failed: {}", e);
+                    Err(anyhow::Error::new(e))
                 }
             },
         }
@@ -117,27 +118,69 @@ impl MuxConnection for TlsConnection {
     fn set_connection(&mut self, new_c: Self) {
         *self = new_c;
     }
+
+    fn close(&mut self) {
+        if let Some(c) = self.inner.take() {
+            c.close();
+        }
+    }
+
+    fn active_stream_count(&self) -> usize {
+        match &self.inner {
+            Some(c) => c.active_stream_count(),
+            None => 0,
+        }
+    }
+
+    fn reconnect_with(
+        params: &ConnParams,
+    ) -> impl std::future::Future<Output = anyhow::Result<Self>> + Send {
+        let url = params.url.clone();
+        let cert = params.cert_path.clone();
+        let host = params.host.clone();
+        let stream_window = params.stream_window;
+        async move {
+            let mut c = TlsConnection::new(stream_window);
+            c.connect(&url, &cert, &host).await?;
+            // Auth handshake (same as initial setup)
+            let conn = c
+                .inner
+                .as_mut()
+                .ok_or_else(|| anyhow!("null connection after connect"))?;
+            let auth_stream = conn.open_stream().await?;
+            let (mut auth_r, mut auth_w) = tokio::io::split(auth_stream);
+            let auth_req = event::AuthRequest::Proxy;
+            let ev = event::new_auth_event(0, &auth_req)?;
+            event::write_event(&mut auth_w, ev).await?;
+            let ack = event::read_event(&mut auth_r).await?;
+            if ack.header.flags() != event::FLAG_AUTH_ACK {
+                return Err(anyhow!("reconnect auth failed: unexpected flag"));
+            }
+            Ok(c)
+        }
+    }
 }
 
 impl MuxClient<TlsConnection> {
+    #[allow(clippy::too_many_arguments)]
     pub async fn from(
         url: &Url,
         cert_path: &Path,
-        host: &String,
+        host: &str,
         count: usize,
         idle_timeout_secs: usize,
         stream_window: u32,
+        max_age_secs: u64,
+        ping_interval_secs: u64,
+        ping_fail_threshold: u32,
     ) -> anyhow::Result<ProxySender> {
+        validate_pool_config(count, ping_interval_secs, ping_fail_threshold)?;
         match url.scheme() {
             "tls" => {
                 let (sender, receiver) = mpsc::channel::<Message>(PROXY_CHANNEL_CAPACITY);
-                let mut client: MuxClient<TlsConnection> = MuxClient {
-                    url: url.clone(),
-                    conns: Vec::new(),
-                    host: String::from(host),
-                    cursor: 0,
-                    cert: Some(PathBuf::from(cert_path)),
-                };
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let pool = Arc::new(MuxClient::<TlsConnection>::new(cancel.clone()));
+                let mut initial: Vec<TlsConnection> = Vec::with_capacity(count);
                 for i in 0..count {
                     let mut tls_conn: TlsConnection = TlsConnection {
                         inner: None,
@@ -149,6 +192,8 @@ impl MuxClient<TlsConnection> {
                             if i == 0 {
                                 return Err(e);
                             }
+                            tracing::warn!("TLS connection:{} failed during startup: {}", i, e);
+                            continue;
                         }
                         _ => {
                             tracing::info!("TLS connection:{} established!", i);
@@ -170,9 +215,29 @@ impl MuxClient<TlsConnection> {
                         }
                         tracing::info!("TLS connection:{} auth completed (proxy mode)", i);
                     }
-                    client.conns.push(tls_conn);
+                    initial.push(tls_conn);
                 }
-                tokio::spawn(mux_client_loop(client, receiver, idle_timeout_secs));
+                let params = Arc::new(ConnParams {
+                    url: url.clone(),
+                    cert_path: cert_path.to_path_buf(),
+                    host: host.to_owned(),
+                    stream_window,
+                    max_age: if max_age_secs == 0 {
+                        None
+                    } else {
+                        Some(Duration::from_secs(max_age_secs))
+                    },
+                    ping_interval: Duration::from_secs(ping_interval_secs),
+                    ping_fail_threshold,
+                    quic_endpoint: None,
+                });
+                tokio::spawn(mux_client_loop(pool.clone(), receiver, idle_timeout_secs));
+                tokio::spawn(crate::tunnel::client::pool_monitor(
+                    pool.clone(),
+                    params,
+                    cancel,
+                    initial,
+                ));
                 Ok(sender)
             }
             _ => Err(anyhow!("unsupported schema:{:?}", url.scheme())),
@@ -186,7 +251,10 @@ async fn new_tls_connection(
     domain: &str,
 ) -> anyhow::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
     let host = url.host_str().ok_or_else(|| anyhow!("url has no host"))?;
-    let remote = (host, url.port().unwrap_or(443))
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("invalid port in URL"))?;
+    let remote = (host, port)
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
@@ -201,7 +269,6 @@ async fn new_tls_connection(
     }
 
     let mut client_crypto = tokio_rustls::rustls::ClientConfig::builder()
-        // .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
 
@@ -210,28 +277,28 @@ async fn new_tls_connection(
 
     let connector = TlsConnector::from(Arc::new(client_crypto));
     let stream = TcpStream::connect(&remote).await?;
+    crate::utils::set_tcp_keepalive(&stream);
 
     let domain = pki_types::ServerName::try_from(domain)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?
         .to_owned();
-    // let domain: pki_types::ServerName<'_> = rustls::ServerName::try_from(domain)
-    //     .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname"))?
-    //     .to_owned();
 
     let stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream> =
         connector.connect(domain, stream).await?;
-    // let ciphersuite = stream.get_ref().1.negotiated_cipher_suite().unwrap();
-    // tracing::info!("Current ciphersuite: {:?}", ciphersuite.suite());
     Ok(stream)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn new_tls_client(
     url: &Url,
     cert_path: &Path,
-    host: &String,
+    host: &str,
     count: usize,
     idle_timeout_secs: usize,
     stream_window: u32,
+    max_age_secs: u64,
+    ping_interval_secs: u64,
+    ping_fail_threshold: u32,
 ) -> anyhow::Result<ProxySender> {
     MuxClient::<TlsConnection>::from(
         url,
@@ -240,6 +307,9 @@ pub async fn new_tls_client(
         count,
         idle_timeout_secs,
         stream_window,
+        max_age_secs,
+        ping_interval_secs,
+        ping_fail_threshold,
     )
     .await
 }

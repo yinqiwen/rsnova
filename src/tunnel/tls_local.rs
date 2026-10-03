@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use tokio::net::TcpStream;
 
-use crate::tunnel::client::ProxySender;
 use crate::tunnel::Message;
+use crate::tunnel::client::{ConnectReply, ProxySender};
 
 /// TLS record and handshake constants (RFC 5246, RFC 6066)
 mod tls {
@@ -121,7 +121,7 @@ impl<'a> Parser<'a> {
 /// ```
 pub async fn peek_sni_v2(stream: &TcpStream) -> Result<String> {
     // Peek data from socket without consuming
-    let mut buf = vec![0u8; 4096];
+    let mut buf = [0u8; 4096];
     let n = stream.peek(&mut buf).await?;
     if n == 0 {
         return Err(anyhow!("connection closed"));
@@ -242,8 +242,9 @@ pub fn valid_tls_version(buf: &[u8]) -> bool {
 
 pub async fn handle_tls(
     tunnel_id: u32,
-    inbound: TcpStream,
+    mut inbound: TcpStream,
     sender: ProxySender,
+    direct_ctx: crate::tunnel::direct::DirectCtx,
 ) -> Result<()> {
     let target_addr = match peek_sni_v2(&inbound).await {
         Ok(mut sni) => {
@@ -254,10 +255,22 @@ pub async fn handle_tls(
     };
     if target_addr.is_empty() {
         tracing::error!("[{}]no sni found ", tunnel_id);
-        super::transparent::handle_transparent(tunnel_id, inbound, sender).await
+        super::transparent::handle_transparent(tunnel_id, inbound, sender, direct_ctx).await
     } else {
         tracing::info!("[{}]Handle TLS proxy to {} ", tunnel_id, target_addr);
-        let msg = Message::open_tcp_stream(inbound, target_addr, None);
+        if direct_ctx
+            .try_bypass(
+                tunnel_id,
+                &mut inbound,
+                &target_addr,
+                None,
+                ConnectReply::None,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        let msg = Message::open_tcp_stream(inbound, target_addr, None, ConnectReply::None);
         sender.send(msg).await?;
         Ok(())
     }

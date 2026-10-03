@@ -4,6 +4,80 @@ use std::sync::Arc;
 
 pub type MetricsRegistry = Arc<Registry<Key, AtomicStorage>>;
 
+pub struct MemoryInfo {
+    pub rss_bytes: u64,
+    pub peak_rss_bytes: u64,
+}
+
+/// Number of currently open file descriptors for this process.
+///
+/// On Linux this counts entries in `/proc/self/fd` — the actual count of open
+/// FDs, not the size of the fd table. Used to surface FD leaks (the kind that
+/// leads to `os error 24` / EMFILE and cascading failures such as cert reads
+/// failing during reconnect).
+#[cfg(target_os = "linux")]
+pub fn get_open_fd_count() -> Option<u64> {
+    // readdir on /proc/self/fd. std::fs::read_dir is fine here — this runs at
+    // metrics scrape cadence (not hot path), and /proc/self/fd is a small
+    // synthetic directory.
+    Some(std::fs::read_dir("/proc/self/fd").ok()?.count() as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_open_fd_count() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_memory_info() -> Option<MemoryInfo> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss = 0u64;
+    let mut peak = 0u64;
+    for line in status.lines() {
+        if let Some(val) = line.strip_prefix("VmRSS:") {
+            rss = parse_kb(val).unwrap_or(0) * 1024;
+        } else if let Some(val) = line.strip_prefix("VmHWM:") {
+            peak = parse_kb(val).unwrap_or(0) * 1024;
+        }
+    }
+    Some(MemoryInfo {
+        rss_bytes: rss,
+        peak_rss_bytes: peak,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_kb(s: &str) -> Option<u64> {
+    s.trim().strip_suffix("kB")?.trim().parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+pub fn get_memory_info() -> Option<MemoryInfo> {
+    unsafe {
+        let mut info: libc::mach_task_basic_info = std::mem::zeroed();
+        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+        let kr = libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as libc::task_info_t,
+            &mut count,
+        );
+        if kr != 0 {
+            return None;
+        }
+        Some(MemoryInfo {
+            rss_bytes: info.resident_size,
+            peak_rss_bytes: info.resident_size_max,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn get_memory_info() -> Option<MemoryInfo> {
+    None
+}
+
 pub struct MetricsLogRecorder {
     registry: MetricsRegistry,
 }
@@ -29,6 +103,23 @@ impl Recorder for MetricsLogRecorder {
 pub fn format_metrics(registry: &MetricsRegistry) -> String {
     let mut metrics_info = String::new();
     metrics_info.push_str("=================Metrics=====================\n");
+    if let Some(mem) = get_memory_info() {
+        metrics_info.push_str("Memory:\n");
+        metrics_info.push_str(&format!(
+            "  rss: {} ({} MB)\n",
+            mem.rss_bytes,
+            mem.rss_bytes / 1024 / 1024
+        ));
+        metrics_info.push_str(&format!(
+            "  peak_rss: {} ({} MB)\n",
+            mem.peak_rss_bytes,
+            mem.peak_rss_bytes / 1024 / 1024
+        ));
+    }
+    if let Some(fds) = get_open_fd_count() {
+        metrics_info.push_str("Process:\n");
+        metrics_info.push_str(&format!("  open_fds: {}\n", fds));
+    }
     metrics_info.push_str("Gauges:\n");
     registry.visit_gauges(|name, gauge| {
         let n = gauge.load(std::sync::atomic::Ordering::Relaxed);
